@@ -1,0 +1,75 @@
+# ========== Sensor ==========
+vfov: [-30.67, 10.67]       # vertical FOV (degrees)
+hfov: [-180, 180]           # horizontal FOV (degrees)
+H: 32                       # range image height (beam channels)
+W: 1080                     # range image width (360 / 0.33)
+W_half: 540                 # half width for front/back rendering
+max_range: 70.0             # max LiDAR range (meters)
+ego_mask_radius: 2.5        # ego-vehicle removal radius (meters)
+
+# ========== Model ==========
+encoder:
+  in_channels: 5             # (depth, x, y, z, intensity)
+  feat_dim: 128              # output feature dimension
+  backbone: "resnet18"       # backbone type
+
+time_embed:
+  dim: 32                    # time embedding dimension
+  max_freq: 10               # max frequency for sinusoidal encoding
+
+fusion:
+  n_heads: 4                 # number of attention heads
+  window_w: 32               # horizontal window size (pixels)
+  num_layers: 2              # stacked cross-attention layers
+
+decoder:
+  hidden_dim: 128            # MLP hidden dimension
+  delta_xyz_scale: 0.5       # tanh scaling for position residual
+
+# ========== Training ==========
+seed: 42
+epochs: 50
+batch_size: 4
+num_workers: 4
+
+optimizer:
+  type: "adamw"
+  weight_decay: 1.0e-4
+
+lr:
+  encoder: 1.0e-4
+  decoder: 2.0e-4
+  warmup_steps: 1000
+
+# ========== Loss Weights ==========
+loss:
+  depth_l1: 10.0
+  chamfer: 0.1
+  smooth: 0.001
+  boundary_depth: 5.0
+  velocity_reg: 0.01
+  opacity_entropy: 0.05
+  intensity_l1: 0.05
+  normal_consistency: 0.1
+  depth_var: 0.01
+  temporal_smooth: 0.5
+
+# ========== Curriculum ==========
+curriculum:
+  phase1_end: 0.3            # fraction of total epochs
+  phase2_end: 0.7
+  phase1_num_steps: 3        # random GT timesteps to use
+  phase2_num_steps: 5
+  phase1_front_only: true    # front 180 only in phase 1
+
+# ========== Data ==========
+data:
+  dataroot: "/data1/nuScenes"
+  version: "v1.0-trainval"
+  frame_gap: 1
+
+# ========== Logging / Checkpointing ==========
+log_interval: 50
+vis_interval: 500
+save_interval: 5             # save checkpoint every N epochs
+output_dir: "outputs"
