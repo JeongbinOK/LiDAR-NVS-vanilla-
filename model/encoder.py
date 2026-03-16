@@ -158,3 +158,43 @@ class TimeEmbedding(nn.Module):
         feat_t = torch.cat([feat, time_emb], dim=1)
         feat_t = self.proj(feat_t)
         return feat_t
+
+
+class FiLMTimeEmbedding(nn.Module):
+    """FiLM-based time conditioning: sinusoidal enc -> MLP -> (gamma, beta).
+
+    Modulates features channel-wise: gamma * feat + beta.
+    Identity-initialized: gamma_bias=1, beta_bias=0.
+    """
+
+    def __init__(self, feat_dim=128, time_embed_dim=32, max_freq=10):
+        super().__init__()
+        self.num_freqs = max_freq + 1
+        raw_dim = 2 * self.num_freqs
+        self.mlp = nn.Sequential(
+            nn.Linear(raw_dim, time_embed_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(time_embed_dim, feat_dim * 2),  # gamma + beta
+        )
+        # Identity init: gamma=1, beta=0
+        nn.init.zeros_(self.mlp[-1].weight)
+        bias = torch.zeros(feat_dim * 2)
+        bias[:feat_dim] = 1.0  # gamma bias = 1
+        self.mlp[-1].bias.data.copy_(bias)
+
+    def forward(self, t, feat):
+        """
+        Args:
+            t: [B] scalar timestamps.
+            feat: [B, C, H, W] encoder output.
+        Returns:
+            feat_t: [B, C, H, W] FiLM-modulated features.
+        """
+        B, C, H, W = feat.shape
+        freqs = 2.0 ** torch.arange(self.num_freqs, device=t.device, dtype=t.dtype)
+        angles = t[:, None] * freqs[None, :] * math.pi
+        enc = torch.cat([torch.sin(angles), torch.cos(angles)], dim=1)  # [B, raw_dim]
+        gamma_beta = self.mlp(enc)  # [B, 2*C]
+        gamma = gamma_beta[:, :C, None, None]   # [B, C, 1, 1]
+        beta = gamma_beta[:, C:, None, None]    # [B, C, 1, 1]
+        return gamma * feat + beta

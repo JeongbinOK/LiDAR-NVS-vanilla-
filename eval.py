@@ -31,17 +31,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'thi
 from chamfer.chamfer3D.dist_chamfer_3D import chamfer_3DDist
 
 
-def prepare_gt_pano(gt_pts, gt_pose, vfov, hfov, H, W, ego_radius, device):
-    """Transform GT points and create panoramic maps."""
-    pts = gt_pts.to(device)
-    pose = gt_pose.to(device)
-    pts = ego_mask(pts, ego_radius)
-
-    pts_homo = torch.cat([pts[:, :3], torch.ones(pts.shape[0], 1, device=device)], dim=1)
-    pts_xyz = (pts_homo @ pose.T)[:, :3]
-    pts_trans = torch.cat([pts_xyz, pts[:, 3:4]], dim=1)
-
-    ri, _, _ = points_to_pano(pts_trans, vfov, hfov, H, W)
+def prepare_gt_pano(gt_pts, vfov, hfov, H, W, ego_radius, device):
+    """Create panoramic depth/intensity maps from GT points in their native frame."""
+    pts = ego_mask(gt_pts.to(device), ego_radius)
+    ri, _, _ = points_to_pano(pts, vfov, hfov, H, W)
     return ri[0:1], ri[4:5]  # depth, intensity
 
 
@@ -130,9 +123,12 @@ def evaluate(args):
         for idx in range(len(gts)):
             t_q = gt_timestamps[idx].item()
 
-            pred_d, pred_i, _, _ = render_full_pano(gp_b, t_q, vfov, H, W_half)
+            # Viewpoint-centric: render from GT sensor position
+            f0_to_gt = torch.inverse(gt_poses[idx])
+            pred_d, pred_i, _, _ = render_full_pano(
+                gp_b, t_q, vfov, H, W_half, viewpoint_pose=f0_to_gt)
             gt_d, gt_i = prepare_gt_pano(
-                gts[idx], gt_poses[idx], vfov, hfov, H, W, ego_radius, device)
+                gts[idx], vfov, hfov, H, W, ego_radius, device)
 
             m = compute_metrics(pred_d, gt_d, vfov, hfov)
 

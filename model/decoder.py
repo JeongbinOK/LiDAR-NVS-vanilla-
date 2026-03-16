@@ -1,10 +1,6 @@
 """
-Per-point Gaussian parameter prediction heads.
-
-Improvements over v1:
-- Concatenates raw point geometry (xyz + intensity) with learned features.
-- 3-layer MLPs (was 2-layer) with larger hidden_dim.
-- Better initialization for scaling and scaling_t.
+Per-point Gaussian parameter prediction heads with split spatial/temporal paths
+and dual-path feature lookup for Frame 1 points.
 """
 import torch
 import torch.nn as nn
@@ -14,20 +10,28 @@ import torch.nn.functional as F
 class GaussianHead(nn.Module):
     """Predict 2D Gaussian primitive parameters for each input point.
 
-    For every LiDAR point (from both input frames), we look up its per-point
-    feature from the fused range-view feature map via bilinear sampling,
-    concatenate raw geometric context (xyz + intensity), then run 3-layer
-    MLP heads to predict Gaussian attributes.
+    Spatial heads (xyz, scaling, rotation, opacity, intensity) use:
+        input = cat([per_point_feat, pts]) = [N, feat_dim + 4]
+
+    Temporal heads (velocity, t_center, scaling_t) use:
+        input = cat([per_point_feat, per_point_motion, pts]) = [N, feat_dim + motion_dim + 4]
+
+    Frame 1 points use dual-path feature lookup:
+        - fused feature via uv_1_f0 (cross-frame info)
+        - native feature via uv_1_native (Frame 1 encoder feature)
+        - combined via learned projection
     """
 
-    def __init__(self, feat_dim=128, hidden_dim=128, delta_xyz_scale=0.5):
+    def __init__(self, feat_dim=128, hidden_dim=128, delta_xyz_scale=0.5,
+                 motion_dim=32):
         super().__init__()
+        self.feat_dim = feat_dim
         self.delta_xyz_scale = delta_xyz_scale
 
-        # Input: learned feature + raw point info (x, y, z, intensity)
-        in_dim = feat_dim + 4
+        spatial_in = feat_dim + 4
+        temporal_in = feat_dim + motion_dim + 4
 
-        def _make_head(out_dim):
+        def _make_head(in_dim, out_dim):
             return nn.Sequential(
                 nn.Linear(in_dim, hidden_dim),
                 nn.ReLU(inplace=True),
@@ -36,37 +40,48 @@ class GaussianHead(nn.Module):
                 nn.Linear(hidden_dim, out_dim),
             )
 
-        self.xyz_head = _make_head(3)       # delta position
-        self.scaling_head = _make_head(2)   # 2D disk scales (log-space)
-        self.rotation_head = _make_head(4)  # quaternion
-        self.opacity_head = _make_head(1)   # logit -> sigmoid
-        self.velocity_head = _make_head(3)  # 3D velocity (m/s)
-        self.t_center_head = _make_head(1)  # temporal center (logit -> sigmoid * 0.5)
-        self.scaling_t_head = _make_head(1) # temporal scale (softplus)
-        self.intensity_head = _make_head(1) # intensity (sigmoid)
+        # Spatial heads
+        self.xyz_head = _make_head(spatial_in, 3)
+        self.scaling_head = _make_head(spatial_in, 2)
+        self.rotation_head = _make_head(spatial_in, 4)
+        self.opacity_head = _make_head(spatial_in, 1)
+        self.intensity_head = _make_head(spatial_in, 1)
 
-        # Initialize opacity bias so sigmoid ≈ 0.5
+        # Temporal heads (wider input: + motion_dim)
+        self.velocity_head = _make_head(temporal_in, 3)
+        self.t_center_head = _make_head(temporal_in, 1)
+        self.scaling_t_head = _make_head(temporal_in, 1)
+
+        # Frame 1 dual-path projection: cat([fused, native]) -> feat_dim
+        self.f1_proj = nn.Linear(feat_dim * 2, feat_dim)
+
+        # Initialize opacity bias so sigmoid ~ 0.5
         nn.init.zeros_(self.opacity_head[-1].weight)
         nn.init.zeros_(self.opacity_head[-1].bias)
 
-        # Initialize scaling bias for small initial Gaussians: exp(-3) ≈ 0.05m
+        # Initialize scaling bias for small initial Gaussians: exp(-3) ~ 0.05m
         nn.init.constant_(self.scaling_head[-1].bias, -3.0)
 
-        # Initialize scaling_t bias for ~100ms temporal width: softplus(-2) ≈ 0.13
+        # Initialize scaling_t bias for ~100ms temporal width: softplus(-2) ~ 0.13
         nn.init.constant_(self.scaling_t_head[-1].bias, -2.0)
 
         # Initialize velocity near zero
         nn.init.zeros_(self.velocity_head[-1].weight)
         nn.init.zeros_(self.velocity_head[-1].bias)
 
-    def forward(self, fused_feat, pts_0, pts_1_transformed, uv_0, uv_1, H, W):
+    def forward(self, fused_feat, motion_feat, feat_1,
+                pts_0, pts_1_transformed,
+                uv_0, uv_1_f0, uv_1_native, H, W):
         """
         Args:
-            fused_feat: [B, C, H, W] — fused feature map.
-            pts_0: [B, N0, 4] — frame 0 points (xyz + intensity).
-            pts_1_transformed: [B, N1, 4] — frame 1 points in frame 0 coords.
-            uv_0: [B, N0, 2] — pixel coords of pts_0 in range image.
-            uv_1: [B, N1, 2] — pixel coords of pts_1 in range image.
+            fused_feat: [B, C, H, W] -- fused feature map (Frame 0 pixel space).
+            motion_feat: [B, motion_dim, H, W] -- per-pixel motion signal.
+            feat_1: [B, C, H, W] -- Frame 1 encoder features (native pixel space).
+            pts_0: list of [N0, 4] -- frame 0 points (xyz + intensity).
+            pts_1_transformed: list of [N1, 4] -- frame 1 points in frame 0 coords.
+            uv_0: list of [N0, 2] -- pixel coords of pts_0 in Frame 0 RI.
+            uv_1_f0: list of [N1, 2] -- pixel coords of pts_1 in Frame 0 pixel space.
+            uv_1_native: list of [N1, 2] -- pixel coords of pts_1 in Frame 1 RI.
             H, W: range image dimensions.
 
         Returns:
@@ -81,35 +96,66 @@ class GaussianHead(nn.Module):
         }
 
         for b in range(B):
-            feat_b = fused_feat[b:b+1]  # [1, C, H, W]
+            fused_b = fused_feat[b:b+1]    # [1, C, H, W]
+            motion_b = motion_feat[b:b+1]  # [1, motion_dim, H, W]
+            feat_1_b = feat_1[b:b+1]       # [1, C, H, W]
 
-            # Concatenate UV coords and sample features
-            uv_cat = torch.cat([uv_0[b], uv_1[b]], dim=0)  # [N0+N1, 2]
-            grid = self._uv_to_grid(uv_cat, H, W, device)  # [1, 1, N0+N1, 2]
+            N0 = pts_0[b].shape[0]
+            N1 = pts_1_transformed[b].shape[0]
 
-            per_point_feat = F.grid_sample(
-                feat_b, grid, mode='bilinear', align_corners=True
-            )  # [1, C, 1, N0+N1]
-            per_point_feat = per_point_feat.squeeze(2).squeeze(0).T  # [N0+N1, C]
+            # --- Frame 0 points: sample from fused + motion ---
+            grid_0 = self._uv_to_grid(uv_0[b], H, W, device)  # [1, 1, N0, 2]
+            pf_0 = F.grid_sample(fused_b, grid_0, mode='bilinear',
+                                 align_corners=True)
+            pf_0 = pf_0.squeeze(2).squeeze(0).T  # [N0, C]
 
-            # Raw point geometry: xyz + intensity
+            pm_0 = F.grid_sample(motion_b, grid_0, mode='bilinear',
+                                 align_corners=True)
+            pm_0 = pm_0.squeeze(2).squeeze(0).T  # [N0, motion_dim]
+
+            # --- Frame 1 points: dual-path feature lookup ---
+            grid_1_f0 = self._uv_to_grid(uv_1_f0[b], H, W, device)
+            pf_1_fused = F.grid_sample(fused_b, grid_1_f0, mode='bilinear',
+                                       align_corners=True)
+            pf_1_fused = pf_1_fused.squeeze(2).squeeze(0).T  # [N1, C]
+
+            grid_1_native = self._uv_to_grid(uv_1_native[b], H, W, device)
+            pf_1_native = F.grid_sample(feat_1_b, grid_1_native, mode='bilinear',
+                                        align_corners=True)
+            pf_1_native = pf_1_native.squeeze(2).squeeze(0).T  # [N1, C]
+
+            # Combine dual-path
+            pf_1 = self.f1_proj(torch.cat([pf_1_fused, pf_1_native], dim=1))  # [N1, C]
+
+            pm_1 = F.grid_sample(motion_b, grid_1_f0, mode='bilinear',
+                                 align_corners=True)
+            pm_1 = pm_1.squeeze(2).squeeze(0).T  # [N1, motion_dim]
+
+            # --- Concatenate Frame 0 + Frame 1 ---
+            per_point_feat = torch.cat([pf_0, pf_1], dim=0)      # [N0+N1, C]
+            per_point_motion = torch.cat([pm_0, pm_1], dim=0)     # [N0+N1, motion_dim]
             pts_cat = torch.cat([pts_0[b], pts_1_transformed[b]], dim=0)  # [N0+N1, 4]
 
-            # Enrich features with geometric context
-            enriched = torch.cat([per_point_feat, pts_cat], dim=1)  # [N0+N1, C+4]
+            # --- Spatial input ---
+            spatial_enriched = torch.cat([per_point_feat, pts_cat], dim=1)  # [N, C+4]
+
+            # --- Temporal input ---
+            temporal_enriched = torch.cat([per_point_feat, per_point_motion,
+                                           pts_cat], dim=1)  # [N, C+motion_dim+4]
 
             # Predict Gaussian parameters
             xyz_base = pts_cat[:, :3]
-            delta_xyz = torch.tanh(self.xyz_head(enriched)) * self.delta_xyz_scale
+            delta_xyz = torch.tanh(self.xyz_head(spatial_enriched)) * self.delta_xyz_scale
             xyz = xyz_base + delta_xyz
 
-            scaling = torch.exp(self.scaling_head(enriched).clamp(-7, 2))  # [N, 2] range [0.001m, 7.4m]
-            rotation = F.normalize(self.rotation_head(enriched), dim=-1)  # [N, 4]
-            opacity = torch.sigmoid(self.opacity_head(enriched))   # [N, 1]
-            velocity = self.velocity_head(enriched).clamp(-10, 10) # [N, 3] cap at ±10 m/s
-            t_center = torch.sigmoid(self.t_center_head(enriched)) * 0.5  # [N, 1]
-            scaling_t = F.softplus(self.scaling_t_head(enriched)) + 1e-4  # [N, 1]
-            intensity = torch.sigmoid(self.intensity_head(enriched))  # [N, 1]
+            scaling = torch.exp(self.scaling_head(spatial_enriched).clamp(-7, 2))
+            rotation = F.normalize(self.rotation_head(spatial_enriched), dim=-1)
+            opacity = torch.sigmoid(self.opacity_head(spatial_enriched))
+            intensity = torch.sigmoid(self.intensity_head(spatial_enriched))
+
+            velocity = self.velocity_head(temporal_enriched).clamp(-10, 10)
+            t_center = torch.sigmoid(self.t_center_head(temporal_enriched)) * 0.5
+            scaling_t = F.softplus(self.scaling_t_head(temporal_enriched)) + 1e-4
 
             results['xyz'].append(xyz)
             results['scaling'].append(scaling)
