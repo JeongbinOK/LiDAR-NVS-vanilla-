@@ -37,15 +37,10 @@ def visualize_depth(depth, vmin=0.0, vmax=50.0):
     return d
 
 
-def prepare_gt_pano(gt_pts, gt_pose, vfov, hfov, H, W, ego_radius, device):
-    """Transform GT points to input_0 frame and create panoramic depth/intensity maps."""
-    pts = gt_pts.to(device)
-    pose = gt_pose.to(device)
-    pts = ego_mask(pts, ego_radius)
-    pts_homo = torch.cat([pts[:, :3], torch.ones(pts.shape[0], 1, device=device)], dim=1)
-    pts_xyz = (pts_homo @ pose.T)[:, :3]
-    pts_trans = torch.cat([pts_xyz, pts[:, 3:4]], dim=1)
-    ri, _, _ = points_to_pano(pts_trans, vfov, hfov, H, W)
+def prepare_gt_pano(gt_pts, vfov, hfov, H, W, ego_radius, device):
+    """Create panoramic depth/intensity maps from GT points in their native frame."""
+    pts = ego_mask(gt_pts.to(device), ego_radius)
+    ri, _, _ = points_to_pano(pts, vfov, hfov, H, W)
     return ri[0:1], ri[4:5]  # gt_depth, gt_intensity
 
 
@@ -124,7 +119,8 @@ def train(args):
     # Optimizer
     encoder_params = (list(model.encoder.parameters()) +
                       list(model.time_embed.parameters()) +
-                      list(model.fusion.parameters()))
+                      list(model.fusion.parameters()) +
+                      list(model.motion_proj.parameters()))
     decoder_params = list(model.decoder.parameters())
     optimizer = torch.optim.AdamW([
         {'params': encoder_params, 'lr': args.lr.encoder},
@@ -237,26 +233,35 @@ def train(args):
                 gt_depths, gt_intensities = [], []
                 depth_sqs, rendered_normals = [], []
 
+                input_1_pose_b = batch['input_1_pose'][b].to(device)
+
                 for idx in indices:
                     t_q = gt_timestamps[idx].item()
+                    # Viewpoint-centric: render from GT sensor position
+                    f0_to_gt = torch.inverse(gt_poses[idx])
                     pred_d, pred_i, dsq, norm = render_full_pano(
-                        gp_b, t_q, vfov, H, W_half)
+                        gp_b, t_q, vfov, H, W_half,
+                        viewpoint_pose=f0_to_gt)
                     pred_depths.append(pred_d)
                     pred_intensities.append(pred_i)
                     depth_sqs.append(dsq)
                     rendered_normals.append(norm)
                     gt_d, gt_i = prepare_gt_pano(
-                        gts[idx], gt_poses[idx], vfov, hfov, H, W,
+                        gts[idx], vfov, hfov, H, W,
                         ego_radius, device)
                     gt_depths.append(gt_d)
                     gt_intensities.append(gt_i)
 
                 boundary_pred, boundary_gt = [], []
                 if loss_weights['boundary_depth'] > 0:
+                    # t=0: render from Frame 0 origin (viewpoint_pose=None)
                     bp0, _, _, _ = render_full_pano(gp_b, 0.0, vfov, H, W_half)
                     boundary_pred.append(bp0)
                     boundary_gt.append(aux['range_img_0'][b, 0:1])
-                    bp1, _, _, _ = render_full_pano(gp_b, 0.5, vfov, H, W_half)
+                    # t=0.5: render from Frame 1 origin
+                    f0_to_f1 = torch.inverse(input_1_pose_b)
+                    bp1, _, _, _ = render_full_pano(gp_b, 0.5, vfov, H, W_half,
+                                                   viewpoint_pose=f0_to_f1)
                     boundary_pred.append(bp1)
                     boundary_gt.append(aux['range_img_1'][b, 0:1])
 
@@ -326,7 +331,6 @@ def train(args):
                         mid_idx = len(batch['gts'][0]) // 2
                         gd_vis, gi_vis = prepare_gt_pano(
                             batch['gts'][0][mid_idx],
-                            batch['gts_poses'][0][mid_idx].to(device),
                             vfov, hfov, H, W, ego_radius, device)
                     else:
                         gd_vis = torch.zeros_like(pd_vis)

@@ -37,7 +37,7 @@ def evolve_gaussians(xyz, velocity, t_center, scaling_t, opacity, t_query):
     return xyz_t, eff_opacity
 
 
-def _build_view_matrix(forward=True, device='cuda'):
+def _build_view_matrix(forward=True, viewpoint_pose=None, device='cuda'):
     """Build the world-to-LiDAR view matrix following GS-LiDAR's convention.
 
     The w2l matrix swaps axes from nuScenes (x-right, y-fwd, z-up) to the
@@ -47,6 +47,13 @@ def _build_view_matrix(forward=True, device='cuda'):
         z_cam =  y_lidar
 
     For backward (rear 180 deg), apply an extra 180-deg yaw rotation.
+
+    Args:
+        forward: True for front 180 deg, False for rear 180 deg.
+        viewpoint_pose: [4, 4] optional transform from frame 0 to target viewpoint.
+            When provided, the view matrix becomes w2l @ viewpoint_pose,
+            rendering from the target viewpoint instead of frame 0 origin.
+        device: torch device.
     """
     w2l = np.array([
         [1,  0,  0, 0],
@@ -64,7 +71,10 @@ def _build_view_matrix(forward=True, device='cuda'):
         ], dtype=np.float32)
         w2l = rot180 @ w2l
 
-    return torch.from_numpy(w2l).to(device)
+    viewmat = torch.from_numpy(w2l).to(device)
+    if viewpoint_pose is not None:
+        viewmat = viewmat @ viewpoint_pose
+    return viewmat
 
 
 def _rasterize_half(xyz, opacity, scaling, rotation, intensity,
@@ -166,7 +176,7 @@ def _stitch_pano(front, back, H, W_half):
 
 
 def render_full_pano(gaussian_params_b, t_query, vfov, H, W_half,
-                     scale_factor=1.0):
+                     scale_factor=1.0, viewpoint_pose=None):
     """Render a full 360-deg panoramic depth/intensity/normal map for one sample.
 
     Args:
@@ -177,6 +187,8 @@ def render_full_pano(gaussian_params_b, t_query, vfov, H, W_half,
         H: panorama height.
         W_half: half-panorama width.
         scale_factor: depth scale factor.
+        viewpoint_pose: [4, 4] optional transform from frame 0 to target viewpoint.
+            None means render from frame 0 origin (backward compatible).
 
     Returns:
         depth_pano: [1, H, 2*W_half] full-360 depth map.
@@ -201,13 +213,15 @@ def render_full_pano(gaussian_params_b, t_query, vfov, H, W_half,
     intensity = gaussian_params_b['intensity']
 
     # Front 180 deg
-    viewmat_fwd = _build_view_matrix(forward=True, device=device)
+    viewmat_fwd = _build_view_matrix(forward=True, viewpoint_pose=viewpoint_pose,
+                                     device=device)
     depth_f, dsq_f, norm_f, int_f, alpha_f = _rasterize_half(
         xyz_t, eff_opacity, scaling, rotation, intensity,
         viewmat_fwd, vfov, H, W_half, scale_factor)
 
     # Back 180 deg
-    viewmat_bwd = _build_view_matrix(forward=False, device=device)
+    viewmat_bwd = _build_view_matrix(forward=False, viewpoint_pose=viewpoint_pose,
+                                     device=device)
     depth_b, dsq_b, norm_b, int_b, alpha_b = _rasterize_half(
         xyz_t, eff_opacity, scaling, rotation, intensity,
         viewmat_bwd, vfov, H, W_half, scale_factor)

@@ -25,6 +25,7 @@ fusion:
 decoder:
   hidden_dim: 128            # MLP hidden dimension
   delta_xyz_scale: 0.5       # tanh scaling for position residual
+  motion_dim: 32             # motion feature dimension for temporal heads
 
 # ========== Training ==========
 seed: 42
