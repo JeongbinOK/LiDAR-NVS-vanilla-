@@ -1,0 +1,19 @@
+name: gaustering
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pytorch=2.5.1
+  - pytorch-cuda=12.1
+  - numpy
+  - scipy
+  - matplotlib
+  - pip
+  - pip:
+    - kornia
+    - open3d
+    - nuscenes-devkit
+# Post-install: pip install torch-cluster -f https://data.pyg.org/whl/torch-2.5.1+cu121.html

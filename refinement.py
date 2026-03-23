@@ -1,4 +1,4 @@
-"""Stage 5: Adaptive split/merge refinement."""
+"""Stage 4: Adaptive split/merge refinement."""
 
 import torch
 
@@ -89,13 +89,68 @@ def _split_cluster(
     return labels
 
 
+def _post_refinement_reassign(
+    xyz: torch.Tensor,
+    normals: torch.Tensor,
+    assignments: torch.Tensor,
+    cfg: ClusteringConfig,
+) -> torch.Tensor:
+    """Reassign all points to optimal cluster after split/merge.
+
+    Uses same cost function as initial assignment:
+    cost = spatial_cost + lambda_normal * normal_cost
+    """
+    K = assignments.max().item() + 1
+    stats = _cluster_stats(xyz, normals, assignments, K)
+
+    valid = stats["counts"] > 0
+    valid_ids = valid.nonzero(as_tuple=True)[0]
+
+    if valid_ids.shape[0] < 2:
+        return assignments
+
+    centroids = stats["mu"][valid_ids]  # [V, 3]
+    centroid_normals = stats["normals"][valid_ids]  # [V, 3]
+
+    # Auto-tune sigma_spatial
+    _, nearest_idx = _knn_points(xyz.unsqueeze(0), centroids.unsqueeze(0), k=1)
+    nearest_dists = (xyz - centroids[nearest_idx.squeeze()]).pow(2).sum(dim=1)
+    sigma_sq = nearest_dists.median().clamp(min=1e-4)
+
+    # Find k nearest centroids for each point
+    cand_k = min(cfg.candidate_k, valid_ids.shape[0])
+    _, candidate_ids = _knn_points(
+        xyz.unsqueeze(0), centroids.unsqueeze(0), k=cand_k
+    )
+    candidate_ids = candidate_ids.squeeze(0)  # [N, C]
+
+    # Spatial cost
+    candidate_centroids = centroids[candidate_ids]  # [N, C, 3]
+    spatial_cost = (xyz.unsqueeze(1) - candidate_centroids).pow(2).sum(dim=-1) / sigma_sq
+
+    # Normal cost
+    candidate_normals = centroid_normals[candidate_ids]  # [N, C, 3]
+    dot_prod = (normals.unsqueeze(1) * candidate_normals).sum(dim=-1)
+    normal_cost = 1.0 - dot_prod.pow(2)
+
+    cost = spatial_cost + cfg.lambda_normal * normal_cost
+
+    best_local = cost.argmin(dim=1)
+    local_assignments = candidate_ids.gather(1, best_local.unsqueeze(1)).squeeze(1)
+
+    # Map local valid indices back to original cluster IDs
+    assignments = valid_ids[local_assignments]
+
+    return assignments
+
+
 def refine_clusters(
     xyz: torch.Tensor,
     normals: torch.Tensor,
     assignments: torch.Tensor,
     cfg: ClusteringConfig,
 ) -> torch.Tensor:
-    """Stage 5: Iterative split/merge refinement.
+    """Stage 4: Iterative split/merge refinement.
 
     Even iterations: split
     Odd iterations: merge
@@ -112,6 +167,7 @@ def refine_clusters(
     device = xyz.device
     K = assignments.max().item() + 1
     merge_cooldown = torch.zeros(K, dtype=torch.long, device=device)
+    prev_assignments = assignments.clone()
 
     for iteration in range(cfg.max_refine_iters):
         K = assignments.max().item() + 1
@@ -141,10 +197,10 @@ def refine_clusters(
 
         else:
             # ---- MERGE (odd iterations) ----
-            K_current = assignments.max().item() + 1
-            stats = _cluster_stats(xyz, normals, assignments, K_current)
+            # stats already computed above — no redundant call
 
             # Extend cooldown if needed
+            K_current = K
             if merge_cooldown.shape[0] < K_current:
                 merge_cooldown = torch.cat([
                     merge_cooldown,
@@ -164,6 +220,13 @@ def refine_clusters(
             )
             neighbor_ids = neighbor_ids.squeeze(0)  # [V, n_neighbors]
 
+            # Compute max merge distance from median nearest-neighbor centroid distance
+            nn_dists_sq, _ = _knn_points(
+                centroids.unsqueeze(0), centroids.unsqueeze(0), k=2
+            )
+            median_nn_dist = nn_dists_sq.squeeze(0)[:, 1].clamp(min=1e-8).sqrt().median()
+            max_merge_dist = cfg.merge_max_dist_ratio * median_nn_dist
+
             merged = set()
             for i_local in range(valid_clusters.shape[0]):
                 cid = valid_clusters[i_local].item()
@@ -181,30 +244,46 @@ def refine_clusters(
                     angle = torch.acos((ni * nj).sum().clamp(-1, 1))
                     angle_deg = angle.item() * 180.0 / 3.14159265
 
-                    if angle_deg < cfg.merge_angle_deg:
-                        # Check merged gamma_rms
-                        merged_mask = (assignments == cid) | (assignments == cjd)
-                        merged_pts = xyz[merged_mask]
-                        merged_mu = merged_pts.mean(dim=0)
-                        merged_n = (ni + nj)
-                        merged_n = merged_n / merged_n.norm().clamp(min=1e-8)
-                        merged_gamma = ((merged_pts - merged_mu) * merged_n).sum(dim=1)
-                        merged_gamma_rms = merged_gamma.pow(2).mean().sqrt()
+                    if angle_deg >= cfg.merge_angle_deg:
+                        continue
 
-                        if merged_gamma_rms < cfg.split_gamma_rms:
-                            # Merge j into i
-                            assignments[assignments == cjd] = cid
-                            merged.add(cjd)
-                            # Cooldown
-                            if cid < merge_cooldown.shape[0]:
-                                merge_cooldown[cid] = 1
+                    # Distance check: centroids must be close enough
+                    centroid_dist = (stats["mu"][cid] - stats["mu"][cjd]).norm()
+                    if centroid_dist > max_merge_dist:
+                        continue
+
+                    # Size check: merged cluster must not exceed split threshold
+                    merged_count = stats["counts"][cid] + stats["counts"][cjd]
+                    if merged_count > cfg.split_max_size:
+                        continue
+
+                    # Gamma RMS check
+                    merged_mask = (assignments == cid) | (assignments == cjd)
+                    merged_pts = xyz[merged_mask]
+                    merged_mu = merged_pts.mean(dim=0)
+                    merged_n = (ni + nj)
+                    merged_n = merged_n / merged_n.norm().clamp(min=1e-8)
+                    merged_gamma = ((merged_pts - merged_mu) * merged_n).sum(dim=1)
+                    merged_gamma_rms = merged_gamma.pow(2).mean().sqrt()
+
+                    if merged_gamma_rms < cfg.split_gamma_rms:
+                        # Merge j into i
+                        assignments[assignments == cjd] = cid
+                        merged.add(cjd)
+                        if cid < merge_cooldown.shape[0]:
+                            merge_cooldown[cid] = 1
 
             # Decrement cooldowns
             merge_cooldown = (merge_cooldown - 1).clamp(min=0)
 
         # ---- Check convergence ----
-        # Recompute and check if < threshold% of points changed
-        # (For simplicity, we always run all iterations)
+        changed = (assignments != prev_assignments).float().mean().item()
+        if changed < cfg.convergence_threshold:
+            break
+        prev_assignments = assignments.clone()
+
+    # ---- Post-refinement reassignment ----
+    assignments = _post_refinement_reassign(xyz, normals, assignments, cfg)
 
     # ---- Compactify cluster IDs ----
     unique_ids = assignments.unique()

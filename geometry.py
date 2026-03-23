@@ -107,7 +107,7 @@ def estimate_local_geometry(xyz: torch.Tensor, cfg: ClusteringConfig) -> dict:
     K = cfg.knn_k
 
     # KNN
-    dists, indices = _knn_points(xyz.unsqueeze(0), xyz.unsqueeze(0), K=K)
+    dists, indices = _knn_points(xyz.unsqueeze(0), xyz.unsqueeze(0), k=K)
     indices = indices.squeeze(0)  # [N, K]
 
     # Batched covariance

@@ -1,4 +1,4 @@
-"""Stage 4: 2D Gaussian fitting per cluster (batched)."""
+"""Stage 5: 2D Gaussian fitting per cluster (batched)."""
 
 import torch
 
@@ -41,11 +41,8 @@ def fit_2d_gaussians(
     mean_intensity /= counts.clamp(min=1)
 
     # ---- Per-cluster PCA for tangent frame ----
-    # Centered points relative to cluster centroid
     centered = xyz - mu[assignments]  # [N, 3]
 
-    # Batched covariance: Σ_k = (1/(n_k-1)) Σ_i (p_i - μ_k)(p_i - μ_k)^T
-    # Using scatter to accumulate outer products
     cov = torch.zeros(K, 3, 3, device=device)
     outer = centered.unsqueeze(2) * centered.unsqueeze(1)  # [N, 3, 3]
     cov.scatter_add_(
@@ -65,15 +62,14 @@ def fit_2d_gaussians(
     cluster_normals[flip] *= -1
     tangent_v[flip] *= -1
 
-    # ---- Reparameterization (α, β, γ) ----
-    # For each point: α = u · (p - μ), β = v · (p - μ), γ = n · (p - μ)
-    cu = tangent_u[assignments]   # [N, 3]
-    cv = tangent_v[assignments]   # [N, 3]
-    cn = cluster_normals[assignments]  # [N, 3]
+    # ---- Reparameterization ----
+    cu = tangent_u[assignments]
+    cv = tangent_v[assignments]
+    cn = cluster_normals[assignments]
 
-    alphas = (cu * centered).sum(dim=1)  # [N]
-    betas = (cv * centered).sum(dim=1)   # [N]
-    gammas = (cn * centered).sum(dim=1)  # [N]
+    alphas = (cu * centered).sum(dim=1)
+    betas = (cv * centered).sum(dim=1)
+    gammas = (cn * centered).sum(dim=1)
 
     # ---- 2D covariance in tangent plane ----
     ab = torch.stack([alphas, betas], dim=1)  # [N, 2]
@@ -84,65 +80,63 @@ def fit_2d_gaussians(
     )
     cov_2d /= (counts.view(-1, 1, 1) - 1).clamp(min=1)
 
-    # 2D eigenvalues → scaling
+    # 2D eigenvalues -> scaling
     eig_2d = torch.linalg.eigvalsh(cov_2d)  # [K, 2] ascending
     scaling_2d = eig_2d.clamp(min=1e-8).sqrt().flip(dims=[1])  # [K, 2] descending
 
-    # ---- Tangent frame → quaternion ----
-    # Rotation matrix R = [u, v, n]^T (rows are u, v, n)
+    # ---- Tangent frame -> quaternion ----
     rot = torch.stack([tangent_u, tangent_v, cluster_normals], dim=1)  # [K, 3, 3]
     quaternion = _rotation_matrix_to_quaternion(rot)  # [K, 4]
 
     # ---- Opacity based on cluster quality ----
-    # gamma_rms per cluster
     gamma_sq = torch.zeros(K, device=device)
     gamma_sq.scatter_add_(0, assignments, gammas.pow(2))
     gamma_rms = (gamma_sq / counts.clamp(min=1)).sqrt()
 
-    # Opacity: high planarity = high opacity
     opacity = torch.exp(-gamma_rms * 10.0).unsqueeze(1).clamp(min=0.01, max=0.99)
 
     # ---- Filter small clusters ----
     valid = counts >= cfg.min_cluster_size
     valid_idx = valid.nonzero(as_tuple=True)[0]
 
-    # Remap assignments
     remap = torch.full((K,), -1, dtype=torch.long, device=device)
     remap[valid_idx] = torch.arange(valid_idx.shape[0], device=device)
     new_assignments = remap[assignments]
 
-    # Mask out points in invalid clusters
     point_mask = new_assignments >= 0
 
     return {
         # Gaussian parameters (valid clusters only)
-        "xyz": mu[valid_idx],                          # [K', 3]
-        "scaling": scaling_2d[valid_idx],               # [K', 2]
-        "rotation": quaternion[valid_idx],              # [K', 4]
-        "normal": cluster_normals[valid_idx],           # [K', 3]
-        "opacity": opacity[valid_idx],                  # [K', 1]
-        "intensity": mean_intensity[valid_idx].unsqueeze(1),  # [K', 1]
-        "tangent_u": tangent_u[valid_idx],              # [K', 3]
-        "tangent_v": tangent_v[valid_idx],              # [K', 3]
+        "xyz": mu[valid_idx],
+        "scaling": scaling_2d[valid_idx],
+        "rotation": quaternion[valid_idx],
+        "normal": cluster_normals[valid_idx],
+        "opacity": opacity[valid_idx],
+        "intensity": mean_intensity[valid_idx].unsqueeze(1),
+        "tangent_u": tangent_u[valid_idx],
+        "tangent_v": tangent_v[valid_idx],
         # Temporal placeholders
         "velocity": torch.zeros(valid_idx.shape[0], 3, device=device),
         "t_center": torch.zeros(valid_idx.shape[0], 1, device=device),
         "scaling_t": torch.ones(valid_idx.shape[0], 1, device=device),
         # Reparameterization
-        "point_assignments": new_assignments,           # [N]
-        "alphas": alphas,                               # [N]
-        "betas": betas,                                 # [N]
-        "gammas": gammas,                               # [N]
-        "point_mask": point_mask,                       # [N]
+        "point_assignments": new_assignments,
+        "alphas": alphas,
+        "betas": betas,
+        "gammas": gammas,
+        "point_mask": point_mask,
         # Internal
-        "_counts": counts[valid_idx],                   # [K']
-        "_gamma_rms": gamma_rms[valid_idx],             # [K']
-        "_cov_2d": cov_2d[valid_idx],                   # [K', 2, 2]
+        "_counts": counts[valid_idx],
+        "_gamma_rms": gamma_rms[valid_idx],
+        "_cov_2d": cov_2d[valid_idx],
     }
 
 
 def _rotation_matrix_to_quaternion(R: torch.Tensor) -> torch.Tensor:
     """Convert batched 3x3 rotation matrices to quaternions [w, x, y, z].
+
+    Uses kornia when available for numerical stability,
+    with a manual fallback.
 
     Args:
         R: [B, 3, 3] rotation matrices
@@ -150,48 +144,52 @@ def _rotation_matrix_to_quaternion(R: torch.Tensor) -> torch.Tensor:
     Returns:
         q: [B, 4] quaternions (w, x, y, z)
     """
+    try:
+        from kornia.geometry.conversions import rotation_matrix_to_quaternion
+        # kornia returns (x, y, z, w) — convert to (w, x, y, z)
+        q_xyzw = rotation_matrix_to_quaternion(R)
+        q = torch.stack([q_xyzw[:, 3], q_xyzw[:, 0], q_xyzw[:, 1], q_xyzw[:, 2]], dim=1)
+        return q / q.norm(dim=1, keepdim=True).clamp(min=1e-8)
+    except ImportError:
+        pass
+
+    # Fallback: Shepperd's method
     B = R.shape[0]
     q = torch.zeros(B, 4, device=R.device, dtype=R.dtype)
 
     trace = R[:, 0, 0] + R[:, 1, 1] + R[:, 2, 2]
 
-    # Case 1: trace > 0
-    s = (trace.clamp(min=0) + 1.0).sqrt() * 2  # s = 4w
     mask1 = trace > 0
     if mask1.any():
-        s1 = s[mask1]
-        q[mask1, 0] = 0.25 * s1
-        q[mask1, 1] = (R[mask1, 2, 1] - R[mask1, 1, 2]) / s1
-        q[mask1, 2] = (R[mask1, 0, 2] - R[mask1, 2, 0]) / s1
-        q[mask1, 3] = (R[mask1, 1, 0] - R[mask1, 0, 1]) / s1
+        s = (trace[mask1] + 1.0).sqrt() * 2
+        q[mask1, 0] = 0.25 * s
+        q[mask1, 1] = (R[mask1, 2, 1] - R[mask1, 1, 2]) / s
+        q[mask1, 2] = (R[mask1, 0, 2] - R[mask1, 2, 0]) / s
+        q[mask1, 3] = (R[mask1, 1, 0] - R[mask1, 0, 1]) / s
 
-    # Case 2: R[0,0] is max diagonal
     mask2 = ~mask1 & (R[:, 0, 0] > R[:, 1, 1]) & (R[:, 0, 0] > R[:, 2, 2])
     if mask2.any():
-        s2 = (1.0 + R[mask2, 0, 0] - R[mask2, 1, 1] - R[mask2, 2, 2]).clamp(min=0).sqrt() * 2
-        q[mask2, 0] = (R[mask2, 2, 1] - R[mask2, 1, 2]) / s2.clamp(min=1e-8)
-        q[mask2, 1] = 0.25 * s2
-        q[mask2, 2] = (R[mask2, 0, 1] + R[mask2, 1, 0]) / s2.clamp(min=1e-8)
-        q[mask2, 3] = (R[mask2, 0, 2] + R[mask2, 2, 0]) / s2.clamp(min=1e-8)
+        s = (1.0 + R[mask2, 0, 0] - R[mask2, 1, 1] - R[mask2, 2, 2]).clamp(min=0).sqrt() * 2
+        q[mask2, 0] = (R[mask2, 2, 1] - R[mask2, 1, 2]) / s.clamp(min=1e-8)
+        q[mask2, 1] = 0.25 * s
+        q[mask2, 2] = (R[mask2, 0, 1] + R[mask2, 1, 0]) / s.clamp(min=1e-8)
+        q[mask2, 3] = (R[mask2, 0, 2] + R[mask2, 2, 0]) / s.clamp(min=1e-8)
 
-    # Case 3: R[1,1] is max diagonal
     mask3 = ~mask1 & ~mask2 & (R[:, 1, 1] > R[:, 2, 2])
     if mask3.any():
-        s3 = (1.0 + R[mask3, 1, 1] - R[mask3, 0, 0] - R[mask3, 2, 2]).clamp(min=0).sqrt() * 2
-        q[mask3, 0] = (R[mask3, 0, 2] - R[mask3, 2, 0]) / s3.clamp(min=1e-8)
-        q[mask3, 1] = (R[mask3, 0, 1] + R[mask3, 1, 0]) / s3.clamp(min=1e-8)
-        q[mask3, 2] = 0.25 * s3
-        q[mask3, 3] = (R[mask3, 1, 2] + R[mask3, 2, 1]) / s3.clamp(min=1e-8)
+        s = (1.0 + R[mask3, 1, 1] - R[mask3, 0, 0] - R[mask3, 2, 2]).clamp(min=0).sqrt() * 2
+        q[mask3, 0] = (R[mask3, 0, 2] - R[mask3, 2, 0]) / s.clamp(min=1e-8)
+        q[mask3, 1] = (R[mask3, 0, 1] + R[mask3, 1, 0]) / s.clamp(min=1e-8)
+        q[mask3, 2] = 0.25 * s
+        q[mask3, 3] = (R[mask3, 1, 2] + R[mask3, 2, 1]) / s.clamp(min=1e-8)
 
-    # Case 4: R[2,2] is max diagonal
     mask4 = ~mask1 & ~mask2 & ~mask3
     if mask4.any():
-        s4 = (1.0 + R[mask4, 2, 2] - R[mask4, 0, 0] - R[mask4, 1, 1]).clamp(min=0).sqrt() * 2
-        q[mask4, 0] = (R[mask4, 1, 0] - R[mask4, 0, 1]) / s4.clamp(min=1e-8)
-        q[mask4, 1] = (R[mask4, 0, 2] + R[mask4, 2, 0]) / s4.clamp(min=1e-8)
-        q[mask4, 2] = (R[mask4, 1, 2] + R[mask4, 2, 1]) / s4.clamp(min=1e-8)
-        q[mask4, 3] = 0.25 * s4
+        s = (1.0 + R[mask4, 2, 2] - R[mask4, 0, 0] - R[mask4, 1, 1]).clamp(min=0).sqrt() * 2
+        q[mask4, 0] = (R[mask4, 1, 0] - R[mask4, 0, 1]) / s.clamp(min=1e-8)
+        q[mask4, 1] = (R[mask4, 0, 2] + R[mask4, 2, 0]) / s.clamp(min=1e-8)
+        q[mask4, 2] = (R[mask4, 1, 2] + R[mask4, 2, 1]) / s.clamp(min=1e-8)
+        q[mask4, 3] = 0.25 * s
 
-    # Normalize
     q = q / q.norm(dim=1, keepdim=True).clamp(min=1e-8)
     return q

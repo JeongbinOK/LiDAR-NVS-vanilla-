@@ -11,6 +11,7 @@ def assign_points(
     normals: torch.Tensor,
     seed_indices: torch.Tensor,
     cfg: ClusteringConfig,
+    curvature: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Normal-aware assignment of points to nearest seeds.
 
@@ -19,6 +20,7 @@ def assign_points(
         normals: [N, 3] per-point normals
         seed_indices: [S] indices into xyz for seed points
         cfg: configuration
+        curvature: [N] optional per-point curvature for consistency cost
 
     Returns:
         assignments: [N] cluster ID (index into seed_indices) for each point
@@ -41,13 +43,22 @@ def assign_points(
     candidate_seeds = seeds[candidate_ids]  # [N, C, 3]
     spatial_cost = (xyz.unsqueeze(1) - candidate_seeds).pow(2).sum(dim=-1) / sigma_sq
 
-    # Normal cost: 1 - (n_p · n_s)^2
+    # Normal cost: 1 - (n_p . n_s)^2
     candidate_normals = seed_normals[candidate_ids]  # [N, C, 3]
     dot_prod = (normals.unsqueeze(1) * candidate_normals).sum(dim=-1)  # [N, C]
     normal_cost = 1.0 - dot_prod.pow(2)
 
     # Combined cost
     cost = spatial_cost + cfg.lambda_normal * normal_cost  # [N, C]
+
+    # Curvature consistency cost
+    if curvature is not None and cfg.lambda_curvature > 0:
+        seed_curvature = curvature[seed_indices]  # [S]
+        candidate_curvature = seed_curvature[candidate_ids]  # [N, C]
+        curvature_diff = (curvature.unsqueeze(1) - candidate_curvature).pow(2)
+        # Normalize by mean to make scale-invariant
+        curvature_cost = curvature_diff / curvature_diff.mean().clamp(min=1e-8)
+        cost = cost + cfg.lambda_curvature * curvature_cost
 
     # Assign to minimum cost candidate
     best_local = cost.argmin(dim=1)  # [N]
