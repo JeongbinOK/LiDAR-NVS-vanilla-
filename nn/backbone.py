@@ -26,11 +26,13 @@ def z_order_key(xyz: torch.Tensor, num_bits: int = 10) -> torch.Tensor:
 
     x, y, z = normalized[:, 0], normalized[:, 1], normalized[:, 2]
 
-    key = torch.zeros(xyz.shape[0], dtype=torch.long, device=xyz.device)
-    for i in range(num_bits):
-        key |= ((x >> i) & 1) << (3 * i)
-        key |= ((y >> i) & 1) << (3 * i + 1)
-        key |= ((z >> i) & 1) << (3 * i + 2)
+    # Vectorized bit interleaving (replaces Python loop)
+    bits = torch.arange(num_bits, device=xyz.device, dtype=torch.long)
+    key = (
+        (((x.unsqueeze(1) >> bits) & 1) << (3 * bits))
+        | (((y.unsqueeze(1) >> bits) & 1) << (3 * bits + 1))
+        | (((z.unsqueeze(1) >> bits) & 1) << (3 * bits + 2))
+    ).sum(dim=1)
 
     return key
 
