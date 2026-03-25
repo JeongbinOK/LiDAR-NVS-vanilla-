@@ -61,11 +61,9 @@ class NeuralClusteringConfig:
 
     # Module C: Soft Assignment
     top_k_seeds: int = 8
-    geo_lambda_normal: float = 1.0
 
     # Preprocessing (non-learned)
     ego_radius: float = 2.5
-    knn_k: int = 30
 
     # Gumbel temperature schedule
     gumbel_tau_start: float = 1.0
