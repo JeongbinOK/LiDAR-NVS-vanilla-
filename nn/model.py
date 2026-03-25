@@ -49,11 +49,12 @@ class NeuralClusteringModel(nn.Module):
         features = self.backbone(xyz, intensity)
 
         # B: Seed generation
-        seed_indices, seed_scores, all_scores = self.seed_gen(features, xyz, tau)
+        seed_indices, seed_scores, all_scores, raw_logits = self.seed_gen(features, xyz, tau)
 
-        # C: Soft assignment (learned affinity + distance bias, no normals)
+        # C: Soft assignment (seed logits enrich f_j for gradient flow to seed MLP)
+        seed_logits = raw_logits[seed_indices]  # [K], differentiable gather
         assign_indices, assign_weights = self.soft_assign(
-            features, xyz, seed_indices, tau,
+            features, xyz, seed_indices, seed_logits, tau,
         )
 
         # D: Gaussian parameter prediction

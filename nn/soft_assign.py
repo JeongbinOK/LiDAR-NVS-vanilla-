@@ -23,21 +23,29 @@ class SoftAssignment(nn.Module):
         super().__init__()
         self.top_k = top_k
 
-        # Learned affinity: [f_i; f_j; f_i - f_j] -> scalar
+        # Learned affinity: [f_i; f_j_enriched; f_i - f_j] -> scalar
         self.affinity_mlp = nn.Sequential(
             nn.Linear(3 * dim, dim),
             nn.ReLU(),
             nn.Linear(dim, 1),
         )
 
+        # Project seed logit (1D) to feature space (D) for f_j enrichment
+        # Zero-init: no effect at start, learns gradually
+        self.score_proj = nn.Linear(1, dim)
+        nn.init.zeros_(self.score_proj.weight)
+        nn.init.zeros_(self.score_proj.bias)
+
     def forward(self, features: torch.Tensor, xyz: torch.Tensor,
                 seed_indices: torch.Tensor,
+                seed_logits: torch.Tensor,
                 tau: float = 1.0) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             features: [N, D] per-point features
             xyz: [N, 3] point positions
             seed_indices: [K] seed point indices into the point cloud
+            seed_logits: [K] raw logits (pre-sigmoid) of selected seeds
             tau: Gumbel-Softmax temperature
 
         Returns:
@@ -60,12 +68,18 @@ class SoftAssignment(nn.Module):
         f_j = seed_features[knn_idx]   # [N, k, D]
         xyz_j = seed_xyz[knn_idx]      # [N, k, 3]
 
-        # 2) Learned affinity
-        f_i = features.unsqueeze(1).expand_as(f_j)      # [N, k, D]
-        interaction = torch.cat([f_i, f_j, f_i - f_j], dim=-1)  # [N, k, 3D]
-        affinity = self.affinity_mlp(interaction).squeeze(-1)     # [N, k]
+        # 2) Enrich f_j with seed quality (gradient path to seed MLP)
+        score_embed = self.score_proj(
+            seed_logits[knn_idx].unsqueeze(-1)    # [N, k, 1]
+        )                                          # [N, k, D]
+        f_j_enriched = f_j + score_embed           # [N, k, D]
 
-        # 3) Distance bias (normalized by mean distance, detached)
+        # 3) Learned affinity (f_i - f_j uses original f_j)
+        f_i = features.unsqueeze(1).expand_as(f_j)                    # [N, k, D]
+        interaction = torch.cat([f_i, f_j_enriched, f_i - f_j], dim=-1)  # [N, k, 3D]
+        affinity = self.affinity_mlp(interaction).squeeze(-1)          # [N, k]
+
+        # 4) Distance bias (normalized by mean distance, detached)
         xyz_i = xyz.unsqueeze(1).expand_as(xyz_j)
         dist_sq = (xyz_i - xyz_j).pow(2).sum(dim=-1)          # [N, k]
         sigma_sq = dist_sq.mean().clamp(min=1e-4).detach()     # scalar, no grad
@@ -74,7 +88,7 @@ class SoftAssignment(nn.Module):
 
         logits = affinity + geo_bias
 
-        # 4) Gumbel-Softmax (train) / argmax (eval)
+        # 5) Gumbel-Softmax (train) / argmax (eval)
         if self.training:
             weights = F.gumbel_softmax(logits, tau=tau, hard=False, dim=-1)
         else:

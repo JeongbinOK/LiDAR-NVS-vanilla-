@@ -26,7 +26,7 @@ class SeedGenerator(nn.Module):
         )
 
     def forward(self, features: torch.Tensor, xyz: torch.Tensor,
-                tau: float = 1.0) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                tau: float = 1.0) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
             features: [N, D] per-point features from backbone
@@ -36,12 +36,14 @@ class SeedGenerator(nn.Module):
         Returns:
             seed_indices: [K_final] indices into point cloud (after NMS)
             seed_scores: [K_final] scores of selected seeds
-            all_scores: [N] seediness scores for all points (for loss)
+            all_scores: [N] seediness scores for all points
+            raw_logits: [N] pre-sigmoid logits (for score_proj in soft_assign)
         """
         N = features.shape[0]
         device = features.device
 
-        all_scores = torch.sigmoid(self.mlp(features).squeeze(-1))  # [N]
+        raw_logits = self.mlp(features).squeeze(-1)        # [N]
+        all_scores = torch.sigmoid(raw_logits)              # [N]
 
         k = min(self.k_max, N)
 
@@ -61,9 +63,16 @@ class SeedGenerator(nn.Module):
         )
 
         seed_indices = topk_indices[keep]
+
+        # Adaptive K cap for train/eval consistency
+        k_cap = max(N // self.target_cluster_size, 10)
+        if seed_indices.shape[0] > k_cap:
+            _, cap_idx = all_scores[seed_indices].topk(k_cap)
+            seed_indices = seed_indices[cap_idx]
+
         seed_scores = all_scores[seed_indices]
 
-        return seed_indices, seed_scores, all_scores
+        return seed_indices, seed_scores, all_scores, raw_logits
 
     def _compute_nms_radius(self, xyz: torch.Tensor) -> float:
         """Adaptive NMS radius from point density, robust to outliers.
