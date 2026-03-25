@@ -96,37 +96,36 @@ class GaussianParameterHead(nn.Module):
         mu_weighted.scatter_add_(0, flat_idx.unsqueeze(1).expand(-1, 3), wxyz)
         mu_weighted = mu_weighted / ws.unsqueeze(1)
 
-        # ---- Differentiable PCA (weighted covariance -> SVD) ----
-        centered = flat_xyz - mu_weighted[flat_idx]
-        w_outer = flat_w.unsqueeze(1).unsqueeze(2) * (
-            centered.unsqueeze(2) * centered.unsqueeze(1)
-        )  # [N*top_k, 3, 3]
+        # ---- PCA warm start (no gradient — SVD backward is unstable) ----
+        with torch.no_grad():
+            centered = flat_xyz - mu_weighted[flat_idx]
+            w_outer = flat_w.unsqueeze(1).unsqueeze(2) * (
+                centered.unsqueeze(2) * centered.unsqueeze(1)
+            )  # [N*top_k, 3, 3]
 
-        cov = torch.zeros(K, 3, 3, device=device)
-        cov.scatter_add_(0, flat_idx.view(-1, 1, 1).expand(-1, 3, 3), w_outer)
-        cov = cov / ws.view(-1, 1, 1)
-        cov = cov + 1e-6 * self._eye3
+            cov = torch.zeros(K, 3, 3, device=device)
+            cov.scatter_add_(0, flat_idx.view(-1, 1, 1).expand(-1, 3, 3), w_outer)
+            cov = cov / ws.view(-1, 1, 1)
+            cov = cov + 1e-6 * self._eye3
 
-        U, S, Vh = torch.linalg.svd(cov)
+            U, S, Vh = torch.linalg.svd(cov)
 
-        u_pca = Vh[:, 0, :]   # [K, 3]
-        v_pca = Vh[:, 1, :]   # [K, 3]
-        n_pca = torch.cross(u_pca, v_pca, dim=-1)
+            u_pca = Vh[:, 0, :]   # [K, 3]
+            v_pca = Vh[:, 1, :]   # [K, 3]
+            n_pca = torch.cross(u_pca, v_pca, dim=-1)
 
-        # Orient normals toward sensor origin (out-of-place for autograd)
-        flip_sign = torch.where(
-            (n_pca * (-mu_weighted)).sum(dim=1, keepdim=True) < 0,
-            torch.tensor(-1.0, device=device),
-            torch.tensor(1.0, device=device),
-        )
-        n_pca = n_pca * flip_sign
-        v_pca = v_pca * flip_sign
+            # Orient normals toward sensor origin
+            flip_sign = torch.where(
+                (n_pca * (-mu_weighted)).sum(dim=1, keepdim=True) < 0,
+                torch.tensor(-1.0, device=device),
+                torch.tensor(1.0, device=device),
+            )
+            n_pca = n_pca * flip_sign
+            v_pca = v_pca * flip_sign
 
-        rot_pca = torch.stack([u_pca, v_pca, n_pca], dim=1)  # [K, 3, 3]
-        # Detach PCA: SVD backward is numerically unstable with near-degenerate
-        # eigenvalues. Network learns residuals on top of this warm start.
-        q_pca = _rotation_matrix_to_quaternion(rot_pca).detach()
-        s_pca = S[:, :2].clamp(min=1e-8).sqrt().detach()
+            rot_pca = torch.stack([u_pca, v_pca, n_pca], dim=1)  # [K, 3, 3]
+            q_pca = _rotation_matrix_to_quaternion(rot_pca)
+            s_pca = S[:, :2].clamp(min=1e-8).sqrt()
 
         # ---- Residual prediction ----
         mu = mu_weighted + self.mlp_mu(cluster_feats)
