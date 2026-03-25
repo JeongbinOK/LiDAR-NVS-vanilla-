@@ -42,3 +42,48 @@ class ClusteringConfig:
 
     # Device
     device: str = "cuda"
+
+
+@dataclass
+class NeuralClusteringConfig:
+    """Hyperparameters for the neural clustering pipeline."""
+
+    # Module A: Point Feature Backbone
+    feature_dim: int = 64
+    num_blocks: int = 3
+    window_size: int = 48
+    num_heads: int = 4
+
+    # Module B: Seed Generation
+    k_max: int = 1500
+    nms_radius_factor: float = 0.3
+    target_cluster_size: int = 30
+
+    # Module C: Soft Assignment
+    top_k_seeds: int = 8
+    geo_lambda_normal: float = 1.0
+
+    # Preprocessing (non-learned)
+    ego_radius: float = 2.5
+    knn_k: int = 30
+
+    # Gumbel temperature schedule
+    gumbel_tau_start: float = 1.0
+    gumbel_tau_end: float = 0.1
+
+    # Training
+    lr: float = 1e-3
+    weight_decay: float = 1e-4
+    num_epochs: int = 100
+    batch_size: int = 2
+
+    # Loss weights
+    w_surface: float = 1.0
+    w_assign: float = 0.01
+    w_scale: float = 0.01
+
+    # Data
+    data_root: str = "~/data/nuScenes"
+
+    # Device
+    device: str = "cuda"

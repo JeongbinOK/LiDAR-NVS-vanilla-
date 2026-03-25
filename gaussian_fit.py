@@ -2,7 +2,7 @@
 
 import torch
 
-from .config import ClusteringConfig
+from config import ClusteringConfig
 
 
 def fit_2d_gaussians(

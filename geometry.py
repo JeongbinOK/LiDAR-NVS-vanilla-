@@ -2,7 +2,7 @@
 
 import torch
 
-from .config import ClusteringConfig
+from config import ClusteringConfig
 
 
 def _knn_points(src: torch.Tensor, dst: torch.Tensor, k: int):
