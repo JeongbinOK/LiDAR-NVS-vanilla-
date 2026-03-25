@@ -1,8 +1,31 @@
-"""Module A: Point Feature Backbone with serialized point transformer."""
+"""Module A: Point Feature Backbone with serialized point transformer.
+
+Uses dual serialization (Z-order + Hilbert) following PTv3 design:
+even blocks use Z-order, odd blocks use Hilbert curve, providing
+complementary locality coverage.
+"""
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+def _quantize_coords(xyz: torch.Tensor, num_bits: int = 10):
+    """Quantize 3D coordinates to integer grid [0, 2^num_bits - 1]."""
+    mins = xyz.min(dim=0).values
+    span = (xyz.max(dim=0).values - mins).clamp(min=1e-6)
+    coords = ((xyz - mins) / span * ((1 << num_bits) - 1)).long()
+    return coords.clamp(0, (1 << num_bits) - 1)
+
+
+def _interleave_bits(x, y, z, num_bits, device):
+    """Interleave bits of 3 coordinates into a single key."""
+    bits = torch.arange(num_bits, device=device, dtype=torch.long)
+    return (
+        (((x.unsqueeze(1) >> bits) & 1) << (3 * bits))
+        | (((y.unsqueeze(1) >> bits) & 1) << (3 * bits + 1))
+        | (((z.unsqueeze(1) >> bits) & 1) << (3 * bits + 2))
+    ).sum(dim=1)
 
 
 def z_order_key(xyz: torch.Tensor, num_bits: int = 10) -> torch.Tensor:
@@ -19,22 +42,71 @@ def z_order_key(xyz: torch.Tensor, num_bits: int = 10) -> torch.Tensor:
     Returns:
         keys: [N] Z-order keys (int64)
     """
-    mins = xyz.min(dim=0).values
-    span = (xyz.max(dim=0).values - mins).clamp(min=1e-6)
-    normalized = ((xyz - mins) / span * ((1 << num_bits) - 1)).long()
-    normalized = normalized.clamp(0, (1 << num_bits) - 1)
+    coords = _quantize_coords(xyz, num_bits)
+    return _interleave_bits(
+        coords[:, 0], coords[:, 1], coords[:, 2], num_bits, xyz.device,
+    )
 
-    x, y, z = normalized[:, 0], normalized[:, 1], normalized[:, 2]
 
-    # Vectorized bit interleaving (replaces Python loop)
-    bits = torch.arange(num_bits, device=xyz.device, dtype=torch.long)
-    key = (
-        (((x.unsqueeze(1) >> bits) & 1) << (3 * bits))
-        | (((y.unsqueeze(1) >> bits) & 1) << (3 * bits + 1))
-        | (((z.unsqueeze(1) >> bits) & 1) << (3 * bits + 2))
-    ).sum(dim=1)
+def hilbert_curve_key(xyz: torch.Tensor, num_bits: int = 10) -> torch.Tensor:
+    """Compute 3D Hilbert curve keys using the Skilling transpose algorithm.
 
-    return key
+    Hilbert curves have provably better locality preservation than Z-order:
+    consecutive points along the curve differ in exactly one coordinate,
+    reducing worst-case locality gaps at spatial boundaries.
+
+    Args:
+        xyz: [N, 3] point positions
+        num_bits: bits per coordinate axis (10 -> 30-bit key, fits int64)
+
+    Returns:
+        keys: [N] Hilbert curve keys (int64)
+    """
+    coords = _quantize_coords(xyz, num_bits)
+    x, y, z = coords[:, 0].clone(), coords[:, 1].clone(), coords[:, 2].clone()
+
+    M = 1 << (num_bits - 1)
+
+    # Phase 1: Inverse undo (Skilling 2004)
+    Q = M
+    while Q > 1:
+        P = Q - 1
+
+        # dim 0 (x): invert low bits if current bit is set
+        mask = (x & Q) != 0
+        x = torch.where(mask, x ^ P, x)
+
+        # dim 1 (y): invert x if y-bit set, else exchange low bits of x,y
+        mask = (y & Q) != 0
+        t = (x ^ y) & P
+        x = torch.where(mask, x ^ P, x ^ t)
+        y = torch.where(mask, y, y ^ t)
+
+        # dim 2 (z): invert x if z-bit set, else exchange low bits of x,z
+        mask = (z & Q) != 0
+        t = (x ^ z) & P
+        x = torch.where(mask, x ^ P, x ^ t)
+        z = torch.where(mask, z, z ^ t)
+
+        Q >>= 1
+
+    # Phase 2: Gray encode
+    y = y ^ x
+    z = z ^ y
+
+    # Phase 3: Parity fix
+    t = torch.zeros_like(x)
+    Q = M
+    while Q > 1:
+        t = torch.where((z & Q) != 0, t ^ (Q - 1), t)
+        Q >>= 1
+
+    x = x ^ t
+    y = y ^ t
+    z = z ^ t
+
+    # Interleave the transposed coordinates to form the Hilbert index
+    return _interleave_bits(x, y, z, num_bits, xyz.device)
 
 
 class WindowedAttention(nn.Module):
@@ -95,11 +167,12 @@ class SerializedTransformerBlock(nn.Module):
 
 
 class PointFeatureBackbone(nn.Module):
-    """Module A: Z-order serialized point transformer backbone.
+    """Module A: Dual-serialization point transformer backbone (PTv3-inspired).
 
     Transforms raw point features (xyz + intensity) into per-point latent
-    features via local self-attention in Z-order curve windows. Alternate
-    blocks use shifted windows (by W/2) for cross-window information flow.
+    features via local self-attention. Even blocks use Z-order serialization,
+    odd blocks use Hilbert curve, providing complementary locality coverage.
+    Shifted windows (W/2) on odd blocks add cross-window information flow.
     """
 
     def __init__(self, dim: int = 64, num_blocks: int = 3,
@@ -118,6 +191,35 @@ class PointFeatureBackbone(nn.Module):
             SerializedTransformerBlock(dim, num_heads)
             for _ in range(num_blocks)
         ])
+
+    def _process_block(self, features, sort_order, unsort_order,
+                       block, shift, N, W, device):
+        """Sort → window → attention → unsort for one block."""
+        sorted_feats = features[sort_order]
+
+        if shift > 0:
+            sorted_feats = torch.roll(sorted_feats, shift, dims=0)
+
+        # Pad to multiple of W
+        pad_size = (W - N % W) % W
+        if pad_size > 0:
+            sorted_feats = F.pad(sorted_feats, (0, 0, 0, pad_size))
+
+        num_windows = sorted_feats.shape[0] // W
+        windows = sorted_feats.view(num_windows, W, self.dim)
+
+        # Validity mask (False for padding tokens)
+        mask = torch.ones(num_windows, W, dtype=torch.bool, device=device)
+        if pad_size > 0:
+            mask[-1, W - pad_size:] = False
+
+        windows = block(windows, mask)
+        sorted_feats = windows.reshape(-1, self.dim)[:N]
+
+        if shift > 0:
+            sorted_feats = torch.roll(sorted_feats, -shift, dims=0)
+
+        return sorted_feats[unsort_order]
 
     def forward(self, xyz: torch.Tensor, intensity: torch.Tensor) -> torch.Tensor:
         """
@@ -138,39 +240,30 @@ class PointFeatureBackbone(nn.Module):
         # Initial embedding
         features = self.embed(torch.cat([xyz, intensity], dim=1))  # [N, D]
 
-        # Z-order serialization (computed once, reused across blocks)
-        z_keys = z_order_key(xyz)
-        sort_order = z_keys.argsort()
-        unsort_order = torch.empty_like(sort_order)
-        unsort_order[sort_order] = torch.arange(N, device=device)
+        # Precompute both serialization orders
+        arange = torch.arange(N, device=device)
 
-        sorted_feats = features[sort_order]
+        z_sort = z_order_key(xyz).argsort()
+        z_unsort = torch.empty_like(z_sort)
+        z_unsort[z_sort] = arange
+
+        h_sort = hilbert_curve_key(xyz).argsort()
+        h_unsort = torch.empty_like(h_sort)
+        h_unsort[h_sort] = arange
 
         for block_idx, block in enumerate(self.blocks):
-            # Shifted windows at odd blocks
+            # Even blocks: Z-order, Odd blocks: Hilbert
+            if block_idx % 2 == 0:
+                sort_order, unsort_order = z_sort, z_unsort
+            else:
+                sort_order, unsort_order = h_sort, h_unsort
+
+            # Shifted windows on odd blocks for cross-window flow
             shift = (W // 2) if (block_idx % 2 == 1) else 0
 
-            if shift > 0:
-                sorted_feats = torch.roll(sorted_feats, shift, dims=0)
+            features = self._process_block(
+                features, sort_order, unsort_order,
+                block, shift, N, W, device,
+            )
 
-            # Pad to multiple of W
-            pad_size = (W - N % W) % W
-            if pad_size > 0:
-                sorted_feats = F.pad(sorted_feats, (0, 0, 0, pad_size))
-
-            num_windows = sorted_feats.shape[0] // W
-            windows = sorted_feats.view(num_windows, W, self.dim)
-
-            # Validity mask (False for padding tokens)
-            mask = torch.ones(num_windows, W, dtype=torch.bool, device=device)
-            if pad_size > 0:
-                mask[-1, W - pad_size:] = False
-
-            windows = block(windows, mask)
-
-            sorted_feats = windows.reshape(-1, self.dim)[:N]
-
-            if shift > 0:
-                sorted_feats = torch.roll(sorted_feats, -shift, dims=0)
-
-        return sorted_feats[unsort_order]
+        return features
