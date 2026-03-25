@@ -220,14 +220,18 @@ def train(cfg: NeuralClusteringConfig, overfit_frames: int = 0):
 
 
 def main():
+    _defaults = NeuralClusteringConfig()
     parser = argparse.ArgumentParser(description="Train neural 2D Gaussian clustering")
-    parser.add_argument("--data-root", default=os.path.expanduser("~/data/nuScenes"))
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--data-root", default=_defaults.data_root)
+    parser.add_argument("--epochs", type=int, default=_defaults.num_epochs)
+    parser.add_argument("--lr", type=float, default=_defaults.lr)
+    parser.add_argument("--batch-size", type=int, default=_defaults.batch_size)
     parser.add_argument("--overfit", type=int, default=0,
                         help="Overfit on N pairs (0=full training)")
-    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--device", default=_defaults.device)
+    parser.add_argument("--w-assign", type=float, default=_defaults.w_assign)
+    parser.add_argument("--w-scale", type=float, default=_defaults.w_scale)
+    parser.add_argument("--k-max", type=int, default=_defaults.k_max)
     args = parser.parse_args()
 
     cfg = NeuralClusteringConfig(
@@ -236,6 +240,9 @@ def main():
         lr=args.lr,
         batch_size=args.batch_size,
         device=args.device,
+        w_assign=args.w_assign,
+        w_scale=args.w_scale,
+        k_max=args.k_max,
     )
 
     train(cfg, overfit_frames=args.overfit)
