@@ -1,6 +1,8 @@
 """Training loop for neural 2D Gaussian clustering."""
 
 import argparse
+import dataclasses
+import json
 import os
 import sys
 import time
@@ -16,6 +18,26 @@ from dataset import NuScenesNVSDataset, nvs_collate_fn
 from config import NeuralClusteringConfig
 from nn.model import NeuralClusteringModel
 from nn.losses import ClusteringLoss
+
+
+def _make_run_dir(base: str = "outputs") -> str:
+    """Create outputs/train_NNN/ with configs/ and ckpt/ subdirs."""
+    os.makedirs(base, exist_ok=True)
+    existing = [
+        d for d in os.listdir(base)
+        if d.startswith("train_") and os.path.isdir(os.path.join(base, d))
+    ]
+    indices = []
+    for d in existing:
+        try:
+            indices.append(int(d.split("_")[1]))
+        except (IndexError, ValueError):
+            pass
+    next_idx = max(indices, default=0) + 1
+    run_dir = os.path.join(base, f"train_{next_idx:03d}")
+    os.makedirs(os.path.join(run_dir, "configs"))
+    os.makedirs(os.path.join(run_dir, "ckpt"))
+    return run_dir
 
 
 def compute_tau(epoch: int, cfg: NeuralClusteringConfig) -> float:
@@ -67,6 +89,16 @@ def process_frame(model, loss_fn, pts, device, tau, ego_radius):
 def train(cfg: NeuralClusteringConfig, overfit_frames: int = 0):
     """Main training loop."""
     device = cfg.device
+
+    # Create per-run output directory
+    run_dir = _make_run_dir(os.path.join(os.path.dirname(__file__), "outputs"))
+    ckpt_dir = os.path.join(run_dir, "ckpt")
+    cfg_dir = os.path.join(run_dir, "configs")
+
+    # Save config
+    with open(os.path.join(cfg_dir, "config.json"), "w") as f:
+        json.dump(dataclasses.asdict(cfg), f, indent=2)
+    print(f"Run dir: {run_dir}")
 
     data_root = os.path.expanduser(cfg.data_root)
     dataset = NuScenesNVSDataset(
@@ -172,7 +204,16 @@ def train(cfg: NeuralClusteringConfig, overfit_frames: int = 0):
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "loss": best_loss,
-            }, os.path.join(os.path.dirname(__file__), "outputs", "best_model.pt"))
+            }, os.path.join(ckpt_dir, "best_model.pt"))
+
+        # Save periodic checkpoint every 10 epochs
+        if (epoch + 1) % 10 == 0:
+            torch.save({
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "loss": avg["total"],
+            }, os.path.join(ckpt_dir, f"epoch_{epoch+1:03d}.pt"))
 
     print(f"\nDone. Best loss: {best_loss:.4f}")
     return model
