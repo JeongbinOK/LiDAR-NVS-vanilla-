@@ -84,7 +84,9 @@ class SeedGenerator(nn.Module):
     @staticmethod
     def _ball_query_nms(xyz: torch.Tensor, scores: torch.Tensor,
                         radius: float) -> torch.Tensor:
-        """Greedy NMS: suppress lower-scored seeds within radius of higher-scored ones.
+        """Greedy NMS on GPU: suppress lower-scored seeds within radius.
+
+        Uses vectorized mask operations instead of CPU loop.
 
         Returns:
             keep: [K_final] indices into the input arrays of kept seeds.
@@ -95,23 +97,24 @@ class SeedGenerator(nn.Module):
 
         device = xyz.device
 
-        # Pairwise distances on GPU, NMS loop on CPU
+        # Pairwise adjacency mask (GPU)
         dists = torch.cdist(xyz.unsqueeze(0), xyz.unsqueeze(0)).squeeze(0)
-
-        dists_cpu = dists.cpu()
+        adjacent = dists < radius  # [K, K] bool
         del dists
-        order_cpu = scores.argsort(descending=True).cpu()
 
-        keep = []
-        suppressed = torch.zeros(K, dtype=torch.bool)
+        # Greedy NMS in score-descending order (all on GPU)
+        order = scores.argsort(descending=True).cpu()  # loop var on CPU
+        alive = torch.ones(K, dtype=torch.bool, device=device)
+        keep = torch.empty(K, dtype=torch.long, device=device)
+        n_keep = 0
 
-        for idx in order_cpu:
-            i = idx.item()
-            if suppressed[i]:
+        for i in order.tolist():
+            if not alive[i].item():
                 continue
-            keep.append(i)
-            close = dists_cpu[i] < radius
-            suppressed |= close
-            suppressed[i] = False
+            keep[n_keep] = i
+            n_keep += 1
+            # Suppress neighbors; un-suppress self (already kept)
+            alive &= ~adjacent[i]
+            alive[i] = True
 
-        return torch.tensor(keep, dtype=torch.long, device=device)
+        return keep[:n_keep]
