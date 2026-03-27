@@ -1,0 +1,22 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Checkpoints / Models
+*.pt
+*.pth
+
+# Outputs / Logs / Visualization
+outputs/
+ckpt/
+*.png
+*.html
+*.log
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/

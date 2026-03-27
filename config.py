@@ -72,13 +72,11 @@ class NeuralClusteringConfig:
     # Training
     lr: float = 1e-3
     weight_decay: float = 1e-4
-    num_epochs: int = 100
+    num_epochs: int = 50
     batch_size: int = 2
 
     # Loss weights
     w_surface: float = 1.0
-    w_assign: float = 0.01
-    w_scale: float = 0.01
 
     # Data
     data_root: str = "~/data/nuScenes"

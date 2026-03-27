@@ -132,7 +132,7 @@ class GaussianParameterHead(nn.Module):
 
         q = F.normalize(q_pca + self.mlp_q(cluster_feats), dim=-1)
 
-        s = F.softplus(torch.log(s_pca) + self.mlp_s(cluster_feats))
+        s = s_pca * torch.exp(self.mlp_s(cluster_feats))
 
         alpha = torch.sigmoid(self.mlp_alpha(cluster_feats))
 

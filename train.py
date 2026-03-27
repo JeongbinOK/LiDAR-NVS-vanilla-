@@ -81,15 +81,16 @@ def process_frame(model, loss_fn, pts, device, tau, ego_radius):
     mask = torch.norm(xyz, dim=1) > ego_radius
     xyz, intensity = xyz[mask], intensity[mask]
 
-    output = model(xyz, intensity, tau=tau)
-    loss_dict = loss_fn(xyz, output)
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        output = model(xyz, intensity, tau=tau)
+        loss_dict = loss_fn(xyz, output)
     return loss_dict, output, xyz
 
 
 def train(cfg: NeuralClusteringConfig, overfit_frames: int = 0):
     """Main training loop."""
     device = cfg.device
-
+    
     # Create per-run output directory
     run_dir = _make_run_dir(os.path.join(os.path.dirname(__file__), "outputs"))
     ckpt_dir = os.path.join(run_dir, "ckpt")
@@ -111,19 +112,15 @@ def train(cfg: NeuralClusteringConfig, overfit_frames: int = 0):
 
     dataloader = DataLoader(
         dataset, batch_size=cfg.batch_size, shuffle=True,
-        collate_fn=nvs_collate_fn, num_workers=0,
+        collate_fn=nvs_collate_fn, num_workers=4, persistent_workers=True,
     )
 
     model = NeuralClusteringModel(cfg).to(device)
-    loss_fn = ClusteringLoss(
-        w_surface=cfg.w_surface,
-        w_assign=cfg.w_assign,
-        w_scale=cfg.w_scale,
-    )
+    loss_fn = ClusteringLoss(w_surface=cfg.w_surface)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay,
     )
-
+    
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Parameters: {num_params:,}")
     print(f"Dataset: {len(dataset)} pairs")
@@ -188,7 +185,8 @@ def train(cfg: NeuralClusteringConfig, overfit_frames: int = 0):
         log = (f"[{epoch+1:3d}/{cfg.num_epochs}] "
                f"loss={avg['total']:.4f} "
                f"(S={avg['surface']:.4f} cmp={avg['compact']:.4f}) "
-               f"tau={tau:.2f} {dt:.1f}s")
+               f"tau={tau:.2f} {dt:.1f}s"
+               f" | s_avg={avg['s_mean']:.3f} s_max={avg['s_max']:.3f}")
 
         if epoch_metrics:
             mg = {k: sum(m[k] for m in epoch_metrics) / len(epoch_metrics)
@@ -229,8 +227,6 @@ def main():
     parser.add_argument("--overfit", type=int, default=0,
                         help="Overfit on N pairs (0=full training)")
     parser.add_argument("--device", default=_defaults.device)
-    parser.add_argument("--w-assign", type=float, default=_defaults.w_assign)
-    parser.add_argument("--w-scale", type=float, default=_defaults.w_scale)
     parser.add_argument("--k-max", type=int, default=_defaults.k_max)
     args = parser.parse_args()
 
@@ -240,8 +236,6 @@ def main():
         lr=args.lr,
         batch_size=args.batch_size,
         device=args.device,
-        w_assign=args.w_assign,
-        w_scale=args.w_scale,
         k_max=args.k_max,
     )
 

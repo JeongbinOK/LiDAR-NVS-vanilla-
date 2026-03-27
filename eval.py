@@ -106,11 +106,7 @@ def main():
     model.eval()
     print(f"Loaded checkpoint: epoch {ckpt['epoch']}, train_loss {ckpt['loss']:.4f}")
 
-    loss_fn = ClusteringLoss(
-        w_surface=cfg.w_surface,
-        w_assign=cfg.w_assign,
-        w_scale=cfg.w_scale,
-    )
+    loss_fn = ClusteringLoss(w_surface=cfg.w_surface)
 
     # Dataset
     dataset = NuScenesNVSDataset(
