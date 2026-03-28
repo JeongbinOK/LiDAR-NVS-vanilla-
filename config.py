@@ -102,6 +102,7 @@ class NeuralClusteringConfig:
     # Loss weights
     w_surface: float = 1.0
     lambda_sparse: float = 0.01
+    lambda_barrier: float = 0.1
     top_k_assign: int = 8
 
     # Data

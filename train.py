@@ -129,6 +129,7 @@ def train(cfg: NeuralClusteringConfig, overfit_frames: int = 0):
     loss_fn = ClusteringLoss(
         w_surface=cfg.w_surface,
         lambda_sparse=cfg.lambda_sparse,
+        lambda_barrier=cfg.lambda_barrier,
         primitive=cfg.primitive_type,
         top_k_assign=cfg.top_k_assign,
     )
@@ -199,7 +200,7 @@ def train(cfg: NeuralClusteringConfig, overfit_frames: int = 0):
 
         log = (f"[{epoch+1:3d}/{cfg.num_epochs}] "
                f"loss={avg['total']:.4f} "
-               f"(S={avg['surface']:.4f} spr={avg['sparsity']:.4f}) "
+               f"(S={avg['surface']:.4f} spr={avg['sparsity']:.4f} bar={avg['barrier']:.4f}) "
                f"tau={tau:.2f} {dt:.1f}s"
                f" | s={avg['s_mean']:.3f} a={avg['alpha_active']:.0f}")
 

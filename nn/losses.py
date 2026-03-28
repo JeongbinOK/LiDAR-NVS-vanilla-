@@ -1,7 +1,7 @@
 """Self-supervised loss functions for neural Gaussian clustering.
 
 Supports both 2D surfel and 3D Gaussian primitives.
-Alpha-weighted NLL + sparsity for automatic Gaussian count control.
+Alpha-weighted NLL + sparsity + log barrier for stable alpha training.
 """
 
 import torch
@@ -13,7 +13,11 @@ from nn.gaussian_head import quaternion_to_rotation_matrix
 class ClusteringLoss(nn.Module):
     """Geometric self-supervision for Gaussian clustering.
 
-    L = w_surface * L_surface(alpha-weighted NLL) + lambda_sparse * L_sparsity
+    L = w_surface * L_surface + lambda_sparse * L_sparsity + lambda_barrier * L_barrier
+
+    Log barrier prevents alpha collapse to zero. Equilibrium alpha per Gaussian:
+        alpha_k* = lambda_barrier / (w_surface * avg_nll_k + lambda_sparse)
+    Good fit (low NLL) → high alpha, poor fit (high NLL) → low alpha.
 
     2D: gamma_sq + maha_2d + log_det_2d
     3D: maha_3d + log_det_3d (no normal comparison)
@@ -23,12 +27,14 @@ class ClusteringLoss(nn.Module):
         self,
         w_surface: float = 1.0,
         lambda_sparse: float = 0.01,
+        lambda_barrier: float = 0.1,
         primitive: str = "2d",
         top_k_assign: int = 8,
     ):
         super().__init__()
         self.w_surface = w_surface
         self.lambda_sparse = lambda_sparse
+        self.lambda_barrier = lambda_barrier
         self.primitive = primitive
         self.top_k_assign = top_k_assign
 
@@ -71,11 +77,18 @@ class ClusteringLoss(nn.Module):
             l_surface = self._nll_3d(d, s_cands, q_cands, alpha_cands,
                                      assign_topk_w)
 
-        # Sparsity: push unused Gaussians toward alpha=0
+        # Sparsity: push alpha toward 0
         l_sparsity = alpha.mean()
 
+        # Log barrier: prevent alpha collapse (pushes alpha away from 0)
+        # Cast to float32 for numerical stability in log
+        alpha_f32 = alpha.float().clamp(min=1e-6)
+        l_barrier = -torch.log(alpha_f32).mean()
+
         # Total
-        total = self.w_surface * l_surface + self.lambda_sparse * l_sparsity
+        total = (self.w_surface * l_surface
+                 + self.lambda_sparse * l_sparsity
+                 + self.lambda_barrier * l_barrier)
 
         # Monitoring metrics
         dist_sq = d.pow(2).sum(dim=-1)
@@ -87,6 +100,7 @@ class ClusteringLoss(nn.Module):
             "total": total,
             "surface": l_surface,
             "sparsity": l_sparsity,
+            "barrier": l_barrier,
             "compact": l_compact,
             "scale": l_scale,
             "s_mean": s.mean(),
@@ -116,8 +130,9 @@ class ClusteringLoss(nn.Module):
         # Log determinant
         log_det = torch.log(s_cands[:, :, 0]) + torch.log(s_cands[:, :, 1])
 
-        # Alpha-weighted NLL
-        per_point = alpha_cands * (gamma_sq + maha + log_det)
+        # Alpha-weighted NLL (clamp to non-negative to prevent alpha-NLL feedback loop)
+        nll = (gamma_sq + maha + log_det).clamp(min=0)
+        per_point = alpha_cands * nll
         return (assign_w * per_point).sum(1).mean()
 
     def _nll_3d(self, d, s_cands, q_cands, alpha_cands, assign_w):
@@ -139,6 +154,7 @@ class ClusteringLoss(nn.Module):
         # Log determinant (3 axes)
         log_det = torch.log(s_cands).sum(dim=-1)  # [N, k]
 
-        # Alpha-weighted NLL
-        per_point = alpha_cands * (maha + log_det)
+        # Alpha-weighted NLL (clamp to non-negative)
+        nll = (maha + log_det).clamp(min=0)
+        per_point = alpha_cands * nll
         return (assign_w * per_point).sum(1).mean()
