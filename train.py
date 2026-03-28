@@ -51,24 +51,34 @@ def compute_tau(epoch: int, cfg: NeuralClusteringConfig) -> float:
 def evaluate_geometric(xyz: torch.Tensor, output: dict) -> dict:
     """Geometric self-evaluation metrics (no GT needed)."""
     gaussians = output["gaussians"]
-    assign_indices = output["assign_indices"]
-    assign_weights = output["assign_weights"]
+    assign = output["assign"]  # [N, K] dense
 
-    mu = gaussians["mu"]
-    n = gaussians["n"]
+    mu = gaussians["mu"]  # [K, 3]
+    alpha = gaussians["alpha"]  # [K, 1]
 
-    hard = assign_indices.gather(
-        1, assign_weights.argmax(dim=1, keepdim=True)
-    ).squeeze(1)
+    hard = assign.argmax(dim=1)  # [N]
 
-    gamma = ((xyz - mu[hard]) * n[hard]).sum(dim=1)
-    gamma_rms = gamma.pow(2).mean().sqrt().item()
-    coverage = (assign_weights.max(dim=1).values > 0.1).float().mean().item()
+    # Distance to assigned center
+    dist = (xyz - mu[hard]).norm(dim=1)
+    dist_rms = dist.pow(2).mean().sqrt().item()
+
+    # Off-plane distance for 2D (normal exists)
+    if "n" in gaussians:
+        n = gaussians["n"]
+        gamma = ((xyz - mu[hard]) * n[hard]).sum(dim=1)
+        gamma_rms = gamma.pow(2).mean().sqrt().item()
+    else:
+        gamma_rms = dist_rms
+
+    coverage = (assign.max(dim=1).values > 0.1).float().mean().item()
+    alpha_active = (alpha.squeeze(-1) > 0.1).sum().item()
 
     return {
         "gamma_rms": gamma_rms,
+        "dist_rms": dist_rms,
         "coverage": coverage,
         "num_gaussians": mu.shape[0],
+        "alpha_active": alpha_active,
     }
 
 
@@ -116,7 +126,12 @@ def train(cfg: NeuralClusteringConfig, overfit_frames: int = 0):
     )
 
     model = NeuralClusteringModel(cfg).to(device)
-    loss_fn = ClusteringLoss(w_surface=cfg.w_surface)
+    loss_fn = ClusteringLoss(
+        w_surface=cfg.w_surface,
+        lambda_sparse=cfg.lambda_sparse,
+        primitive=cfg.primitive_type,
+        top_k_assign=cfg.top_k_assign,
+    )
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay,
     )
@@ -184,9 +199,9 @@ def train(cfg: NeuralClusteringConfig, overfit_frames: int = 0):
 
         log = (f"[{epoch+1:3d}/{cfg.num_epochs}] "
                f"loss={avg['total']:.4f} "
-               f"(S={avg['surface']:.4f} cmp={avg['compact']:.4f}) "
+               f"(S={avg['surface']:.4f} spr={avg['sparsity']:.4f}) "
                f"tau={tau:.2f} {dt:.1f}s"
-               f" | s_avg={avg['s_mean']:.3f} s_max={avg['s_max']:.3f}")
+               f" | s={avg['s_mean']:.3f} a={avg['alpha_active']:.0f}")
 
         if epoch_metrics:
             mg = {k: sum(m[k] for m in epoch_metrics) / len(epoch_metrics)
@@ -227,7 +242,10 @@ def main():
     parser.add_argument("--overfit", type=int, default=0,
                         help="Overfit on N pairs (0=full training)")
     parser.add_argument("--device", default=_defaults.device)
-    parser.add_argument("--k-max", type=int, default=_defaults.k_max)
+    parser.add_argument("--backbone", default=_defaults.backbone_type,
+                        choices=["ptv3", "custom"])
+    parser.add_argument("--primitive", default=_defaults.primitive_type,
+                        choices=["2d", "3d"])
     args = parser.parse_args()
 
     cfg = NeuralClusteringConfig(
@@ -236,7 +254,8 @@ def main():
         lr=args.lr,
         batch_size=args.batch_size,
         device=args.device,
-        k_max=args.k_max,
+        backbone_type=args.backbone,
+        primitive_type=args.primitive,
     )
 
     train(cfg, overfit_frames=args.overfit)

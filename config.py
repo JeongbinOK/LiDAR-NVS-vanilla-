@@ -46,26 +46,50 @@ class ClusteringConfig:
 
 @dataclass
 class NeuralClusteringConfig:
-    """Hyperparameters for the neural clustering pipeline."""
+    """Hyperparameters for the neural clustering pipeline v2."""
 
-    # Module A: Point Feature Backbone
+    # Backbone
+    backbone_type: str = "ptv3"    # "ptv3" or "custom"
     feature_dim: int = 64
+
+    # PTv3 backbone settings
+    ptv3_grid_size: float = 0.1
+    ptv3_stride: tuple = (2, 2)
+    ptv3_enc_depths: tuple = (2, 2, 2)
+    ptv3_enc_channels: tuple = (32, 64, 128)
+    ptv3_enc_num_head: tuple = (2, 4, 8)
+    ptv3_enc_patch_size: tuple = (1024, 1024, 1024)
+    ptv3_dec_depths: tuple = (2, 2)
+    ptv3_dec_channels: tuple = (64, 64)
+    ptv3_dec_num_head: tuple = (4, 4)
+    ptv3_dec_patch_size: tuple = (1024, 1024)
+    ptv3_enable_flash: bool = True
+
+    # Custom backbone fallback settings
     num_blocks: int = 3
     window_size: int = 48
     num_heads: int = 4
 
-    # Module B: Seed Generation
-    k_max: int = 1500
-    nms_radius_factor: float = 0.3
+    # Voting / Seed selection
     target_cluster_size: int = 30
 
-    # Module C: Soft Assignment
-    top_k_seeds: int = 8
+    # Differentiable clustering
+    cluster_iters: int = 4
+    cluster_feat_weight: float = 0.1
 
-    # Preprocessing (non-learned)
+    # Cross-attention refinement
+    refine_layers: int = 2
+    refine_heads: int = 4
+    refine_local_topk: int = 64
+
+    # Gaussian head
+    primitive_type: str = "2d"     # "2d" or "3d"
+    pca_topk: int = 128
+
+    # Preprocessing
     ego_radius: float = 2.5
 
-    # Gumbel temperature schedule
+    # Temperature schedule
     gumbel_tau_start: float = 1.0
     gumbel_tau_end: float = 0.1
 
@@ -77,6 +101,8 @@ class NeuralClusteringConfig:
 
     # Loss weights
     w_surface: float = 1.0
+    lambda_sparse: float = 0.01
+    top_k_assign: int = 8
 
     # Data
     data_root: str = "~/data/nuScenes"

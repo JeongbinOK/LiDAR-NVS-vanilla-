@@ -28,26 +28,35 @@ def evaluate_frame(model, loss_fn, pts, device, tau, ego_radius):
         loss_dict = loss_fn(xyz, output)
 
     gaussians = output["gaussians"]
-    assign_indices = output["assign_indices"]
-    assign_weights = output["assign_weights"]
-    mu, n = gaussians["mu"], gaussians["n"]
+    assign = output["assign"]  # [N, K] dense
+    mu = gaussians["mu"]
+    alpha = gaussians["alpha"]
 
-    hard = assign_indices.gather(
-        1, assign_weights.argmax(dim=1, keepdim=True),
-    ).squeeze(1)
+    hard = assign.argmax(dim=1)
 
-    gamma = ((xyz - mu[hard]) * n[hard]).sum(dim=1)
-    gamma_rms = gamma.pow(2).mean().sqrt().item()
-    coverage = (assign_weights.max(dim=1).values > 0.1).float().mean().item()
+    # Distance to assigned center
+    dist_rms = (xyz - mu[hard]).norm(dim=1).pow(2).mean().sqrt().item()
+
+    # Off-plane distance for 2D
+    if "n" in gaussians:
+        n = gaussians["n"]
+        gamma = ((xyz - mu[hard]) * n[hard]).sum(dim=1)
+        gamma_rms = gamma.pow(2).mean().sqrt().item()
+    else:
+        gamma_rms = dist_rms
+
+    coverage = (assign.max(dim=1).values > 0.1).float().mean().item()
+    alpha_active = (alpha.squeeze(-1) > 0.1).sum().item()
 
     metrics = {
         "loss": loss_dict["total"].item(),
         "surface": loss_dict["surface"].item(),
-        "compact": loss_dict["compact"].item(),
-        "scale": loss_dict["scale"].item(),
+        "sparsity": loss_dict["sparsity"].item(),
         "gamma_rms": gamma_rms,
+        "dist_rms": dist_rms,
         "coverage": coverage,
         "K": mu.shape[0],
+        "alpha_active": alpha_active,
         "N": xyz.shape[0],
     }
     return metrics, output, xyz
@@ -60,14 +69,11 @@ def save_bev(xyz, output, path, title=""):
     import matplotlib.pyplot as plt
 
     xyz_np = xyz.cpu().numpy()
-    assign_indices = output["assign_indices"]
-    assign_weights = output["assign_weights"]
+    assign = output["assign"]  # [N, K] dense
     mu = output["gaussians"]["mu"].cpu().numpy()
     s = output["gaussians"]["s"].cpu().numpy()
 
-    hard = assign_indices.gather(
-        1, assign_weights.argmax(dim=1, keepdim=True),
-    ).squeeze(1).cpu().numpy()
+    hard = assign.argmax(dim=1).cpu().numpy()
 
     fig, ax = plt.subplots(1, 1, figsize=(12, 12))
     scatter = ax.scatter(
@@ -106,7 +112,12 @@ def main():
     model.eval()
     print(f"Loaded checkpoint: epoch {ckpt['epoch']}, train_loss {ckpt['loss']:.4f}")
 
-    loss_fn = ClusteringLoss(w_surface=cfg.w_surface)
+    loss_fn = ClusteringLoss(
+        w_surface=cfg.w_surface,
+        lambda_sparse=cfg.lambda_sparse,
+        primitive=cfg.primitive_type,
+        top_k_assign=cfg.top_k_assign,
+    )
 
     # Dataset
     dataset = NuScenesNVSDataset(
@@ -150,7 +161,7 @@ def main():
     print("\n" + "=" * 60)
     print(f"{'Metric':<15} {'Mean':>10} {'Std':>10} {'Min':>10} {'Max':>10}")
     print("-" * 60)
-    for key in ["gamma_rms", "surface", "compact", "scale", "coverage", "K", "N"]:
+    for key in ["gamma_rms", "dist_rms", "surface", "sparsity", "coverage", "K", "alpha_active", "N"]:
         vals = [m[key] for m in all_metrics]
         print(
             f"{key:<15} {np.mean(vals):10.4f} {np.std(vals):10.4f} "
