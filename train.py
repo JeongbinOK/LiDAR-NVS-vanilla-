@@ -43,9 +43,9 @@ def _make_run_dir(base: str = "outputs") -> str:
 def compute_tau(epoch: int, cfg: NeuralClusteringConfig) -> float:
     """Linear temperature annealing from tau_start to tau_end."""
     if cfg.num_epochs <= 1:
-        return cfg.gumbel_tau_end
+        return cfg.cluster_tau_end
     t = epoch / (cfg.num_epochs - 1)
-    return cfg.gumbel_tau_start + t * (cfg.gumbel_tau_end - cfg.gumbel_tau_start)
+    return cfg.cluster_tau_start + t * (cfg.cluster_tau_end - cfg.cluster_tau_start)
 
 
 def evaluate_geometric(xyz: torch.Tensor, output: dict) -> dict:
@@ -54,8 +54,6 @@ def evaluate_geometric(xyz: torch.Tensor, output: dict) -> dict:
     assign = output["assign"]  # [N, K] dense
 
     mu = gaussians["mu"]  # [K, 3]
-    alpha = gaussians["alpha"]  # [K, 1]
-
     hard = assign.argmax(dim=1)  # [N]
 
     # Distance to assigned center
@@ -71,14 +69,12 @@ def evaluate_geometric(xyz: torch.Tensor, output: dict) -> dict:
         gamma_rms = dist_rms
 
     coverage = (assign.max(dim=1).values > 0.1).float().mean().item()
-    alpha_active = (alpha.squeeze(-1) > 0.1).sum().item()
 
     return {
         "gamma_rms": gamma_rms,
         "dist_rms": dist_rms,
         "coverage": coverage,
         "num_gaussians": mu.shape[0],
-        "alpha_active": alpha_active,
     }
 
 
@@ -127,10 +123,6 @@ def train(cfg: NeuralClusteringConfig, overfit_frames: int = 0):
 
     model = NeuralClusteringModel(cfg).to(device)
     loss_fn = ClusteringLoss(
-        w_surface=cfg.w_surface,
-        lambda_alpha=cfg.lambda_alpha,
-        lambda_center=cfg.lambda_center,
-        lambda_barrier=cfg.lambda_barrier,
         primitive=cfg.primitive_type,
         top_k_assign=cfg.top_k_assign,
     )
@@ -201,10 +193,8 @@ def train(cfg: NeuralClusteringConfig, overfit_frames: int = 0):
 
         log = (f"[{epoch+1:3d}/{cfg.num_epochs}] "
                f"loss={avg['total']:.4f} "
-               f"(S={avg['surface']:.4f} a_l={avg['alpha_loss']:.4f} "
-               f"ctr={avg['centerness']:.4f}) "
                f"tau={tau:.2f} {dt:.1f}s"
-               f" | s={avg['s_mean']:.3f} a={avg['alpha_active']:.0f}")
+               f" | s={avg['s_mean']:.3f} K={avg['K']:.0f}")
 
         if epoch_metrics:
             mg = {k: sum(m[k] for m in epoch_metrics) / len(epoch_metrics)

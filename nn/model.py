@@ -1,6 +1,6 @@
 """Neural Gaussian clustering model v2.
 
-Pipeline: PTv3 Backbone → Offset Voting → Diff Clustering → Cross-Attn Refine → Gaussian Head
+Pipeline: PTv3 Backbone → Voxel Seeding → Diff Clustering → Cross-Attn Refine → Gaussian Head
 """
 
 import torch
@@ -8,7 +8,7 @@ import torch.nn as nn
 
 from nn.ptv3.wrapper import PTv3Backbone
 from nn.backbone import PointFeatureBackbone
-from nn.vote import LearnedCenterPredictor
+from nn.vote import VoxelCenterPredictor
 from nn.diff_cluster import DiffSoftClustering
 from nn.refine import CrossAttentionRefiner
 from nn.gaussian_head import GaussianParameterHead
@@ -19,9 +19,9 @@ class NeuralClusteringModel(nn.Module):
 
     Pipeline:
         1. Backbone: xyz + intensity → per-point features [N, D]
-        2. Vote: features → offset, centerness → seed selection
-        3. Cluster: iterative soft k-means → centers, assignments
-        4. Refine: cross-attention → refined center features
+        2. Vote + Voxel: features → offset → voxel pooling → seeds [V, 3]
+        3. Cluster: iterative soft k-means → centers, assignments [N, K]
+        4. Refine: cross-attention → refined center features [K, D]
         5. Head: PCA + residual → Gaussian parameters
     """
 
@@ -52,10 +52,10 @@ class NeuralClusteringModel(nn.Module):
                 window_size=cfg.window_size, num_heads=cfg.num_heads,
             )
 
-        # Stage 2: Learned Center Prediction
-        self.voter = LearnedCenterPredictor(
+        # Stage 2: Voxel-based Center Prediction
+        self.voter = VoxelCenterPredictor(
             dim=D,
-            target_cluster_size=cfg.target_cluster_size,
+            voxel_size=getattr(cfg, 'seed_voxel_size', 0.3),
         )
 
         # Stage 3: Differentiable Soft Clustering
@@ -85,7 +85,7 @@ class NeuralClusteringModel(nn.Module):
         Args:
             xyz: [N, 3] point positions (ego-masked)
             intensity: [N] or [N, 1] per-point intensity
-            tau: temperature for Gumbel selection and soft clustering
+            tau: temperature for soft clustering
 
         Returns:
             dict with gaussians, assignments, voting info
@@ -93,13 +93,16 @@ class NeuralClusteringModel(nn.Module):
         # Stage 1: Backbone
         features = self.backbone(xyz, intensity)  # [N, D]
 
-        # Stage 2: Offset Voting
-        vote_out = self.voter(features, xyz, tau)
-        vote_xyz = vote_out["vote_xyz"]     # [N, 3]
-        seed_idx = vote_out["seed_idx"]     # [K]
+        # Stage 2: Voxel Seeding
+        vote_out = self.voter(features, xyz)
+        vote_xyz = vote_out["vote_xyz"]              # [N, 3]
+        voxel_centers = vote_out["voxel_centers"]    # [V, 3]
+        voxel_feats = vote_out["voxel_feats"]        # [V, D]
 
         # Stage 3: Differentiable Soft Clustering
-        cluster_out = self.clusterer(vote_xyz, features, seed_idx, tau)
+        cluster_out = self.clusterer(
+            vote_xyz, features, voxel_centers, voxel_feats, tau,
+        )
         centers = cluster_out["centers"]          # [K, 3]
         center_feats = cluster_out["center_feats"]  # [K, D]
         assign = cluster_out["assign"]            # [N, K]
@@ -117,7 +120,6 @@ class NeuralClusteringModel(nn.Module):
             "assign": assign,             # [N, K] dense
             "centers": centers,           # [K, 3]
             "vote_xyz": vote_xyz,         # [N, 3]
-            "centerness": vote_out["centerness"],  # [N]
             "offset": vote_out["offset"],          # [N, 3]
-            "seed_idx": seed_idx,                  # [K]
+            "voxel_ids": vote_out["voxel_ids"],    # [N]
         }

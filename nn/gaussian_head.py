@@ -44,9 +44,6 @@ class GaussianParameterHead(nn.Module):
             nn.Linear(dim, dim // 2), nn.ReLU(), nn.Linear(dim // 2, 4))
         self.mlp_s = nn.Sequential(
             nn.Linear(dim, dim // 2), nn.ReLU(), nn.Linear(dim // 2, s_dim))
-        self.mlp_alpha = nn.Sequential(
-            nn.Linear(dim, dim // 2), nn.ReLU(), nn.Linear(dim // 2, 1))
-
         # Zero-init residual heads so initial output = PCA
         for mlp in [self.mlp_mu, self.mlp_q, self.mlp_s]:
             nn.init.zeros_(mlp[-1].weight)
@@ -124,8 +121,8 @@ class GaussianParameterHead(nn.Module):
         # Residual prediction
         mu = centers + self.mlp_mu(center_feats)
         q = F.normalize(q_pca + self.mlp_q(center_feats), dim=-1)
-        s = s_pca * torch.exp(self.mlp_s(center_feats))
-        alpha = torch.sigmoid(self.mlp_alpha(center_feats))
+        s = (s_pca * torch.exp(self.mlp_s(center_feats).clamp(-3, 3))).clamp(min=0.1)
+        alpha = torch.ones(centers.shape[0], 1, device=centers.device)
 
         # Rotation matrix and derived vectors
         R = quaternion_to_rotation_matrix(q)

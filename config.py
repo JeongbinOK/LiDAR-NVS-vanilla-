@@ -70,8 +70,8 @@ class NeuralClusteringConfig:
     window_size: int = 48
     num_heads: int = 4
 
-    # Voting / Seed selection
-    target_cluster_size: int = 30
+    # Voxel seeding
+    seed_voxel_size: float = 0.3
 
     # Differentiable clustering
     cluster_iters: int = 4
@@ -89,9 +89,9 @@ class NeuralClusteringConfig:
     # Preprocessing
     ego_radius: float = 2.5
 
-    # Temperature schedule
-    gumbel_tau_start: float = 1.0
-    gumbel_tau_end: float = 0.1
+    # Clustering temperature schedule
+    cluster_tau_start: float = 1.0
+    cluster_tau_end: float = 0.2
 
     # Training
     lr: float = 1e-3
@@ -99,11 +99,7 @@ class NeuralClusteringConfig:
     num_epochs: int = 50
     batch_size: int = 2
 
-    # Loss weights
-    w_surface: float = 1.0
-    lambda_alpha: float = 0.1
-    lambda_center: float = 0.1
-    lambda_barrier: float = 0.01
+    # Loss
     top_k_assign: int = 8
 
     # Data

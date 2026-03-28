@@ -1,4 +1,4 @@
-"""Evaluation script for neural 2D Gaussian clustering."""
+"""Evaluation script for neural Gaussian clustering."""
 
 import argparse
 import os
@@ -30,7 +30,6 @@ def evaluate_frame(model, loss_fn, pts, device, tau, ego_radius):
     gaussians = output["gaussians"]
     assign = output["assign"]  # [N, K] dense
     mu = gaussians["mu"]
-    alpha = gaussians["alpha"]
 
     hard = assign.argmax(dim=1)
 
@@ -46,19 +45,14 @@ def evaluate_frame(model, loss_fn, pts, device, tau, ego_radius):
         gamma_rms = dist_rms
 
     coverage = (assign.max(dim=1).values > 0.1).float().mean().item()
-    alpha_active = (alpha.squeeze(-1) > 0.1).sum().item()
 
     metrics = {
         "loss": loss_dict["total"].item(),
         "surface": loss_dict["surface"].item(),
-        "alpha_loss": loss_dict["alpha_loss"].item(),
-        "centerness": loss_dict["centerness"].item(),
-        "barrier": loss_dict["barrier"].item(),
         "gamma_rms": gamma_rms,
         "dist_rms": dist_rms,
         "coverage": coverage,
         "K": mu.shape[0],
-        "alpha_active": alpha_active,
         "N": xyz.shape[0],
     }
     return metrics, output, xyz
@@ -73,12 +67,11 @@ def save_bev(xyz, output, path, title=""):
     xyz_np = xyz.cpu().numpy()
     assign = output["assign"]  # [N, K] dense
     mu = output["gaussians"]["mu"].cpu().numpy()
-    s = output["gaussians"]["s"].cpu().numpy()
 
     hard = assign.argmax(dim=1).cpu().numpy()
 
     fig, ax = plt.subplots(1, 1, figsize=(12, 12))
-    scatter = ax.scatter(
+    ax.scatter(
         xyz_np[:, 0], xyz_np[:, 1],
         c=hard, cmap="tab20", s=0.3, alpha=0.6, rasterized=True,
     )
@@ -100,7 +93,7 @@ def main():
     parser.add_argument("--data-root", default=os.path.expanduser("~/data/nuScenes"))
     parser.add_argument("--split", default="val")
     parser.add_argument("--num-frames", type=int, default=20)
-    parser.add_argument("--tau", type=float, default=0.1, help="Gumbel tau for eval")
+    parser.add_argument("--tau", type=float, default=0.1, help="Clustering tau for eval")
     parser.add_argument("--save-viz", action="store_true", help="Save BEV plots")
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
@@ -115,10 +108,6 @@ def main():
     print(f"Loaded checkpoint: epoch {ckpt['epoch']}, train_loss {ckpt['loss']:.4f}")
 
     loss_fn = ClusteringLoss(
-        w_surface=cfg.w_surface,
-        lambda_alpha=cfg.lambda_alpha,
-        lambda_center=cfg.lambda_center,
-        lambda_barrier=cfg.lambda_barrier,
         primitive=cfg.primitive_type,
         top_k_assign=cfg.top_k_assign,
     )
@@ -165,7 +154,7 @@ def main():
     print("\n" + "=" * 60)
     print(f"{'Metric':<15} {'Mean':>10} {'Std':>10} {'Min':>10} {'Max':>10}")
     print("-" * 60)
-    for key in ["gamma_rms", "dist_rms", "surface", "alpha_loss", "centerness", "barrier", "coverage", "K", "alpha_active", "N"]:
+    for key in ["gamma_rms", "dist_rms", "surface", "coverage", "K", "N"]:
         vals = [m[key] for m in all_metrics]
         print(
             f"{key:<15} {np.mean(vals):10.4f} {np.std(vals):10.4f} "
