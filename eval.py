@@ -51,7 +51,9 @@ def evaluate_frame(model, loss_fn, pts, device, tau, ego_radius):
     metrics = {
         "loss": loss_dict["total"].item(),
         "surface": loss_dict["surface"].item(),
-        "sparsity": loss_dict["sparsity"].item(),
+        "alpha_loss": loss_dict["alpha_loss"].item(),
+        "centerness": loss_dict["centerness"].item(),
+        "barrier": loss_dict["barrier"].item(),
         "gamma_rms": gamma_rms,
         "dist_rms": dist_rms,
         "coverage": coverage,
@@ -114,7 +116,9 @@ def main():
 
     loss_fn = ClusteringLoss(
         w_surface=cfg.w_surface,
-        lambda_sparse=cfg.lambda_sparse,
+        lambda_alpha=cfg.lambda_alpha,
+        lambda_center=cfg.lambda_center,
+        lambda_barrier=cfg.lambda_barrier,
         primitive=cfg.primitive_type,
         top_k_assign=cfg.top_k_assign,
     )
@@ -161,7 +165,7 @@ def main():
     print("\n" + "=" * 60)
     print(f"{'Metric':<15} {'Mean':>10} {'Std':>10} {'Min':>10} {'Max':>10}")
     print("-" * 60)
-    for key in ["gamma_rms", "dist_rms", "surface", "sparsity", "coverage", "K", "alpha_active", "N"]:
+    for key in ["gamma_rms", "dist_rms", "surface", "alpha_loss", "centerness", "barrier", "coverage", "K", "alpha_active", "N"]:
         vals = [m[key] for m in all_metrics]
         print(
             f"{key:<15} {np.mean(vals):10.4f} {np.std(vals):10.4f} "
