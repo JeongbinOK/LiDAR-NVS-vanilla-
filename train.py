@@ -130,8 +130,12 @@ def train(cfg: NeuralClusteringConfig, overfit_frames: int = 0):
         model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay,
     )
     
+    print("Model Parameters per Module:")
+    for name, module in model.named_children():
+        params = sum(p.numel() for p in module.parameters() if p.requires_grad)
+        print(f"  {name:<20}: {params:>12,}")
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Parameters: {num_params:,}")
+    print(f"Total Parameters: {num_params:,}")
     print(f"Dataset: {len(dataset)} pairs")
     print(f"Epochs: {cfg.num_epochs}, batch_size: {cfg.batch_size}")
     print("-" * 60)
@@ -149,29 +153,35 @@ def train(cfg: NeuralClusteringConfig, overfit_frames: int = 0):
         for batch_idx, batch in enumerate(pbar):
             # batch['input_0']: List[Tensor(N, 4)], batch['input_1']: List[Tensor(M, 4)]
             B = len(batch['input_0'])
+            num_frames = B * 2
             batch_loss = 0.0
             batch_loss_dicts = []
+            
+            optimizer.zero_grad()
+            nan_found = False
 
             for b in range(B):
                 for frame_pts in [batch['input_0'][b], batch['input_1'][b]]:
                     ld, output, xyz = process_frame(
                         model, loss_fn, frame_pts, device, tau, cfg.ego_radius,
                     )
-                    batch_loss = batch_loss + ld["total"]
+                    
+                    frame_loss = ld["total"] / num_frames
+                    if torch.isnan(frame_loss):
+                        nan_found = True
+                    else:
+                        frame_loss.backward()
+
+                    batch_loss += ld["total"].item()
                     batch_loss_dicts.append({k: v.item() for k, v in ld.items()})
 
-            # Average over all frames in the batch (B * 2 frames)
-            num_frames = B * 2
             batch_loss = batch_loss / num_frames
 
-            if torch.isnan(batch_loss):
+            if nan_found:
                 pbar.write(f"  NaN loss at batch {batch_idx}, skipping")
                 optimizer.zero_grad()
-                batch_loss = 0.0
                 continue
 
-            optimizer.zero_grad()
-            batch_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 

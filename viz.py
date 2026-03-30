@@ -136,8 +136,7 @@ def visualize(checkpoint: str, scene_num: int, split: str,
         output = model(xyz, intensity, tau=tau)
 
     gaussians      = output["gaussians"]
-    assign_indices = output["assign_indices"]
-    assign_weights = output["assign_weights"]
+    assign         = output["assign"]
 
     mu     = gaussians["mu"].cpu().numpy()   # [K, 3]
     n_vec  = gaussians["n"].cpu().numpy()    # [K, 3]
@@ -146,9 +145,7 @@ def visualize(checkpoint: str, scene_num: int, split: str,
     s      = gaussians["s"].cpu().numpy()    # [K, 2]
     xyz_np = xyz.cpu().numpy()               # [N, 3]
 
-    hard = assign_indices.gather(
-        1, assign_weights.argmax(dim=1, keepdim=True)
-    ).squeeze(1).cpu().numpy()              # [N]
+    hard = assign.argmax(dim=1).cpu().numpy()  # [N]
 
     K = mu.shape[0]
     N = xyz_np.shape[0]

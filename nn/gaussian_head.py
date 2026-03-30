@@ -8,8 +8,67 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from gaussian_fit import _rotation_matrix_to_quaternion
+def _rotation_matrix_to_quaternion(R: torch.Tensor) -> torch.Tensor:
+    """Convert batched 3x3 rotation matrices to quaternions [w, x, y, z].
 
+    Uses kornia when available for numerical stability,
+    with a manual fallback.
+
+    Args:
+        R: [B, 3, 3] rotation matrices
+
+    Returns:
+        q: [B, 4] quaternions (w, x, y, z)
+    """
+    try:
+        from kornia.geometry.conversions import rotation_matrix_to_quaternion
+        # kornia returns (x, y, z, w) — convert to (w, x, y, z)
+        q_xyzw = rotation_matrix_to_quaternion(R)
+        q = torch.stack([q_xyzw[:, 3], q_xyzw[:, 0], q_xyzw[:, 1], q_xyzw[:, 2]], dim=1)
+        return q / q.norm(dim=1, keepdim=True).clamp(min=1e-8)
+    except ImportError:
+        pass
+
+    # Fallback: Shepperd's method
+    B = R.shape[0]
+    q = torch.zeros(B, 4, device=R.device, dtype=R.dtype)
+
+    trace = R[:, 0, 0] + R[:, 1, 1] + R[:, 2, 2]
+
+    mask1 = trace > 0
+    if mask1.any():
+        s = (trace[mask1] + 1.0).sqrt() * 2
+        q[mask1, 0] = 0.25 * s
+        q[mask1, 1] = (R[mask1, 2, 1] - R[mask1, 1, 2]) / s
+        q[mask1, 2] = (R[mask1, 0, 2] - R[mask1, 2, 0]) / s
+        q[mask1, 3] = (R[mask1, 1, 0] - R[mask1, 0, 1]) / s
+
+    mask2 = ~mask1 & (R[:, 0, 0] > R[:, 1, 1]) & (R[:, 0, 0] > R[:, 2, 2])
+    if mask2.any():
+        s = (1.0 + R[mask2, 0, 0] - R[mask2, 1, 1] - R[mask2, 2, 2]).clamp(min=0).sqrt() * 2
+        q[mask2, 0] = (R[mask2, 2, 1] - R[mask2, 1, 2]) / s.clamp(min=1e-8)
+        q[mask2, 1] = 0.25 * s
+        q[mask2, 2] = (R[mask2, 0, 1] + R[mask2, 1, 0]) / s.clamp(min=1e-8)
+        q[mask2, 3] = (R[mask2, 0, 2] + R[mask2, 2, 0]) / s.clamp(min=1e-8)
+
+    mask3 = ~mask1 & ~mask2 & (R[:, 1, 1] > R[:, 2, 2])
+    if mask3.any():
+        s = (1.0 + R[mask3, 1, 1] - R[mask3, 0, 0] - R[mask3, 2, 2]).clamp(min=0).sqrt() * 2
+        q[mask3, 0] = (R[mask3, 0, 2] - R[mask3, 2, 0]) / s.clamp(min=1e-8)
+        q[mask3, 1] = (R[mask3, 0, 1] + R[mask3, 1, 0]) / s.clamp(min=1e-8)
+        q[mask3, 2] = 0.25 * s
+        q[mask3, 3] = (R[mask3, 1, 2] + R[mask3, 2, 1]) / s.clamp(min=1e-8)
+
+    mask4 = ~mask1 & ~mask2 & ~mask3
+    if mask4.any():
+        s = (1.0 + R[mask4, 2, 2] - R[mask4, 0, 0] - R[mask4, 1, 1]).clamp(min=0).sqrt() * 2
+        q[mask4, 0] = (R[mask4, 1, 0] - R[mask4, 0, 1]) / s.clamp(min=1e-8)
+        q[mask4, 1] = (R[mask4, 0, 2] + R[mask4, 2, 0]) / s.clamp(min=1e-8)
+        q[mask4, 2] = (R[mask4, 1, 2] + R[mask4, 2, 1]) / s.clamp(min=1e-8)
+        q[mask4, 3] = 0.25 * s
+
+    q = q / q.norm(dim=1, keepdim=True).clamp(min=1e-8)
+    return q
 
 def quaternion_to_rotation_matrix(q: torch.Tensor) -> torch.Tensor:
     """Convert quaternion [w, x, y, z] to 3x3 rotation matrix."""
