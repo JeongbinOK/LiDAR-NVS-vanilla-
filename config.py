@@ -71,7 +71,7 @@ class NeuralClusteringConfig:
     num_heads: int = 4
 
     # Voxel seeding
-    seed_voxel_size: float = 0.3
+    seed_voxel_size: float = 1.0
 
     # Differentiable clustering
     cluster_iters: int = 4
