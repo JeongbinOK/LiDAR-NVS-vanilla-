@@ -15,10 +15,11 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 # Add external dataloader path
-sys.path.insert(0, "/data1/nuScenes/loader")
+from config import NeuralClusteringConfig
+sys.path.insert(0, os.path.join(os.path.expanduser(NeuralClusteringConfig.data_root), "loader"))
 from dataset import NuScenesNVSDataset, nvs_collate_fn
 
-from config import NeuralClusteringConfig
+
 from nn.model import NeuralClusteringModel
 from nn.losses import ClusteringLoss
 

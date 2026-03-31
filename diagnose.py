@@ -1,9 +1,9 @@
 """Diagnosis: verify gradient flow and loss behavior."""
 import sys, os
-sys.path.insert(0, os.path.expanduser("~/data/nuScenes/loader"))
+from config import NeuralClusteringConfig
+sys.path.insert(0, os.path.join(os.path.expanduser(NeuralClusteringConfig.data_root), "loader"))
 
 import torch
-from config import NeuralClusteringConfig
 from nn.model import NeuralClusteringModel
 from nn.losses import ClusteringLoss
 

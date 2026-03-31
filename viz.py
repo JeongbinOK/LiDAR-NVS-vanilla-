@@ -17,10 +17,10 @@ import sys
 import numpy as np
 import torch
 
-sys.path.insert(0, os.path.expanduser("~/data/nuScenes/loader"))
+from config import NeuralClusteringConfig
+sys.path.insert(0, os.path.join(os.path.expanduser(NeuralClusteringConfig.data_root), "loader"))
 from dataset import NuScenesNVSDataset
 
-from config import NeuralClusteringConfig
 from nn.model import NeuralClusteringModel
 
 

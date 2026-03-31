@@ -7,10 +7,10 @@ import sys
 import torch
 import numpy as np
 
-sys.path.insert(0, os.path.expanduser("~/data/nuScenes/loader"))
+from config import NeuralClusteringConfig
+sys.path.insert(0, os.path.join(os.path.expanduser(NeuralClusteringConfig.data_root), "loader"))
 from dataset import NuScenesNVSDataset, nvs_collate_fn
 
-from config import NeuralClusteringConfig
 from nn.model import NeuralClusteringModel
 from nn.losses import ClusteringLoss
 
