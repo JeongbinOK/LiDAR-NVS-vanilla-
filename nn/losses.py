@@ -85,12 +85,18 @@ class ClusteringLoss(nn.Module):
         n_cands = torch.cross(u_cands, v_cands, dim=-1)
 
         gamma_sq = (d * n_cands).sum(dim=-1).pow(2)
+        # 1) Normalize gamma_sq with a small fixed variance (e.g. sigma_perp = 0.05m)
+        sigma_perp_sq = 0.0025
+        gamma_nll = gamma_sq / sigma_perp_sq
         d_u = (d * u_cands).sum(dim=-1)
         d_v = (d * v_cands).sum(dim=-1)
         maha = (d_u / s_cands[:, :, 0]).pow(2) + (d_v / s_cands[:, :, 1]).pow(2)
-        log_det = torch.log(s_cands[:, :, 0]) + torch.log(s_cands[:, :, 1])
+        
+        # 2) Log-determinant of covariance is 2 * sum(ln(s))
+        log_det = 2.0 * (torch.log(s_cands[:, :, 0]) + torch.log(s_cands[:, :, 1]))
 
-        nll = (gamma_sq + maha + log_det).clamp(min=0)  # [N, k]
+        # 3) Remove .clamp(min=0) since continuous NLL can mathematically be negative
+        nll = gamma_nll + maha + log_det  # [N, k]
         loss = (assign_w * nll).sum(1).mean()
         return loss
 
@@ -105,8 +111,11 @@ class ClusteringLoss(nn.Module):
 
         d_local = torch.einsum('nkij,nkj->nki', R.transpose(-1, -2), d)
         maha = (d_local / s_cands).pow(2).sum(dim=-1)
-        log_det = torch.log(s_cands).sum(dim=-1)
+        
+        # 4) Log-determinant correction (factor of 2)
+        log_det = 2.0 * torch.log(s_cands).sum(dim=-1)
 
-        nll = (maha + log_det).clamp(min=0)
+        # 5) Remove .clamp(min=0) to allow gradient flow at small scales
+        nll = maha + log_det
         loss = (assign_w * nll).sum(1).mean()
         return loss

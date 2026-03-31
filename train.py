@@ -6,13 +6,16 @@ import json
 import os
 import sys
 import time
+import warnings
+
+warnings.filterwarnings("ignore", category=FutureWarning, module="spconv")
 
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 # Add external dataloader path
-sys.path.insert(0, os.path.expanduser("~/data/nuScenes/loader"))
+sys.path.insert(0, "/data1/nuScenes/loader")
 from dataset import NuScenesNVSDataset, nvs_collate_fn
 
 from config import NeuralClusteringConfig
