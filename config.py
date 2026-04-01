@@ -34,7 +34,7 @@ class NeuralClusteringConfig:
 
     # Differentiable clustering
     cluster_iters: int = 4
-    cluster_feat_weight: float = 0.1
+    cluster_feat_weight: float = 0.0
 
     # Cross-attention refinement
     refine_layers: int = 2
@@ -42,7 +42,7 @@ class NeuralClusteringConfig:
     refine_local_topk: int = 64
 
     # Gaussian head
-    primitive_type: str = "2d"     # "2d" or "3d"
+    primitive_type: str = "3d"     # "2d" or "3d"
     pca_topk: int = 128
 
     # Preprocessing
@@ -55,14 +55,14 @@ class NeuralClusteringConfig:
     # Training
     lr: float = 1e-3
     weight_decay: float = 1e-4
-    num_epochs: int = 50
+    num_epochs: int = 30
     batch_size: int = 2
 
     # Loss
     top_k_assign: int = 8
 
     # Data
-    data_root: str = "~/data1/nuScenes"
+    data_root: str = "~/data/nuScenes"
 
     # Device
     device: str = "cuda"
