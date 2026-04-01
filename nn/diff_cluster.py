@@ -49,14 +49,15 @@ class DiffSoftClustering(nn.Module):
             spatial_dist = torch.cdist(vote_xyz, centers)  # [N, K]
 
             # Feature distance (optional, weighted)
+            # Square separately to avoid cross-terms: (a+wb)² ≠ a²+wb²
             if self.feature_weight > 0:
                 feat_dist = torch.cdist(features, center_feats)  # [N, K]
-                dist = spatial_dist + self.feature_weight * feat_dist
+                dist_sq = spatial_dist.pow(2) + self.feature_weight * feat_dist.pow(2)
             else:
-                dist = spatial_dist
+                dist_sq = spatial_dist.pow(2)
 
             # Soft assignment via attention
-            assign = F.softmax(-dist.pow(2) / tau, dim=-1)  # [N, K]
+            assign = F.softmax(-dist_sq / tau, dim=-1)  # [N, K]
 
             # Weighted center update
             w = assign.sum(dim=0).clamp(min=1e-4)  # [K]

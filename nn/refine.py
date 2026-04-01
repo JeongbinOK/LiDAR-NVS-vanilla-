@@ -94,8 +94,8 @@ class RefineLayer(nn.Module):
         center_feats = center_feats + sa_out
         center_feats = self.norm2(center_feats)
 
-        # 3. FFN
-        center_feats = center_feats + self.ffn(self.norm3(center_feats))
+        # 3. FFN (post-norm, consistent with sub-layers 1 and 2)
+        center_feats = self.norm3(center_feats + self.ffn(center_feats))
 
         return center_feats
 

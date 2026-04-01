@@ -51,6 +51,8 @@ class ClusteringLoss(nn.Module):
         # Sparsify: top-k assignments per point for memory efficiency
         top_k = min(self.top_k_assign, K)
         assign_topk_w, assign_topk_idx = assign_full.topk(top_k, dim=-1)
+        # Renormalize so weights sum to 1 per point (removes tau-dependent scale drift)
+        assign_topk_w = assign_topk_w / assign_topk_w.sum(dim=-1, keepdim=True).clamp(min=1e-8)
 
         # Gather Gaussian params for top-k candidates
         mu_cands = mu[assign_topk_idx]
@@ -85,8 +87,9 @@ class ClusteringLoss(nn.Module):
         n_cands = torch.cross(u_cands, v_cands, dim=-1)
 
         gamma_sq = (d * n_cands).sum(dim=-1).pow(2)
-        # 1) Normalize gamma_sq with a small fixed variance (e.g. sigma_perp = 0.05m)
-        sigma_perp_sq = 0.0025
+        # Normalize gamma_sq: sigma_perp = 0.5m matches 1m voxel scale,
+        # keeping gamma_nll on the same order as maha at cluster boundaries.
+        sigma_perp_sq = 0.25
         gamma_nll = gamma_sq / sigma_perp_sq
         d_u = (d * u_cands).sum(dim=-1)
         d_v = (d * v_cands).sum(dim=-1)

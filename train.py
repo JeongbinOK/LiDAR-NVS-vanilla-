@@ -74,11 +74,15 @@ def evaluate_geometric(xyz: torch.Tensor, output: dict) -> dict:
 
     coverage = (assign.max(dim=1).values > 0.1).float().mean().item()
 
+    # Issue 6 monitor: large offsets indicate assign-mu position mismatch
+    offset_norm = output["offset"].norm(dim=1).mean().item()
+
     return {
         "gamma_rms": gamma_rms,
         "dist_rms": dist_rms,
         "coverage": coverage,
         "num_gaussians": mu.shape[0],
+        "offset_norm": offset_norm,
     }
 
 
@@ -133,6 +137,9 @@ def train(cfg: NeuralClusteringConfig, overfit_frames: int = 0):
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay,
     )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=cfg.num_epochs, eta_min=cfg.lr * 1e-2,
+    )
     
     print("Model Parameters per Module:")
     for name, module in model.named_children():
@@ -162,29 +169,35 @@ def train(cfg: NeuralClusteringConfig, overfit_frames: int = 0):
             batch_loss_dicts = []
             
             optimizer.zero_grad()
-            nan_found = False
+            valid_frames = 0
+            eval_metric = None
 
             for b in range(B):
                 for frame_pts in [batch['input_0'][b], batch['input_1'][b]]:
                     ld, output, xyz = process_frame(
                         model, loss_fn, frame_pts, device, tau, cfg.ego_radius,
                     )
-                    
+
                     frame_loss = ld["total"] / num_frames
                     if torch.isnan(frame_loss):
-                        nan_found = True
-                    else:
-                        frame_loss.backward()
+                        pbar.write(f"  NaN loss at batch {batch_idx} frame {valid_frames}, skipping frame")
+                        continue
 
+                    frame_loss.backward()
+                    valid_frames += 1
                     batch_loss += ld["total"].item()
                     batch_loss_dicts.append({k: v.item() for k, v in ld.items()})
 
-            batch_loss = batch_loss / num_frames
+                    if overfit_frames > 0 or (batch_idx + 1) % 50 == 0:
+                        with torch.no_grad():
+                            eval_metric = evaluate_geometric(xyz, output)
 
-            if nan_found:
-                pbar.write(f"  NaN loss at batch {batch_idx}, skipping")
+            if valid_frames == 0:
+                pbar.write(f"  All frames NaN at batch {batch_idx}, skipping batch")
                 optimizer.zero_grad()
                 continue
+
+            batch_loss = batch_loss / valid_frames
 
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
@@ -194,9 +207,9 @@ def train(cfg: NeuralClusteringConfig, overfit_frames: int = 0):
             epoch_losses.append(avg_batch)
             pbar.set_postfix(loss=f"{avg_batch['total']:.4f}", tau=f"{tau:.2f}")
 
-            if overfit_frames > 0 or (batch_idx + 1) % 50 == 0:
-                with torch.no_grad():
-                    epoch_metrics.append(evaluate_geometric(xyz, output))
+            if eval_metric is not None:
+                epoch_metrics.append(eval_metric)
+                eval_metric = None
 
         dt = time.time() - t0
         if not epoch_losses:
@@ -213,7 +226,7 @@ def train(cfg: NeuralClusteringConfig, overfit_frames: int = 0):
         if epoch_metrics:
             mg = {k: sum(m[k] for m in epoch_metrics) / len(epoch_metrics)
                   for k in epoch_metrics[0]}
-            log += f" | gamma={mg['gamma_rms']:.4f} cov={mg['coverage']:.3f} K={mg['num_gaussians']:.0f}"
+            log += f" | gamma={mg['gamma_rms']:.4f} cov={mg['coverage']:.3f} K={mg['num_gaussians']:.0f} off={mg['offset_norm']:.3f}m"
 
         tqdm.write(log)
 
@@ -223,8 +236,11 @@ def train(cfg: NeuralClusteringConfig, overfit_frames: int = 0):
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
                 "loss": best_loss,
             }, os.path.join(ckpt_dir, "best_model.pt"))
+
+        scheduler.step()
 
         # Save periodic checkpoint every 10 epochs
         if (epoch + 1) % 10 == 0:
@@ -232,6 +248,7 @@ def train(cfg: NeuralClusteringConfig, overfit_frames: int = 0):
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
                 "loss": avg["total"],
             }, os.path.join(ckpt_dir, f"epoch_{epoch+1:03d}.pt"))
 
