@@ -90,7 +90,7 @@ class ClusteringLoss(nn.Module):
         # Normalize gamma_sq: sigma_perp = 0.5m matches 1m voxel scale,
         # keeping gamma_nll on the same order as maha at cluster boundaries.
         sigma_perp_sq = 0.25
-        gamma_nll = gamma_sq / sigma_perp_sq
+        gamma_nll = (gamma_sq / sigma_perp_sq).clamp(max=1e4)
         d_u = (d * u_cands).sum(dim=-1)
         d_v = (d * v_cands).sum(dim=-1)
         maha = (d_u / s_cands[:, :, 0]).pow(2) + (d_v / s_cands[:, :, 1]).pow(2)

@@ -101,7 +101,7 @@ def process_frame(model, loss_fn, pts, device, tau, ego_radius):
     return loss_dict, output, xyz
 
 
-def train(cfg: NeuralClusteringConfig, overfit_frames: int = 0):
+def train(cfg: NeuralClusteringConfig, overfit_frames: int = 0, resume: str = ""):
     """Main training loop."""
     device = cfg.device
     
@@ -152,8 +152,18 @@ def train(cfg: NeuralClusteringConfig, overfit_frames: int = 0):
     print("-" * 60)
 
     best_loss = float("inf")
+    start_epoch = 0
 
-    for epoch in range(cfg.num_epochs):
+    if resume:
+        ckpt = torch.load(resume, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model_state_dict"])
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        start_epoch = ckpt["epoch"] + 1
+        best_loss = ckpt.get("loss", float("inf"))
+        print(f"Resumed from {resume} (epoch {ckpt['epoch']+1}, loss={best_loss:.4f})")
+        print("-" * 60)
+
+    for epoch in range(start_epoch, cfg.num_epochs):
         tau = compute_tau(epoch, cfg)
         epoch_losses = []
         epoch_metrics = []
@@ -179,8 +189,8 @@ def train(cfg: NeuralClusteringConfig, overfit_frames: int = 0):
                     )
 
                     frame_loss = ld["total"] / num_frames
-                    if torch.isnan(frame_loss):
-                        pbar.write(f"  NaN loss at batch {batch_idx} frame {valid_frames}, skipping frame")
+                    if not torch.isfinite(frame_loss):
+                        pbar.write(f"  NaN/inf loss at batch {batch_idx} frame {valid_frames}, skipping frame")
                         continue
 
                     frame_loss.backward()
@@ -200,6 +210,16 @@ def train(cfg: NeuralClusteringConfig, overfit_frames: int = 0):
             batch_loss = batch_loss / valid_frames
 
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            has_bad_grad = any(
+                p.grad is not None and not torch.isfinite(p.grad).all()
+                for p in model.parameters()
+            )
+            if has_bad_grad:
+                pbar.write(f"  Bad grad at batch {batch_idx}, skipping step")
+                optimizer.zero_grad()
+                continue
+
             optimizer.step()
 
             avg_batch = {k: sum(d[k] for d in batch_loss_dicts) / len(batch_loss_dicts)
@@ -230,7 +250,11 @@ def train(cfg: NeuralClusteringConfig, overfit_frames: int = 0):
 
         tqdm.write(log)
 
-        if avg["total"] < best_loss:
+        model_has_nan = any(
+            torch.isnan(p).any() or torch.isinf(p).any()
+            for p in model.parameters()
+        )
+        if avg["total"] < best_loss and not model_has_nan:
             best_loss = avg["total"]
             torch.save({
                 "epoch": epoch,
@@ -265,6 +289,8 @@ def main():
     parser.add_argument("--batch-size", type=int, default=_defaults.batch_size)
     parser.add_argument("--overfit", type=int, default=0,
                         help="Overfit on N pairs (0=full training)")
+    parser.add_argument("--resume", type=str, default="",
+                        help="Path to checkpoint to resume training from")
     parser.add_argument("--device", default=_defaults.device)
     parser.add_argument("--backbone", default=_defaults.backbone_type,
                         choices=["ptv3", "custom"])
@@ -282,7 +308,7 @@ def main():
         primitive_type=args.primitive,
     )
 
-    train(cfg, overfit_frames=args.overfit)
+    train(cfg, overfit_frames=args.overfit, resume=args.resume)
 
 
 if __name__ == "__main__":
