@@ -34,7 +34,7 @@ class NeuralClusteringConfig:
 
     # Differentiable clustering
     cluster_iters: int = 4
-    cluster_feat_weight: float = 0.0
+    cluster_feat_weight: float = 0.1
 
     # Cross-attention refinement
     refine_layers: int = 2
@@ -55,14 +55,14 @@ class NeuralClusteringConfig:
     # Training
     lr: float = 1e-3
     weight_decay: float = 1e-4
-    num_epochs: int = 30
+    num_epochs: int = 50
     batch_size: int = 2
 
     # Loss
     top_k_assign: int = 8
 
     # Data
-    data_root: str = "~/data/nuScenes"
+    data_root: str = "/data1/nuScenes"
 
     # Device
     device: str = "cuda"

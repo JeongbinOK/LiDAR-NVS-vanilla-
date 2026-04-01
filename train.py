@@ -174,7 +174,6 @@ def train(cfg: NeuralClusteringConfig, overfit_frames: int = 0, resume: str = ""
         for batch_idx, batch in enumerate(pbar):
             # batch['input_0']: List[Tensor(N, 4)], batch['input_1']: List[Tensor(M, 4)]
             B = len(batch['input_0'])
-            num_frames = B * 2
             batch_loss = 0.0
             batch_loss_dicts = []
             
@@ -188,12 +187,13 @@ def train(cfg: NeuralClusteringConfig, overfit_frames: int = 0, resume: str = ""
                         model, loss_fn, frame_pts, device, tau, cfg.ego_radius,
                     )
 
-                    frame_loss = ld["total"] / num_frames
-                    if not torch.isfinite(frame_loss):
+                    if not torch.isfinite(ld["total"]):
                         pbar.write(f"  NaN/inf loss at batch {batch_idx} frame {valid_frames}, skipping frame")
                         continue
 
-                    frame_loss.backward()
+                    # Backward without scaling; gradients will be rescaled after the
+                    # loop so that skipped frames don't under-weight valid ones.
+                    ld["total"].backward()
                     valid_frames += 1
                     batch_loss += ld["total"].item()
                     batch_loss_dicts.append({k: v.item() for k, v in ld.items()})
@@ -208,6 +208,14 @@ def train(cfg: NeuralClusteringConfig, overfit_frames: int = 0, resume: str = ""
                 continue
 
             batch_loss = batch_loss / valid_frames
+
+            # Normalize accumulated gradients by the actual number of valid frames.
+            # When no frames are skipped valid_frames == B*2, so this is a no-op
+            # compared to the old num_frames divisor.
+            if valid_frames > 1:
+                for p in model.parameters():
+                    if p.grad is not None:
+                        p.grad /= valid_frames
 
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 

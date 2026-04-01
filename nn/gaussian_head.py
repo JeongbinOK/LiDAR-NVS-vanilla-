@@ -114,21 +114,28 @@ class GaussianParameterHead(nn.Module):
         """Compute PCA initialization from weighted covariance.
 
         Uses top-M assigned points per cluster for memory efficiency.
+        Runs in float32 to avoid bfloat16 precision loss in SVD.
         """
         K = centers.shape[0]
         M = min(self.pca_topk, assign.shape[0])
         device = centers.device
 
+        # Upcast to float32 for numerical stability (bfloat16 has only ~3 decimal
+        # digits of precision; 1e-6 regularisation is essentially zero in bf16).
+        centers_f = centers.float()
+        assign_f = assign.float()
+        vote_xyz_f = vote_xyz.float()
+
         # Top-M points per cluster by assignment weight
-        _, top_idx = assign.T.topk(M, dim=-1)     # [K, M]
-        top_xyz = vote_xyz[top_idx]                # [K, M, 3]
-        top_w = assign.T.gather(1, top_idx)        # [K, M]
+        _, top_idx = assign_f.T.topk(M, dim=-1)     # [K, M]
+        top_xyz = vote_xyz_f[top_idx]                # [K, M, 3]
+        top_w = assign_f.T.gather(1, top_idx)        # [K, M]
 
         # Weighted covariance
-        d = top_xyz - centers.unsqueeze(1)          # [K, M, 3]
+        d = top_xyz - centers_f.unsqueeze(1)          # [K, M, 3]
         w_norm = top_w / top_w.sum(1, keepdim=True).clamp(min=1e-8)
         cov = torch.einsum('kmi,kmj,km->kij', d, d, w_norm)  # [K, 3, 3]
-        cov = cov + 1e-6 * self._eye3
+        cov = cov + 1e-6 * self._eye3.float()
 
         # SVD
         U, S, Vh = torch.linalg.svd(cov)
@@ -139,7 +146,7 @@ class GaussianParameterHead(nn.Module):
 
         # Orient normals toward sensor origin
         flip = torch.where(
-            (n_pca * (-centers)).sum(1, keepdim=True) < 0,
+            (n_pca * (-centers_f)).sum(1, keepdim=True) < 0,
             torch.tensor(-1.0, device=device),
             torch.tensor(1.0, device=device),
         )
@@ -154,7 +161,9 @@ class GaussianParameterHead(nn.Module):
         else:
             s_pca = S.clamp(min=1e-8).sqrt()
 
-        return q_pca, s_pca
+        # Return in the original dtype (float32 results are cast back)
+        orig_dtype = centers.dtype
+        return q_pca.to(orig_dtype), s_pca.to(orig_dtype)
 
     def forward(
         self,
