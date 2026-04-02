@@ -34,7 +34,7 @@ class NeuralClusteringConfig:
 
     # Differentiable clustering
     cluster_iters: int = 4
-    cluster_feat_weight: float = 0.1
+    cluster_feat_weight: float = 0.0  # 0.1은 backward에서 OOM 유발 (24GB 카드 기준)
 
     # Cross-attention refinement
     refine_layers: int = 2
@@ -43,7 +43,7 @@ class NeuralClusteringConfig:
 
     # Gaussian head
     primitive_type: str = "3d"     # "2d" or "3d"
-    pca_topk: int = 128
+    pca_topk: int = 32             # PCA 및 loss 모두 per-Gaussian top-M으로 사용
 
     # Preprocessing
     ego_radius: float = 2.5
@@ -55,14 +55,14 @@ class NeuralClusteringConfig:
     # Training
     lr: float = 1e-3
     weight_decay: float = 1e-4
-    num_epochs: int = 50
+    num_epochs: int = 30
     batch_size: int = 2
 
-    # Loss
+    # Loss (top_k_assign은 현재 미사용; loss는 pca_topk를 top_m으로 사용)
     top_k_assign: int = 8
 
     # Data
-    data_root: str = "/data1/nuScenes"
+    data_root: str = "~/data/nuScenes"
 
     # Device
     device: str = "cuda"

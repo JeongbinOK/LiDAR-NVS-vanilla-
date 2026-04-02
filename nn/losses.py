@@ -1,9 +1,13 @@
 """Self-supervised loss for neural Gaussian clustering.
 
-Single loss: assignment-weighted Gaussian NLL.
-Supports both 2D surfel and 3D Gaussian primitives.
+Single loss: assignment-weighted Gaussian NLL, computed per-Gaussian.
 
-L = mean_i [ sum_j  w_ij * NLL_ij ]
+L = mean_k [ sum_m  w_km * NLL_km ]
+
+For each Gaussian k, the top-M most-assigned points are gathered and their
+NLL under that Gaussian is minimized. This ensures every Gaussian receives
+gradient regardless of cluster size (no dead-cluster problem), and is
+consistent with the per-Gaussian PCA warmstart in GaussianHead.
 
 2D: NLL = gamma_sq + maha_2d + log_det_2d
 3D: NLL = maha_3d + log_det_3d
@@ -32,11 +36,11 @@ class ClusteringLoss(nn.Module):
     def __init__(
         self,
         primitive: str = "2d",
-        top_k_assign: int = 8,
+        top_m: int = 32,
     ):
         super().__init__()
         self.primitive = primitive
-        self.top_k_assign = top_k_assign
+        self.top_m = top_m
 
     def forward(self, xyz: torch.Tensor, output: dict) -> dict:
         gaussians = output["gaussians"]
@@ -48,25 +52,24 @@ class ClusteringLoss(nn.Module):
 
         N, K = assign_full.shape
 
-        # Sparsify: top-k assignments per point for memory efficiency
-        top_k = min(self.top_k_assign, K)
-        assign_topk_w, assign_topk_idx = assign_full.topk(top_k, dim=-1)
-        # Renormalize so weights sum to 1 per point (removes tau-dependent scale drift)
+        # Per-Gaussian top-M: each Gaussian gathers its most-assigned points.
+        # Ensures all K Gaussians receive gradient (no dead clusters).
+        top_m = min(self.top_m, N)
+        assign_topk_w, assign_topk_idx = assign_full.T.topk(top_m, dim=-1)  # [K, M]
+        # Normalize per Gaussian so weights sum to 1 per cluster
         assign_topk_w = assign_topk_w / assign_topk_w.sum(dim=-1, keepdim=True).clamp(min=1e-8)
 
-        # Gather Gaussian params for top-k candidates
-        mu_cands = mu[assign_topk_idx]
-        s_cands = s[assign_topk_idx].clamp(min=1e-4)
-        q_cands = q[assign_topk_idx]
-
-        xyz_exp = xyz.unsqueeze(1).expand(-1, top_k, -1)
-        d = xyz_exp - mu_cands  # [N, k, 3]
+        # Gather point coords and Gaussian params
+        top_xyz = xyz[assign_topk_idx]                          # [K, M, 3]
+        d = top_xyz - mu.unsqueeze(1)                           # [K, M, 3]
+        s_exp = s.unsqueeze(1).expand(-1, top_m, -1).clamp(min=1e-4)  # [K, M, s_dim]
+        q_exp = q.unsqueeze(1).expand(-1, top_m, -1)            # [K, M, 4]
 
         # Compute NLL
         if self.primitive == "2d":
-            l_surface = self._nll_2d(d, s_cands, q_cands, assign_topk_w)
+            l_surface = self._nll_2d(d, s_exp, q_exp, assign_topk_w)
         else:
-            l_surface = self._nll_3d(d, s_cands, q_cands, assign_topk_w)
+            l_surface = self._nll_3d(d, s_exp, q_exp, assign_topk_w)
 
         return {
             "total": l_surface,
@@ -78,12 +81,12 @@ class ClusteringLoss(nn.Module):
 
     def _nll_2d(self, d, s_cands, q_cands, assign_w):
         """2D surfel NLL: gamma_sq + maha_2d + log_det_2d."""
-        N, k = assign_w.shape
+        K, M = assign_w.shape
 
-        q_flat = q_cands.reshape(N * k, 4)
+        q_flat = q_cands.reshape(K * M, 4)
         R_flat = quaternion_to_rotation_matrix(q_flat)
-        u_cands = R_flat[:, 0, :].reshape(N, k, 3)
-        v_cands = R_flat[:, 1, :].reshape(N, k, 3)
+        u_cands = R_flat[:, 0, :].reshape(K, M, 3)
+        v_cands = R_flat[:, 1, :].reshape(K, M, 3)
         n_cands = torch.cross(u_cands, v_cands, dim=-1)
 
         gamma_sq = (d * n_cands).sum(dim=-1).pow(2)
@@ -105,12 +108,11 @@ class ClusteringLoss(nn.Module):
 
     def _nll_3d(self, d, s_cands, q_cands, assign_w):
         """3D Gaussian NLL: maha_3d + log_det_3d."""
-        N, k = assign_w.shape
+        K, M = assign_w.shape
 
-        K_flat = q_cands.shape[0] * q_cands.shape[1]
-        q_flat = q_cands.reshape(K_flat, 4)
+        q_flat = q_cands.reshape(K * M, 4)
         R_flat = quaternion_to_rotation_matrix(q_flat)
-        R = R_flat.reshape(N, k, 3, 3)
+        R = R_flat.reshape(K, M, 3, 3)
 
         d_local = torch.einsum('nkij,nkj->nki', R.transpose(-1, -2), d)
         maha = (d_local / s_cands).pow(2).sum(dim=-1)

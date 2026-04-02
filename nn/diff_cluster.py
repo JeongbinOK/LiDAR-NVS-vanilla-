@@ -24,7 +24,7 @@ class DiffSoftClustering(nn.Module):
 
     def forward(
         self,
-        vote_xyz: torch.Tensor,
+        xyz: torch.Tensor,
         features: torch.Tensor,
         init_centers: torch.Tensor,
         init_feats: torch.Tensor,
@@ -32,7 +32,7 @@ class DiffSoftClustering(nn.Module):
     ) -> dict:
         """
         Args:
-            vote_xyz: [N, 3] voted positions (xyz + offset)
+            xyz: [N, 3] original points position(not voted positions)
             features: [N, D] per-point backbone features
             init_centers: [K, 3] initial seed center positions
             init_feats: [K, D] initial seed center features
@@ -46,7 +46,7 @@ class DiffSoftClustering(nn.Module):
 
         for _ in range(self.num_iters):
             # Spatial distance
-            spatial_dist = torch.cdist(vote_xyz, centers)  # [N, K]
+            spatial_dist = torch.cdist(xyz, centers)  # [N, K]
 
             # Feature distance (optional, weighted)
             # Square separately to avoid cross-terms: (a+wb)² ≠ a²+wb²
@@ -61,7 +61,7 @@ class DiffSoftClustering(nn.Module):
 
             # Weighted center update
             w = assign.sum(dim=0).clamp(min=1e-4)  # [K]
-            centers = (assign.T @ vote_xyz) / w.unsqueeze(-1)       # [K, 3]
+            centers = (assign.T @ xyz) / w.unsqueeze(-1)       # [K, 3]
             center_feats = (assign.T @ features) / w.unsqueeze(-1)  # [K, D]
 
         return {

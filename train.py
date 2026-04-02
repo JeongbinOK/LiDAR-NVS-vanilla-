@@ -74,15 +74,19 @@ def evaluate_geometric(xyz: torch.Tensor, output: dict) -> dict:
 
     coverage = (assign.max(dim=1).values > 0.1).float().mean().item()
 
-    # Issue 6 monitor: large offsets indicate assign-mu position mismatch
-    offset_norm = output["offset"].norm(dim=1).mean().item()
+    # Vote offset: 포인트가 투표 위치로 이동한 거리 (VoxelCenterPredictor)
+    vote_offset_norm = output["offset"].norm(dim=1).mean().item()
+
+    # Mu offset: Gaussian center가 clustering center에서 이동한 거리 (mlp_mu residual)
+    mu_offset_norm = (mu - output["centers"]).norm(dim=1).mean().item()
 
     return {
         "gamma_rms": gamma_rms,
         "dist_rms": dist_rms,
         "coverage": coverage,
         "num_gaussians": mu.shape[0],
-        "offset_norm": offset_norm,
+        "vote_offset": vote_offset_norm,
+        "mu_offset": mu_offset_norm,
     }
 
 
@@ -132,7 +136,7 @@ def train(cfg: NeuralClusteringConfig, overfit_frames: int = 0, resume: str = ""
     model = NeuralClusteringModel(cfg).to(device)
     loss_fn = ClusteringLoss(
         primitive=cfg.primitive_type,
-        top_k_assign=cfg.top_k_assign,
+        top_m=cfg.pca_topk,
     )
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay,
@@ -254,7 +258,7 @@ def train(cfg: NeuralClusteringConfig, overfit_frames: int = 0, resume: str = ""
         if epoch_metrics:
             mg = {k: sum(m[k] for m in epoch_metrics) / len(epoch_metrics)
                   for k in epoch_metrics[0]}
-            log += f" | gamma={mg['gamma_rms']:.4f} cov={mg['coverage']:.3f} K={mg['num_gaussians']:.0f} off={mg['offset_norm']:.3f}m"
+            log += f" | gamma={mg['gamma_rms']:.4f} cov={mg['coverage']:.3f} K={mg['num_gaussians']:.0f} vote_off={mg['vote_offset']:.3f}m mu_off={mg['mu_offset']:.3f}m"
 
         tqdm.write(log)
 

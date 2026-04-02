@@ -110,7 +110,7 @@ class GaussianParameterHead(nn.Module):
 
         self.register_buffer("_eye3", torch.eye(3).unsqueeze(0))
 
-    def _pca_warmstart(self, centers, assign, vote_xyz):
+    def _pca_warmstart(self, centers, assign, xyz):
         """Compute PCA initialization from weighted covariance.
 
         Uses top-M assigned points per cluster for memory efficiency.
@@ -124,11 +124,11 @@ class GaussianParameterHead(nn.Module):
         # digits of precision; 1e-6 regularisation is essentially zero in bf16).
         centers_f = centers.float()
         assign_f = assign.float()
-        vote_xyz_f = vote_xyz.float()
+        xyz_f = xyz.float()
 
         # Top-M points per cluster by assignment weight
         _, top_idx = assign_f.T.topk(M, dim=-1)     # [K, M]
-        top_xyz = vote_xyz_f[top_idx]                # [K, M, 3]
+        top_xyz = xyz_f[top_idx]                # [K, M, 3]
         top_w = assign_f.T.gather(1, top_idx)        # [K, M]
 
         # Weighted covariance
@@ -170,21 +170,21 @@ class GaussianParameterHead(nn.Module):
         center_feats: torch.Tensor,
         centers: torch.Tensor,
         assign: torch.Tensor,
-        vote_xyz: torch.Tensor,
+        xyz: torch.Tensor,
     ) -> dict:
         """
         Args:
             center_feats: [K, D] refined center features
             centers: [K, 3] cluster center positions
             assign: [N, K] soft assignment matrix
-            vote_xyz: [N, 3] voted point positions
+            xyz: [N, 3] original point positions
 
         Returns:
             dict with mu, q, s, alpha, and (for 2D) u, v, n
         """
         # PCA warm start (no gradient)
         with torch.no_grad():
-            q_pca, s_pca = self._pca_warmstart(centers, assign, vote_xyz)
+            q_pca, s_pca = self._pca_warmstart(centers, assign, xyz)
 
         # Residual prediction
         mu = centers + self.mlp_mu(center_feats)

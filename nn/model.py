@@ -101,7 +101,7 @@ class NeuralClusteringModel(nn.Module):
 
         # Stage 3: Differentiable Soft Clustering
         cluster_out = self.clusterer(
-            vote_xyz, features, voxel_centers, voxel_feats, tau,
+            xyz, features, voxel_centers, voxel_feats, tau,
         )
         centers = cluster_out["centers"]          # [K, 3]
         center_feats = cluster_out["center_feats"]  # [K, D]
@@ -112,7 +112,7 @@ class NeuralClusteringModel(nn.Module):
 
         # Stage 4: Gaussian Parameters
         gaussians = self.gaussian_head(
-            center_feats, centers, assign, vote_xyz,
+            center_feats, centers, assign, xyz,
         )
 
         return {
