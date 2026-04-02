@@ -1,12 +1,12 @@
-"""Interactive 3D visualization of neural 2D Gaussian clustering results.
+"""Interactive 3D visualization of neural Gaussian clustering results.
 
-Loads a checkpoint, runs inference on a val scene, and saves an interactive
-HTML file viewable in any browser (rotate, zoom, pan).
+Supports both 2D surfel (disc) and 3D Gaussian (ellipsoid) primitives.
+Mode is auto-detected from the checkpoint's config.json.
 
 Buttons:
-  [Both]          — points + Gaussian surfels
-  [Points only]   — point cloud colored by cluster
-  [Gaussians only]— filled surfel discs + normals
+  [Both]           — points + Gaussian shapes
+  [Points only]    — point cloud colored by cluster
+  [Gaussians only] — Gaussian shapes + axes/normals
 """
 
 import argparse
@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.join(os.path.expanduser(NeuralClusteringConfig.data_r
 from dataset import NuScenesNVSDataset
 
 from nn.model import NeuralClusteringModel
+from nn.gaussian_head import quaternion_to_rotation_matrix
 
 
 def _load_cfg_from_ckpt(checkpoint_path: str) -> NeuralClusteringConfig:
@@ -41,15 +42,34 @@ def _load_cfg_from_ckpt(checkpoint_path: str) -> NeuralClusteringConfig:
     return NeuralClusteringConfig()
 
 
-def _build_surfel_mesh(mu, u, v, s, palette, n_theta=32, min_vis_scale=1.5):
+def _q_to_axes(q_np: np.ndarray):
+    """Compute principal axes from [K, 4] quaternions.
+
+    Uses the same row convention as gaussian_head.py:
+      u = R[:, 0, :]  (first row)
+      v = R[:, 1, :]  (second row)
+      n = cross(u, v)
+
+    Ellipsoid formula:  pts_world = (sphere * s) @ R + mu
+    where R[k] rows are the world-space principal axis directions.
+
+    Returns u, v, n each [K, 3], and R_all [K, 3, 3].
     """
-    Build a single batched Mesh3d for all K surfel discs using vertexcolor.
+    q_t = torch.tensor(q_np, dtype=torch.float32)
+    R_t = quaternion_to_rotation_matrix(q_t)   # [K, 3, 3]
+    R_np = R_t.numpy()
+    u = R_np[:, 0, :]                          # [K, 3]
+    v = R_np[:, 1, :]                          # [K, 3]
+    n = np.cross(u, v)                         # [K, 3]
+    return u, v, n, R_np
 
-    Each surfel is a fan-triangulated ellipse disc:
-      vertex 0      = centre (mu[k])
-      vertices 1..T = ellipse boundary at 1-sigma (using actual u, v, s)
 
-    min_vis_scale: minimum radius (metres) so small surfels remain visible.
+# ── 2D surfel ─────────────────────────────────────────────────────────────────
+
+def _build_surfel_mesh(mu, u, v, s, palette, n_theta=32, min_vis_scale=1.5):
+    """Batched Mesh3d for all K surfel discs (2D mode).
+
+    Each disc is a fan-triangulated ellipse at 1-sigma in the u-v plane.
     """
     all_x, all_y, all_z = [], [], []
     all_i, all_j, all_k = [], [], []
@@ -62,22 +82,18 @@ def _build_surfel_mesh(mu, u, v, s, palette, n_theta=32, min_vis_scale=1.5):
     offset = 0
     for k_idx in range(len(mu)):
         color = palette[k_idx % len(palette)]
-
-        # Clamp scale for visual clarity (actual shape preserved, just floored)
         sk = np.maximum(s[k_idx], min_vis_scale)  # [2]
 
-        # Ellipse boundary: mu + sk[0]*cos(t)*u + sk[1]*sin(t)*v
         circle = (mu[k_idx]
                   + sk[0] * cos_t[:, None] * u[k_idx]
                   + sk[1] * sin_t[:, None] * v[k_idx])  # [T, 3]
+        verts = np.vstack([mu[k_idx], circle])           # [T+1, 3]
 
-        verts = np.vstack([mu[k_idx], circle])   # [T+1, 3]
         all_x.extend(verts[:, 0])
         all_y.extend(verts[:, 1])
         all_z.extend(verts[:, 2])
         vertex_colors.extend([color] * (n_theta + 1))
 
-        # Fan triangles from centre
         for t in range(n_theta):
             all_i.append(offset)
             all_j.append(offset + 1 + t)
@@ -99,6 +115,85 @@ def _build_normal_lines(mu, n, scale=0.5):
     return xs, ys, zs
 
 
+# ── 3D ellipsoid ──────────────────────────────────────────────────────────────
+
+def _build_ellipsoid_mesh(mu, q, s, palette, n_lat=10, n_lon=16, min_vis_scale=0.3):
+    """Batched Mesh3d for all K ellipsoids (3D mode).
+
+    Parametric construction:
+      pts_world = (unit_sphere * sk) @ R + mu
+
+    where R[k] rows are the world-space principal axis directions,
+    consistent with _q_to_axes and gaussian_head.py's row convention.
+    """
+    all_x, all_y, all_z = [], [], []
+    all_i, all_j, all_k = [], [], []
+    vertex_colors = []
+
+    # Unit sphere vertices [n_lat * n_lon, 3]
+    lat = np.linspace(0, np.pi, n_lat)
+    lon = np.linspace(0, 2 * np.pi, n_lon, endpoint=False)
+    sphere = np.stack([
+        np.outer(np.sin(lat), np.cos(lon)),
+        np.outer(np.sin(lat), np.sin(lon)),
+        np.tile(np.cos(lat)[:, None], (1, n_lon)),
+    ], axis=-1).reshape(-1, 3)  # [n_lat*n_lon, 3]
+    n_verts = sphere.shape[0]
+
+    # Quad → 2 triangles, precomputed indices (same for every ellipsoid)
+    ti, tj, tk = [], [], []
+    for i in range(n_lat - 1):
+        for j in range(n_lon):
+            j1 = (j + 1) % n_lon
+            v00 = i * n_lon + j;       v01 = i * n_lon + j1
+            v10 = (i + 1) * n_lon + j; v11 = (i + 1) * n_lon + j1
+            ti += [v00, v00]; tj += [v10, v01]; tk += [v11, v11]
+
+    # Rotation matrices from quaternions (rows = world-space principal axes)
+    q_t = torch.tensor(q, dtype=torch.float32)
+    R_all = quaternion_to_rotation_matrix(q_t).numpy()  # [K, 3, 3]
+
+    offset = 0
+    for k_idx in range(len(mu)):
+        color = palette[k_idx % len(palette)]
+        sk = np.maximum(s[k_idx], min_vis_scale)   # [3]
+
+        pts = (sphere * sk) @ R_all[k_idx] + mu[k_idx]  # [V, 3]
+
+        all_x.extend(pts[:, 0])
+        all_y.extend(pts[:, 1])
+        all_z.extend(pts[:, 2])
+        vertex_colors.extend([color] * n_verts)
+
+        all_i.extend(v + offset for v in ti)
+        all_j.extend(v + offset for v in tj)
+        all_k.extend(v + offset for v in tk)
+        offset += n_verts
+
+    return (np.array(all_x), np.array(all_y), np.array(all_z),
+            all_i, all_j, all_k, vertex_colors)
+
+
+def _build_axis_lines(mu, R_all, s, scale_factor=1.0):
+    """Show the smallest-scale (thinnest) principal axis per Gaussian.
+
+    This axis is the most 'normal-like' direction for flat/thin Gaussians.
+    axis_dir = R_all[k, argmin(s[k]), :] (row = world-space direction).
+    """
+    xs, ys, zs = [], [], []
+    for k in range(len(mu)):
+        min_ax = int(np.argmin(s[k]))
+        axis_dir = R_all[k, min_ax, :]
+        length = float(s[k, min_ax]) * scale_factor
+        end = mu[k] + axis_dir * length
+        xs += [float(mu[k, 0]), float(end[0]), None]
+        ys += [float(mu[k, 1]), float(end[1]), None]
+        zs += [float(mu[k, 2]), float(end[2]), None]
+    return xs, ys, zs
+
+
+# ── main visualize ─────────────────────────────────────────────────────────────
+
 def visualize(checkpoint: str, scene_num: int, split: str,
               data_root: str, device: str, tau: float, out: str):
     import plotly.graph_objects as go
@@ -106,6 +201,7 @@ def visualize(checkpoint: str, scene_num: int, split: str,
     # ── 1. Model ──────────────────────────────────────────────────────────
     cfg = _load_cfg_from_ckpt(checkpoint)
     cfg.device = device
+    primitive = cfg.primitive_type  # "2d" or "3d"
 
     model = NeuralClusteringModel(cfg).to(device)
     ckpt  = torch.load(checkpoint, map_location=device, weights_only=False)
@@ -113,7 +209,7 @@ def visualize(checkpoint: str, scene_num: int, split: str,
     model.eval()
     epoch      = ckpt.get("epoch", "?")
     train_loss = ckpt.get("loss", float("nan"))
-    print(f"Checkpoint: epoch={epoch}, train_loss={train_loss:.4f}")
+    print(f"Checkpoint: epoch={epoch}, train_loss={train_loss:.4f}, primitive={primitive}")
 
     # ── 2. Data ───────────────────────────────────────────────────────────
     dataset = NuScenesNVSDataset(
@@ -123,7 +219,7 @@ def visualize(checkpoint: str, scene_num: int, split: str,
     if scene_num >= len(dataset):
         raise ValueError(f"--scene-num {scene_num} out of range (size={len(dataset)})")
 
-    pts = dataset[scene_num]["input_0"]   # [N, 4]
+    pts = dataset[scene_num]["input_0"]  # [N, 4]
 
     # ── 3. Inference ──────────────────────────────────────────────────────
     xyz_raw   = pts[:, :3].to(device)
@@ -135,22 +231,22 @@ def visualize(checkpoint: str, scene_num: int, split: str,
     with torch.no_grad():
         output = model(xyz, intensity, tau=tau)
 
-    gaussians      = output["gaussians"]
-    assign         = output["assign"]
+    gaussians = output["gaussians"]
+    assign    = output["assign"]
 
-    mu     = gaussians["mu"].cpu().numpy()   # [K, 3]
-    n_vec  = gaussians["n"].cpu().numpy()    # [K, 3]
-    u_vec  = gaussians["u"].cpu().numpy()    # [K, 3]
-    v_vec  = gaussians["v"].cpu().numpy()    # [K, 3]
-    s      = gaussians["s"].cpu().numpy()    # [K, 2]
-    xyz_np = xyz.cpu().numpy()               # [N, 3]
-
-    hard = assign.argmax(dim=1).cpu().numpy()  # [N]
+    mu     = gaussians["mu"].cpu().numpy()  # [K, 3]
+    q      = gaussians["q"].cpu().numpy()   # [K, 4]
+    s      = gaussians["s"].cpu().numpy()   # [K, 2] or [K, 3]
+    xyz_np = xyz.cpu().numpy()              # [N, 3]
+    hard   = assign.argmax(dim=1).cpu().numpy()  # [N]
 
     K = mu.shape[0]
     N = xyz_np.shape[0]
-    print(f"Scene {scene_num}: N={N} points, K={K} surfels")
+    print(f"Scene {scene_num}: N={N} points, K={K} Gaussians")
     print(f"Scale stats: min={s.min():.3f}  mean={s.mean():.3f}  max={s.max():.3f}")
+
+    # Principal axes from q (used by both modes for normal/axis display)
+    u_vec, v_vec, n_vec, R_all = _q_to_axes(q)
 
     # ── 4. Colors ─────────────────────────────────────────────────────────
     palette = [
@@ -163,7 +259,7 @@ def visualize(checkpoint: str, scene_num: int, split: str,
     sur_colors = [palette[k % len(palette)] for k in range(K)]
 
     # ── 5. Build traces ───────────────────────────────────────────────────
-    # Trace 0: point cloud (cluster-colored)
+    # Trace 0: point cloud colored by cluster assignment
     trace_pts = go.Scatter3d(
         x=xyz_np[:, 0], y=xyz_np[:, 1], z=xyz_np[:, 2],
         mode="markers",
@@ -172,66 +268,82 @@ def visualize(checkpoint: str, scene_num: int, split: str,
         hovertemplate="x=%{x:.2f} y=%{y:.2f} z=%{z:.2f}<extra></extra>",
     )
 
-    # Trace 1: surfel filled discs (Mesh3d, vertexcolor)
-    vx, vy, vz, fi, fj, fk, vcolors = _build_surfel_mesh(mu, u_vec, v_vec, s, palette)
-    trace_discs = go.Mesh3d(
+    # Trace 1: Gaussian shapes
+    if primitive == "2d":
+        # Prefer model-output u/v if available, else derive from q
+        u_vis = gaussians["u"].cpu().numpy() if "u" in gaussians else u_vec
+        v_vis = gaussians["v"].cpu().numpy() if "v" in gaussians else v_vec
+        vx, vy, vz, fi, fj, fk, vcol = _build_surfel_mesh(
+            mu, u_vis, v_vis, s, palette)
+        shape_name = "Surfels"
+    else:
+        vx, vy, vz, fi, fj, fk, vcol = _build_ellipsoid_mesh(
+            mu, q, s, palette)
+        shape_name = "Ellipsoids"
+
+    trace_shapes = go.Mesh3d(
         x=vx, y=vy, z=vz,
         i=fi, j=fj, k=fk,
-        vertexcolor=vcolors,
-        opacity=0.65,
-        name="Surfels",
+        vertexcolor=vcol,
+        opacity=0.55,
+        name=shape_name,
         hoverinfo="skip",
         showlegend=True,
         showscale=False,
     )
 
-    # Trace 2: surfel centres
+    # Trace 2: Gaussian centres
     trace_centers = go.Scatter3d(
         x=mu[:, 0], y=mu[:, 1], z=mu[:, 2],
         mode="markers",
         marker=dict(size=3, color=sur_colors, symbol="x"),
-        name="Surfel centres",
+        name="Centers",
         hovertemplate="x=%{x:.2f} y=%{y:.2f} z=%{z:.2f}<extra></extra>",
     )
 
-    # Trace 3: normal vectors
-    nx, ny, nz = _build_normal_lines(mu, n_vec, scale=0.5)
-    trace_normals = go.Scatter3d(
-        x=nx, y=ny, z=nz,
+    # Trace 3: surface normals (2D) or thinnest-axis arrows (3D)
+    if primitive == "2d":
+        n_vis = gaussians["n"].cpu().numpy() if "n" in gaussians else n_vec
+        ax_x, ax_y, ax_z = _build_normal_lines(mu, n_vis, scale=0.5)
+        axis_name = "Normals"
+    else:
+        ax_x, ax_y, ax_z = _build_axis_lines(mu, R_all, s, scale_factor=1.0)
+        axis_name = "Principal axes"
+
+    trace_axes = go.Scatter3d(
+        x=ax_x, y=ax_y, z=ax_z,
         mode="lines",
         line=dict(width=2, color="rgba(255,160,0,0.7)"),
-        name="Normals",
+        name=axis_name,
         hoverinfo="skip",
     )
 
-    fig = go.Figure(data=[trace_pts, trace_discs, trace_centers, trace_normals])
+    fig = go.Figure(data=[trace_pts, trace_shapes, trace_centers, trace_axes])
 
     # ── 6. Toggle buttons ─────────────────────────────────────────────────
-    # Trace order: 0=pts  1=discs  2=centers  3=normals
+    mode_str = "2D surfel" if primitive == "2d" else "3D Gaussian"
     btn_both = dict(
-        label="Both",
-        method="update",
+        label="Both", method="update",
         args=[{"visible": [True, True, True, True]},
               {"title.text": f"Scene {scene_num} | epoch={epoch} | Both"}],
     )
     btn_pts = dict(
-        label="Points only",
-        method="update",
+        label="Points only", method="update",
         args=[{"visible": [True, False, False, False]},
               {"title.text": f"Scene {scene_num} | epoch={epoch} | Points only"}],
     )
     btn_gauss = dict(
-        label="Gaussians only",
-        method="update",
+        label=f"{shape_name} only", method="update",
         args=[{"visible": [False, True, True, True]},
-              {"title.text": f"Scene {scene_num} | epoch={epoch} | Gaussians only"}],
+              {"title.text": f"Scene {scene_num} | epoch={epoch} | {shape_name} only"}],
     )
 
     # ── 7. Layout ─────────────────────────────────────────────────────────
     dark_bg = "rgb(15,15,20)"
     fig.update_layout(
         title=dict(
-            text=f"Scene {scene_num} | epoch={epoch} | N={N} pts | K={K} surfels | Both",
+            text=(f"Scene {scene_num} | epoch={epoch} | N={N} pts | K={K} "
+                  f"| {mode_str} | Both"),
             font=dict(color="white", size=13),
         ),
         scene=dict(
@@ -269,7 +381,6 @@ def visualize(checkpoint: str, scene_num: int, split: str,
     out_dir = os.path.dirname(out)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
-    # Insert epoch into filename: foo.html → foo_ep16.html
     base, ext = os.path.splitext(out)
     out_final = f"{base}_ep{epoch}{ext}.html"
     fig.write_html(out_final, include_plotlyjs="cdn")
@@ -277,11 +388,13 @@ def visualize(checkpoint: str, scene_num: int, split: str,
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Interactive 3D visualization of clustering")
+    _defaults = NeuralClusteringConfig()
+    parser = argparse.ArgumentParser(
+        description="Interactive 3D visualization of Gaussian clustering")
     parser.add_argument("--checkpoint", default="outputs/train_001/ckpt/best_model.pt")
     parser.add_argument("--scene-num", type=int, default=0)
     parser.add_argument("--split", default="val")
-    parser.add_argument("--data-root", default=os.path.expanduser("~/data/nuScenes"))
+    parser.add_argument("--data-root", default=_defaults.data_root)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--tau", type=float, default=0.1)
     parser.add_argument("--out", default=None,
