@@ -25,6 +25,7 @@ python eval.py --ckpt outputs/train_XXX/ckpt/best_model.pt
 
 ## Pipeline Architecture
 
+""GOAL"" Clustering using Gaussian primitives to accurately represent the surface of a 3D scene rendered as a LiDAR point cloud 
 The model is a single-forward-pass pipeline: **raw LiDAR → Gaussian parameters**.
 
 ```

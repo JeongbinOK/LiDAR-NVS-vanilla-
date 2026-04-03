@@ -318,6 +318,8 @@ def main():
                         choices=["ptv3", "custom"])
     parser.add_argument("--primitive", default=_defaults.primitive_type,
                         choices=["2d", "3d"])
+    parser.add_argument("--seed-voxel-size", type=float, default=_defaults.seed_voxel_size,
+                        help="Voxel size for seed center generation (WSL2 3090: use 4.0)")
     args = parser.parse_args()
 
     cfg = NeuralClusteringConfig(
@@ -328,6 +330,7 @@ def main():
         device=args.device,
         backbone_type=args.backbone,
         primitive_type=args.primitive,
+        seed_voxel_size=args.seed_voxel_size,
     )
 
     train(cfg, overfit_frames=args.overfit, resume=args.resume)

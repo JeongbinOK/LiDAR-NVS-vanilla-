@@ -189,7 +189,18 @@ class GaussianParameterHead(nn.Module):
         # Residual prediction
         mu = centers + self.mlp_mu(center_feats)
         q = F.normalize(q_pca + self.mlp_q(center_feats), dim=-1)
-        s = (s_pca * torch.exp(self.mlp_s(center_feats).clamp(-3, 3))).clamp(min=0.1)
+        s_raw = s_pca * torch.exp(self.mlp_s(center_feats).clamp(-3, 3))
+        if self.primitive == "3d":
+            # Sort descending so s[0]≥s[1]≥s[2] (fat→thin) — PCA initialises this
+            # order but MLP correction can break it.
+            s = s_raw.sort(dim=-1, descending=True).values
+            # Per-axis floor: allow thin axis (normal) down to 2cm.
+            # top-M assignment ensures only nearby points enter loss, so
+            # (d_n/0.02)² stays manageable; clip_grad_norm handles the rest.
+            s_floor = s.new_tensor([0.1, 0.05, 0.02])
+            s = torch.maximum(s, s_floor.unsqueeze(0))
+        else:
+            s = s_raw.clamp(min=0.1)
         alpha = torch.ones(centers.shape[0], 1, device=centers.device)
 
         # Rotation matrix and derived vectors
