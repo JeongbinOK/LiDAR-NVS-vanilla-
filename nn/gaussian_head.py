@@ -197,7 +197,7 @@ class GaussianParameterHead(nn.Module):
             # Per-axis floor: allow thin axis (normal) down to 2cm.
             # top-M assignment ensures only nearby points enter loss, so
             # (d_n/0.02)² stays manageable; clip_grad_norm handles the rest.
-            s_floor = s.new_tensor([0.1, 0.05, 0.02])
+            s_floor = s.new_tensor([0.1, 0.05, 0.05])
             s = torch.maximum(s, s_floor.unsqueeze(0))
         else:
             s = s_raw.clamp(min=0.1)

@@ -10,15 +10,10 @@ import warnings
 
 warnings.filterwarnings("ignore", category=FutureWarning, module="spconv")
 
-# WSL2에서는 CUDA 메모리 단편화가 심해 OOM이 발생하기 쉬움.
-# expandable_segments는 CUDA VMM API를 사용해 단편화를 완화함.
+# assign_full.T.topk() 등 비연속 텐서 topk에서 임시 contiguous copy가 생성되어
+# 메모리 단편화가 심해질 수 있음. expandable_segments는 CUDA VMM API로 단편화 완화.
 # import torch 이전에 설정해야 allocator 초기화에 반영됨.
-try:
-    with open("/proc/version") as _f:
-        if "microsoft" in _f.read().lower():
-            os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-except OSError:
-    pass
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 from torch.utils.data import DataLoader

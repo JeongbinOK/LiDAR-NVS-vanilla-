@@ -24,9 +24,12 @@ class RefineLayer(nn.Module):
         self.cross_out = nn.Linear(dim, dim)
 
         # Self-attention (centers attend to each other)
-        self.self_attn = nn.MultiheadAttention(
-            dim, num_heads, batch_first=True,
-        )
+        # Use F.scaled_dot_product_attention (flash-attn backend) to avoid
+        # materialising the full K×K matrix — nn.MultiheadAttention OOMs at K>~8k.
+        self.sa_q = nn.Linear(dim, dim)
+        self.sa_k = nn.Linear(dim, dim)
+        self.sa_v = nn.Linear(dim, dim)
+        self.sa_out = nn.Linear(dim, dim)
 
         # FFN
         self.ffn = nn.Sequential(
@@ -88,9 +91,13 @@ class RefineLayer(nn.Module):
         center_feats = center_feats + cross_out
         center_feats = self.norm1(center_feats)
 
-        # 2. Self-attention (add batch dim for nn.MultiheadAttention)
-        cf = center_feats.unsqueeze(0)  # [1, K, D]
-        sa_out = self.self_attn(cf, cf, cf)[0].squeeze(0)  # [K, D]
+        # 2. Self-attention via F.scaled_dot_product_attention [O(K) memory]
+        K, D = center_feats.shape
+        q = self.sa_q(center_feats).view(K, self.num_heads, self.head_dim).transpose(0, 1).unsqueeze(0)  # [1, H, K, d]
+        k = self.sa_k(center_feats).view(K, self.num_heads, self.head_dim).transpose(0, 1).unsqueeze(0)
+        v = self.sa_v(center_feats).view(K, self.num_heads, self.head_dim).transpose(0, 1).unsqueeze(0)
+        sa_out = F.scaled_dot_product_attention(q, k, v).squeeze(0).transpose(0, 1).reshape(K, D)
+        sa_out = self.sa_out(sa_out)
         center_feats = center_feats + sa_out
         center_feats = self.norm2(center_feats)
 

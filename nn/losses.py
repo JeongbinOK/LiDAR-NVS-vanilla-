@@ -54,8 +54,9 @@ class ClusteringLoss(nn.Module):
 
         # Per-Gaussian top-M: each Gaussian gathers its most-assigned points.
         # Ensures all K Gaussians receive gradient (no dead clusters).
+        # .contiguous() avoids implicit temp copy inside topk on non-contiguous .T view.
         top_m = min(self.top_m, N)
-        assign_topk_w, assign_topk_idx = assign_full.T.topk(top_m, dim=-1)  # [K, M]
+        assign_topk_w, assign_topk_idx = assign_full.T.contiguous().topk(top_m, dim=-1)  # [K, M]
         # Normalize per Gaussian so weights sum to 1 per cluster
         assign_topk_w = assign_topk_w / assign_topk_w.sum(dim=-1, keepdim=True).clamp(min=1e-8)
 
