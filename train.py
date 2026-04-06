@@ -141,7 +141,7 @@ def train(cfg: NeuralClusteringConfig, overfit_frames: int = 0, resume: str = ""
     model = NeuralClusteringModel(cfg).to(device)
     loss_fn = ClusteringLoss(
         primitive=cfg.primitive_type,
-        top_m=cfg.pca_topk,
+        top_k_assign=cfg.top_k_assign,
     )
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay,

@@ -109,7 +109,7 @@ def main():
 
     loss_fn = ClusteringLoss(
         primitive=cfg.primitive_type,
-        top_m=cfg.pca_topk,
+        top_k_assign=cfg.top_k_assign,
     )
 
     # Dataset

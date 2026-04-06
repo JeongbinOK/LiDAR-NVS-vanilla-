@@ -48,7 +48,7 @@ class NeuralClusteringConfig:
 
     # Gaussian head
     primitive_type: str = "3d"     # "2d" or "3d"
-    pca_topk: int = 32             # PCA 및 loss 모두 per-Gaussian top-M으로 사용
+    pca_topk: int = 32             # Gaussian 초기화 (Warm-start)용 PCA 계산 시 참조할 점의 수
 
     # Preprocessing
     ego_radius: float = 2.5
@@ -63,7 +63,7 @@ class NeuralClusteringConfig:
     num_epochs: int = 30
     batch_size: int = 2
 
-    # Loss (top_k_assign은 현재 미사용; loss는 pca_topk를 top_m으로 사용)
+    # Loss: 1개의 점이 자신과 가장 확률이 높은 top_k개의 가우시안에게만 NLL Gradient를 줌 (메모리 최적화)
     top_k_assign: int = 8
 
     # Data

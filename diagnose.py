@@ -16,7 +16,7 @@ def grad_check(primitive="2d", steps=3):
 
     cfg = NeuralClusteringConfig(backbone_type="ptv3", primitive_type=primitive)
     model = NeuralClusteringModel(cfg).cuda()
-    loss_fn = ClusteringLoss(primitive=primitive, top_m=cfg.pca_topk)
+    loss_fn = ClusteringLoss(primitive=primitive, top_k_assign=cfg.top_k_assign)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
 
     N = 3000
@@ -65,7 +65,7 @@ def train_test(primitive="2d", epochs=20):
 
     cfg = NeuralClusteringConfig(backbone_type="ptv3", primitive_type=primitive)
     model = NeuralClusteringModel(cfg).cuda()
-    loss_fn = ClusteringLoss(primitive=primitive, top_m=cfg.pca_topk)
+    loss_fn = ClusteringLoss(primitive=primitive, top_k_assign=cfg.top_k_assign)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
 
     # Synthetic: two parallel planes
