@@ -122,6 +122,25 @@ def train(cfg: NeuralClusteringConfig, overfit_frames: int = 0, resume: str = ""
     # Save config
     with open(os.path.join(cfg_dir, "config.json"), "w") as f:
         json.dump(dataclasses.asdict(cfg), f, indent=2)
+        
+    # Save git info for reproducibility
+    try:
+        import subprocess
+        commit_hash = subprocess.check_output(["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL).decode("utf-8").strip()
+        git_diff = subprocess.check_output(["git", "diff", "--stat"], stderr=subprocess.DEVNULL).decode("utf-8").strip()
+        branch_name = subprocess.check_output(["git", "rev-parse", "--abbrev-ref", "HEAD"], stderr=subprocess.DEVNULL).decode("utf-8").strip()
+        
+        git_info = {
+            "commit_hash": commit_hash,
+            "branch": branch_name,
+            "is_dirty": bool(git_diff),
+            "diff_stat": git_diff,
+        }
+        with open(os.path.join(cfg_dir, "git_info.json"), "w") as f:
+            json.dump(git_info, f, indent=2)
+    except Exception as e:
+        print(f"Warning: Failed to save git info: {e}")
+
     print(f"Run dir: {run_dir}")
 
     data_root = os.path.expanduser(cfg.data_root)
