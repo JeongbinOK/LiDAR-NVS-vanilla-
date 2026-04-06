@@ -56,14 +56,14 @@ class ClusteringLoss(nn.Module):
         # Ensures all K Gaussians receive gradient (no dead clusters).
         # .contiguous() avoids implicit temp copy inside topk on non-contiguous .T view.
         top_m = min(self.top_m, N)
-        assign_topk_w, assign_topk_idx = assign_full.T.contiguous().topk(top_m, dim=-1)  # [K, M]
+        assign_topk_w, assign_topk_idx = assign_full.T.topk(top_m, dim=-1)  # [K, M]
         # Normalize per Gaussian so weights sum to 1 per cluster
         assign_topk_w = assign_topk_w / assign_topk_w.sum(dim=-1, keepdim=True).clamp(min=1e-8)
 
         # Gather point coords and Gaussian params
         top_xyz = xyz[assign_topk_idx]                          # [K, M, 3]
         d = top_xyz - mu.unsqueeze(1)                           # [K, M, 3]
-        s_exp = s.unsqueeze(1).expand(-1, top_m, -1).clamp(min=1e-4)  # [K, M, s_dim]
+        s_exp = s.unsqueeze(1).expand(-1, top_m, -1).clamp(min=0.01)  # [K, M, s_dim]
         q_exp = q.unsqueeze(1).expand(-1, top_m, -1)            # [K, M, 4]
 
         # Compute NLL
@@ -98,7 +98,8 @@ class ClusteringLoss(nn.Module):
         d_u = (d * u_cands).sum(dim=-1)
         d_v = (d * v_cands).sum(dim=-1)
         maha = (d_u / s_cands[:, :, 0]).pow(2) + (d_v / s_cands[:, :, 1]).pow(2)
-        
+        maha = maha.clamp(max=7500.0)
+
         # 2) Log-determinant of covariance is 2 * sum(ln(s))
         log_det = 2.0 * (torch.log(s_cands[:, :, 0]) + torch.log(s_cands[:, :, 1]))
 
@@ -116,8 +117,8 @@ class ClusteringLoss(nn.Module):
         R = R_flat.reshape(K, M, 3, 3)
 
         d_local = torch.einsum('nkij,nkj->nki', R.transpose(-1, -2), d)
-        maha = (d_local / s_cands).pow(2).sum(dim=-1)
-        
+        maha = (d_local / s_cands).pow(2).sum(dim=-1).clamp(max=7500.0)
+
         # 4) Log-determinant correction (factor of 2)
         log_det = 2.0 * torch.log(s_cands).sum(dim=-1)
 

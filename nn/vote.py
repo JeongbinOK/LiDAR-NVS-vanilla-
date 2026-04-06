@@ -12,6 +12,8 @@ scatter_mean is differentiable. Voxel assignment is discrete (like
 PTv3's own voxelization), but values within each voxel get gradient.
 """
 
+import math
+
 import torch
 import torch.nn as nn
 
@@ -22,11 +24,16 @@ class VoxelCenterPredictor(nn.Module):
     Per-point offset MLP adjusts positions, then voxelization groups
     nearby voted positions. scatter_mean produces seed centers [V, 3]
     and aggregated features [V, D] where V = number of occupied voxels.
+
+    If V > max_K, coarse-grid deduplication reduces seeds to at most max_K:
+    fine voxels are grouped into a coarser grid (scale = ceil(sqrt(V/max_K))),
+    and the highest-point-count representative is kept per coarse cell.
     """
 
-    def __init__(self, dim: int = 64, voxel_size: float = 0.3):
+    def __init__(self, dim: int = 64, voxel_size: float = 0.3, max_K: int = 8000):
         super().__init__()
         self.voxel_size = voxel_size
+        self.max_K = max_K
 
         self.offset_mlp = nn.Sequential(
             nn.Linear(dim, dim),
@@ -91,10 +98,61 @@ class VoxelCenterPredictor(nn.Module):
         voxel_centers = voxel_xyz_sum / voxel_count.unsqueeze(1)  # [V, 3]
         voxel_feats = voxel_feat_sum / voxel_count.unsqueeze(1)   # [V, D]
 
+        # Coarse-grid deduplication: if V > max_K, group fine voxels into a
+        # coarser grid and keep the highest-point-count representative per cell.
+        # scale = ceil((V/max_K)^(1/3)) for 3D grouping.
+        #
+        # Phase 1: coarse-grid selects one spatial representative per region
+        #          → C < max_K (spatial coverage, but under-utilises budget)
+        # Phase 2: fill remaining (max_K - C) slots with highest-count voxels
+        #          not already selected → utilise full max_K budget
+        if V > self.max_K:
+            scale = max(2, math.ceil((V / self.max_K) ** (1 / 3)))
+            coarse = torch.floor(voxel_centers.detach() / (self.voxel_size * scale)).long()
+            coarse = coarse - coarse.min(0).values
+            cdims = coarse.max(0).values + 1
+            coarse_lin = (coarse[:, 0] * cdims[1] + coarse[:, 1]) * cdims[2] + coarse[:, 2]
+
+            # Sort by (coarse_lin asc, voxel_count desc) via composite integer key
+            max_cnt = voxel_count.long().max()
+            sort_key = coarse_lin * (max_cnt + 1) + (max_cnt - voxel_count.long())
+            order = sort_key.argsort()
+
+            # First occurrence in sorted order = highest-count voxel per coarse cell
+            sorted_coarse = coarse_lin[order]
+            is_first = torch.cat([
+                torch.ones(1, dtype=torch.bool, device=device),
+                sorted_coarse[1:] != sorted_coarse[:-1],
+            ])
+            keep_coarse = order[is_first]  # [C] spatial representatives
+
+            if keep_coarse.shape[0] >= self.max_K:
+                # More coarse cells than budget: keep top by count
+                keep = keep_coarse[voxel_count[keep_coarse].topk(self.max_K).indices]
+            else:
+                # Phase 2: fill remaining budget with highest-count non-selected voxels
+                n_fill = self.max_K - keep_coarse.shape[0]
+                selected_mask = torch.zeros(V, dtype=torch.bool, device=device)
+                selected_mask[keep_coarse] = True
+                remaining = (~selected_mask).nonzero(as_tuple=True)[0]
+                if remaining.shape[0] > 0:
+                    n_fill = min(n_fill, remaining.shape[0])
+                    fill = remaining[voxel_count[remaining].topk(n_fill).indices]
+                    keep = torch.cat([keep_coarse, fill])
+                else:
+                    keep = keep_coarse
+
+            voxel_centers = voxel_centers[keep]
+            voxel_feats = voxel_feats[keep]
+            V = voxel_centers.shape[0]
+
         return {
-            "vote_xyz": vote_xyz,           # [N, 3]
-            "offset": offset,               # [N, 3]
-            "voxel_centers": voxel_centers,  # [V, 3]
+            "vote_xyz": vote_xyz,            # [N, 3]
+            "offset": offset,                # [N, 3]
+            "voxel_centers": voxel_centers,  # [V, 3]  V <= max_K after capping
             "voxel_feats": voxel_feats,      # [V, D]
-            "voxel_ids": voxel_ids,          # [N] point-to-voxel mapping
+            # NOTE: voxel_ids maps points to the ORIGINAL (pre-cap) fine voxel
+            # indices. Do NOT use voxel_ids to index into voxel_centers/voxel_feats
+            # when capping has occurred (V_original > max_K).
+            "voxel_ids": voxel_ids,          # [N] indices into pre-cap voxel space
         }

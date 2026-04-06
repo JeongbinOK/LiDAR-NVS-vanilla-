@@ -56,6 +56,7 @@ class NeuralClusteringModel(nn.Module):
         self.voter = VoxelCenterPredictor(
             dim=D,
             voxel_size=getattr(cfg, 'seed_voxel_size', 0.3),
+            max_K=getattr(cfg, 'max_seed_K', 8000),
         )
 
         # Stage 3: Differentiable Soft Clustering

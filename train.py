@@ -196,6 +196,12 @@ def train(cfg: NeuralClusteringConfig, overfit_frames: int = 0, resume: str = ""
                         model, loss_fn, frame_pts, device, tau, cfg.ego_radius,
                     )
 
+                    K_now = output["assign"].shape[1]
+                    N_now = xyz.shape[0]
+                    if K_now > 5000:
+                        mem_mb = torch.cuda.memory_allocated() / 1e6
+                        pbar.write(f"  [K-warn] batch={batch_idx} K={K_now} N={N_now} mem={mem_mb:.0f}MB")
+
                     if not torch.isfinite(ld["total"]):
                         pbar.write(f"  NaN/inf loss at batch {batch_idx} frame {valid_frames}, skipping frame")
                         continue

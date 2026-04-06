@@ -32,11 +32,14 @@ class NeuralClusteringConfig:
     # Voxel seeding
     # 주의: 1.0m는 RTX 4090(native Linux)에서는 K≈3000으로 정상 동작하지만,
     # WSL2 RTX 3090에서는 K≈N(≈33K)이 되어 assign OOM → --seed-voxel-size 4.0 사용
-    seed_voxel_size: float = 1.0
+    seed_voxel_size: float = 1.5
+    # K 상한: V > max_seed_K이면 coarse-grid deduplication으로 축소
+    # diff_cluster backward = 8 × N × K × 4 bytes → K=8000, N=28000 → ~7GB
+    max_seed_K: int = 1500
 
     # Differentiable clustering
     cluster_iters: int = 4
-    cluster_feat_weight: float = 0.0  # >0이면 WSL2 3090(24GB)에서 backward OOM (display 1.3GB 선점으로 실질 가용 부족)
+    cluster_feat_weight: float = 0.1  # >0이면 4×feat_dist[N,K] backward 누적 → K 큰 배치에서 OOM
 
     # Cross-attention refinement
     refine_layers: int = 2
@@ -64,7 +67,7 @@ class NeuralClusteringConfig:
     top_k_assign: int = 8
 
     # Data
-    data_root: str = "~/data/nuScenes"
+    data_root: str = "/data1/nuScenes"
 
     # Device
     device: str = "cuda"
