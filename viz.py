@@ -66,10 +66,10 @@ def _q_to_axes(q_np: np.ndarray):
 
 # ── 2D surfel ─────────────────────────────────────────────────────────────────
 
-def _build_surfel_mesh(mu, u, v, s, palette, n_theta=32, min_vis_scale=1.5):
+def _build_surfel_mesh(mu, u, v, s, palette, n_theta=32, min_vis_scale=1.5, sigma_multiplier=3.0):
     """Batched Mesh3d for all K surfel discs (2D mode).
 
-    Each disc is a fan-triangulated ellipse at 1-sigma in the u-v plane.
+    Each disc is a fan-triangulated ellipse at N-sigma in the u-v plane.
     """
     all_x, all_y, all_z = [], [], []
     all_i, all_j, all_k = [], [], []
@@ -82,7 +82,7 @@ def _build_surfel_mesh(mu, u, v, s, palette, n_theta=32, min_vis_scale=1.5):
     offset = 0
     for k_idx in range(len(mu)):
         color = palette[k_idx % len(palette)]
-        sk = np.maximum(s[k_idx], min_vis_scale)  # [2]
+        sk = np.maximum(s[k_idx] * sigma_multiplier, min_vis_scale)  # [2]
 
         circle = (mu[k_idx]
                   + sk[0] * cos_t[:, None] * u[k_idx]
@@ -117,7 +117,7 @@ def _build_normal_lines(mu, n, scale=0.5):
 
 # ── 3D ellipsoid ──────────────────────────────────────────────────────────────
 
-def _build_ellipsoid_mesh(mu, q, s, palette, n_lat=10, n_lon=16, min_vis_scale=0.3):
+def _build_ellipsoid_mesh(mu, q, s, palette, n_lat=10, n_lon=16, min_vis_scale=0.3, sigma_multiplier=3.0):
     """Batched Mesh3d for all K ellipsoids (3D mode).
 
     Parametric construction:
@@ -156,7 +156,7 @@ def _build_ellipsoid_mesh(mu, q, s, palette, n_lat=10, n_lon=16, min_vis_scale=0
     offset = 0
     for k_idx in range(len(mu)):
         color = palette[k_idx % len(palette)]
-        sk = np.maximum(s[k_idx], min_vis_scale)   # [3]
+        sk = np.maximum(s[k_idx] * sigma_multiplier, min_vis_scale)   # [3]
 
         pts = (sphere * sk) @ R_all[k_idx] + mu[k_idx]  # [V, 3]
 
