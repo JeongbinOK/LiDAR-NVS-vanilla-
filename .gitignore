@@ -13,6 +13,14 @@ ckpt/
 *.png
 *.html
 *.log
+*.pdf
+
+# Offline detection + tracking results (LK3D + MCTrack, large files)
+bbox/
+
+# External detector/tracker repos (cloned on demand by run_all.sh)
+nn/detector/LargeKernel3D/
+nn/detector/MCTrack/
 
 # Environments
 .env

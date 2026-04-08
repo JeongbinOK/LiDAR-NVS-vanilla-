@@ -1,4 +1,4 @@
-"""Evaluation script for neural Gaussian clustering."""
+"""Evaluation script for Quadratic Gaussian Splatting (QGS)."""
 
 import argparse
 import os
@@ -7,15 +7,16 @@ import sys
 import torch
 import numpy as np
 
-from config import NeuralClusteringConfig
-sys.path.insert(0, os.path.join(os.path.expanduser(NeuralClusteringConfig.data_root), "loader"))
+from config import QGSConfig
+sys.path.insert(0, os.path.join(os.path.expanduser(QGSConfig.data_root), "loader"))
 from dataset import NuScenesNVSDataset, nvs_collate_fn
 
-from nn.model import NeuralClusteringModel
-from nn.losses import ClusteringLoss
+from nn.model import QGSModel
+# TODO: Import your QGSLoss here
+# from nn.qgs_loss import QGSLoss
 
 
-def evaluate_frame(model, loss_fn, pts, device, tau, ego_radius):
+def evaluate_frame(model, loss_fn, pts, device, ego_radius):
     """Run model on a single frame, return metrics + output."""
     xyz = pts[:, :3].to(device)
     intensity = pts[:, 3:4].to(device)
@@ -24,93 +25,39 @@ def evaluate_frame(model, loss_fn, pts, device, tau, ego_radius):
     xyz, intensity = xyz[mask], intensity[mask]
 
     with torch.no_grad():
-        output = model(xyz, intensity, tau=tau)
-        loss_dict = loss_fn(xyz, output)
+        output = model(xyz, intensity)
+        
+        # TODO: compute actual loss and metrics using loss_fn
+        # loss_dict = loss_fn(xyz, output)
+        metrics = {
+            "dummy_loss": 0.0,
+            "N": xyz.shape[0],
+        }
 
-    gaussians = output["gaussians"]
-    assign = output["assign"]  # [N, K] dense
-    mu = gaussians["mu"]
-
-    hard = assign.argmax(dim=1)
-
-    # Distance to assigned center
-    dist_rms = (xyz - mu[hard]).norm(dim=1).pow(2).mean().sqrt().item()
-
-    # Off-plane distance for 2D
-    if "n" in gaussians:
-        n = gaussians["n"]
-        gamma = ((xyz - mu[hard]) * n[hard]).sum(dim=1)
-        gamma_rms = gamma.pow(2).mean().sqrt().item()
-    else:
-        gamma_rms = dist_rms
-
-    coverage = (assign.max(dim=1).values > 0.1).float().mean().item()
-
-    metrics = {
-        "loss": loss_dict["total"].item(),
-        "surface": loss_dict["surface"].item(),
-        "gamma_rms": gamma_rms,
-        "dist_rms": dist_rms,
-        "coverage": coverage,
-        "K": mu.shape[0],
-        "N": xyz.shape[0],
-    }
     return metrics, output, xyz
 
 
-def save_bev(xyz, output, path, title=""):
-    """Save BEV visualization of clustering."""
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    xyz_np = xyz.cpu().numpy()
-    assign = output["assign"]  # [N, K] dense
-    mu = output["gaussians"]["mu"].cpu().numpy()
-
-    hard = assign.argmax(dim=1).cpu().numpy()
-
-    fig, ax = plt.subplots(1, 1, figsize=(12, 12))
-    ax.scatter(
-        xyz_np[:, 0], xyz_np[:, 1],
-        c=hard, cmap="tab20", s=0.3, alpha=0.6, rasterized=True,
-    )
-    ax.scatter(mu[:, 0], mu[:, 1], c="red", s=10, marker="x", linewidths=0.5)
-    ax.set_aspect("equal")
-    ax.set_xlim(-50, 50)
-    ax.set_ylim(-50, 50)
-    ax.set_title(title, fontsize=10)
-    ax.set_xlabel("x (m)")
-    ax.set_ylabel("y (m)")
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Saved: {path}")
-
-
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate neural clustering")
+    parser = argparse.ArgumentParser(description="Evaluate QGS model")
     parser.add_argument("--checkpoint", default="outputs/best_model.pt")
     parser.add_argument("--data-root", default=os.path.expanduser("~/data/nuScenes"))
     parser.add_argument("--split", default="val")
     parser.add_argument("--num-frames", type=int, default=20)
-    parser.add_argument("--tau", type=float, default=0.1, help="Clustering tau for eval")
     parser.add_argument("--save-viz", action="store_true", help="Save BEV plots")
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
 
-    cfg = NeuralClusteringConfig(device=args.device)
+    cfg = QGSConfig(device=args.device)
 
     # Load model
-    model = NeuralClusteringModel(cfg).to(args.device)
+    model = QGSModel(cfg).to(args.device)
     ckpt = torch.load(args.checkpoint, map_location=args.device, weights_only=False)
     model.load_state_dict(ckpt["model_state_dict"], strict=False)
     model.eval()
     print(f"Loaded checkpoint: epoch {ckpt['epoch']}, train_loss {ckpt['loss']:.4f}")
 
-    loss_fn = ClusteringLoss(
-        primitive=cfg.primitive_type,
-        top_k_assign=cfg.top_k_assign,
-    )
+    # TODO: Instantiate QGSLoss
+    loss_fn = None
 
     # Dataset
     dataset = NuScenesNVSDataset(
@@ -130,31 +77,25 @@ def main():
         pts = sample["input_0"]  # [N, 4]
 
         metrics, output, xyz = evaluate_frame(
-            model, loss_fn, pts, args.device, args.tau, cfg.ego_radius,
+            model, loss_fn, pts, args.device, cfg.ego_radius,
         )
         all_metrics.append(metrics)
 
         status = (
             f"[{i+1:3d}/{num_frames}] "
-            f"N={metrics['N']:5d} K={metrics['K']:3d} "
-            f"gamma={metrics['gamma_rms']:.4f} "
-            f"S={metrics['surface']:.4f} "
-            f"cov={metrics['coverage']:.3f}"
+            f"N={metrics['N']:5d} loss={metrics['dummy_loss']:.4f}"
         )
         print(status)
 
         if args.save_viz and i < 10:
-            save_bev(
-                xyz, output,
-                os.path.join(viz_dir, f"frame_{i:03d}.png"),
-                title=f"Frame {i} | K={metrics['K']} gamma={metrics['gamma_rms']:.3f}",
-            )
+            # TODO: Implement QGS specific plotting
+            pass
 
     # Summary
     print("\n" + "=" * 60)
     print(f"{'Metric':<15} {'Mean':>10} {'Std':>10} {'Min':>10} {'Max':>10}")
     print("-" * 60)
-    for key in ["gamma_rms", "dist_rms", "surface", "coverage", "K", "N"]:
+    for key in ["dummy_loss", "N"]:
         vals = [m[key] for m in all_metrics]
         print(
             f"{key:<15} {np.mean(vals):10.4f} {np.std(vals):10.4f} "
@@ -165,3 +106,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

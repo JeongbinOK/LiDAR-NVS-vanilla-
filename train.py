@@ -20,13 +20,14 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 # Add external dataloader path
-from config import NeuralClusteringConfig
-sys.path.insert(0, os.path.join(os.path.expanduser(NeuralClusteringConfig.data_root), "loader"))
+from config import QGSConfig
+sys.path.insert(0, os.path.join(os.path.expanduser(QGSConfig.data_root), "loader"))
 from dataset import NuScenesNVSDataset, nvs_collate_fn
 
 
-from nn.model import NeuralClusteringModel
-from nn.losses import ClusteringLoss
+from nn.model import QGSModel
+# TODO: Import your QGSLoss here
+# from nn.qgs_loss import QGSLoss
 
 
 def _make_run_dir(base: str = "outputs") -> str:
@@ -49,53 +50,15 @@ def _make_run_dir(base: str = "outputs") -> str:
     return run_dir
 
 
-def compute_tau(epoch: int, cfg: NeuralClusteringConfig) -> float:
-    """Linear temperature annealing from tau_start to tau_end."""
-    if cfg.num_epochs <= 1:
-        return cfg.cluster_tau_end
-    t = epoch / (cfg.num_epochs - 1)
-    return cfg.cluster_tau_start + t * (cfg.cluster_tau_end - cfg.cluster_tau_start)
-
-
 def evaluate_geometric(xyz: torch.Tensor, output: dict) -> dict:
-    """Geometric self-evaluation metrics (no GT needed)."""
-    gaussians = output["gaussians"]
-    assign = output["assign"]  # [N, K] dense
-
-    mu = gaussians["mu"]  # [K, 3]
-    hard = assign.argmax(dim=1)  # [N]
-
-    # Distance to assigned center
-    dist = (xyz - mu[hard]).norm(dim=1)
-    dist_rms = dist.pow(2).mean().sqrt().item()
-
-    # Off-plane distance for 2D (normal exists)
-    if "n" in gaussians:
-        n = gaussians["n"]
-        gamma = ((xyz - mu[hard]) * n[hard]).sum(dim=1)
-        gamma_rms = gamma.pow(2).mean().sqrt().item()
-    else:
-        gamma_rms = dist_rms
-
-    coverage = (assign.max(dim=1).values > 0.1).float().mean().item()
-
-    # Vote offset: 포인트가 투표 위치로 이동한 거리 (VoxelCenterPredictor)
-    vote_offset_norm = output["offset"].norm(dim=1).mean().item()
-
-    # Mu offset: Gaussian center가 clustering center에서 이동한 거리 (mlp_mu residual)
-    mu_offset_norm = (mu - output["centers"]).norm(dim=1).mean().item()
-
+    """Evaluate QGS predictions."""
+    # TODO: Implement geometry evaluation (e.g., PSNR, depth metrics)
     return {
-        "gamma_rms": gamma_rms,
-        "dist_rms": dist_rms,
-        "coverage": coverage,
-        "num_gaussians": mu.shape[0],
-        "vote_offset": vote_offset_norm,
-        "mu_offset": mu_offset_norm,
+        "dummy_metric": 0.0
     }
 
 
-def process_frame(model, loss_fn, pts, device, tau, ego_radius):
+def process_frame(model, loss_fn, pts, device, ego_radius):
     """Run model on a single frame and return loss dict + output."""
     xyz = pts[:, :3].to(device)
     intensity = pts[:, 3:4].to(device)
@@ -105,12 +68,19 @@ def process_frame(model, loss_fn, pts, device, tau, ego_radius):
     xyz, intensity = xyz[mask], intensity[mask]
 
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-        output = model(xyz, intensity, tau=tau)
-        loss_dict = loss_fn(xyz, output)
+        output = model(xyz, intensity)
+        
+        # TODO: compute actual loss
+        # loss_dict = loss_fn(xyz, output)
+        
+        # Skeleton dummy loss for now to keep train loop running
+        dummy_loss = output["features"].sum() * 0.0
+        loss_dict = {"total": dummy_loss}
+        
     return loss_dict, output, xyz
 
 
-def train(cfg: NeuralClusteringConfig, overfit_frames: int = 0, resume: str = ""):
+def train(cfg: QGSConfig, overfit_frames: int = 0, resume: str = ""):
     """Main training loop."""
     device = cfg.device
     
@@ -157,11 +127,9 @@ def train(cfg: NeuralClusteringConfig, overfit_frames: int = 0, resume: str = ""
         collate_fn=nvs_collate_fn, num_workers=4, persistent_workers=True,
     )
 
-    model = NeuralClusteringModel(cfg).to(device)
-    loss_fn = ClusteringLoss(
-        primitive=cfg.primitive_type,
-        top_k_assign=cfg.top_k_assign,
-    )
+    model = QGSModel(cfg).to(device)
+    # TODO: Instantiate QGSLoss
+    loss_fn = None
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay,
     )
@@ -192,7 +160,7 @@ def train(cfg: NeuralClusteringConfig, overfit_frames: int = 0, resume: str = ""
         print("-" * 60)
 
     for epoch in range(start_epoch, cfg.num_epochs):
-        tau = compute_tau(epoch, cfg)
+        # Setup metrics or schedulers specific to epoch here
         epoch_losses = []
         epoch_metrics = []
         t0 = time.time()
@@ -212,14 +180,10 @@ def train(cfg: NeuralClusteringConfig, overfit_frames: int = 0, resume: str = ""
             for b in range(B):
                 for frame_pts in [batch['input_0'][b], batch['input_1'][b]]:
                     ld, output, xyz = process_frame(
-                        model, loss_fn, frame_pts, device, tau, cfg.ego_radius,
+                        model, loss_fn, frame_pts, device, cfg.ego_radius,
                     )
 
-                    K_now = output["assign"].shape[1]
-                    N_now = xyz.shape[0]
-                    if K_now > 5000:
-                        mem_mb = torch.cuda.memory_allocated() / 1e6
-                        pbar.write(f"  [K-warn] batch={batch_idx} K={K_now} N={N_now} mem={mem_mb:.0f}MB")
+                    # Memory constraint checks can go here if needed
 
                     if not torch.isfinite(ld["total"]):
                         pbar.write(f"  NaN/inf loss at batch {batch_idx} frame {valid_frames}, skipping frame")
@@ -267,7 +231,7 @@ def train(cfg: NeuralClusteringConfig, overfit_frames: int = 0, resume: str = ""
             avg_batch = {k: sum(d[k] for d in batch_loss_dicts) / len(batch_loss_dicts)
                          for k in batch_loss_dicts[0]}
             epoch_losses.append(avg_batch)
-            pbar.set_postfix(loss=f"{avg_batch['total']:.4f}", tau=f"{tau:.2f}")
+            pbar.set_postfix(loss=f"{avg_batch['total']:.4f}")
 
             if eval_metric is not None:
                 epoch_metrics.append(eval_metric)
@@ -282,8 +246,7 @@ def train(cfg: NeuralClusteringConfig, overfit_frames: int = 0, resume: str = ""
 
         log = (f"[{epoch+1:3d}/{cfg.num_epochs}] "
                f"loss={avg['total']:.4f} "
-               f"tau={tau:.2f} {dt:.1f}s"
-               f" | s={avg['s_mean']:.3f} K={avg['K']:.0f}")
+               f"{dt:.1f}s")
 
         if epoch_metrics:
             mg = {k: sum(m[k] for m in epoch_metrics) / len(epoch_metrics)

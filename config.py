@@ -1,11 +1,11 @@
-"""Hyperparameters for the 2D Gaussian clustering pipeline."""
+"""Hyperparameters for the Quadratic Gaussian Splatting (QGS) pipeline."""
 
 from dataclasses import dataclass
 
 
 @dataclass
-class NeuralClusteringConfig:
-    """Hyperparameters for the neural clustering pipeline v2."""
+class QGSConfig:
+    """Hyperparameters for the QGS pipeline."""
 
     # Backbone
     backbone_type: str = "ptv3"    # "ptv3" or "custom"
@@ -29,33 +29,13 @@ class NeuralClusteringConfig:
     window_size: int = 48
     num_heads: int = 4
 
-    # Voxel seeding
-    # 주의: 1.0m는 RTX 4090(native Linux)에서는 K≈3000으로 정상 동작하지만,
-    # WSL2 RTX 3090에서는 K≈N(≈33K)이 되어 assign OOM → --seed-voxel-size 4.0 사용
-    seed_voxel_size: float = 1.5
-    # K 상한: V > max_seed_K이면 coarse-grid deduplication으로 축소
-    # diff_cluster backward = 8 × N × K × 4 bytes → K=8000, N=28000 → ~7GB
-    max_seed_K: int = 1500
-
-    # Differentiable clustering
-    cluster_iters: int = 4
-    cluster_feat_weight: float = 0.1  # >0이면 4×feat_dist[N,K] backward 누적 → K 큰 배치에서 OOM
-
-    # Cross-attention refinement
-    refine_layers: int = 2
-    refine_heads: int = 4
-    refine_local_topk: int = 64
-
-    # Gaussian head
-    primitive_type: str = "3d"     # "2d" or "3d"
-    pca_topk: int = 32             # Gaussian 초기화 (Warm-start)용 PCA 계산 시 참조할 점의 수
+    # TODO: Add specific QGS representation parameters here
+    # Example:
+    # qgs_max_primitives: int = 2000
+    # qgs_feature_dim: int = 32
 
     # Preprocessing
     ego_radius: float = 2.5
-
-    # Clustering temperature schedule
-    cluster_tau_start: float = 1.0
-    cluster_tau_end: float = 0.2
 
     # Training
     lr: float = 1e-3
@@ -63,11 +43,11 @@ class NeuralClusteringConfig:
     num_epochs: int = 30
     batch_size: int = 2
 
-    # Loss: 1개의 점이 자신과 가장 확률이 높은 top_k개의 가우시안에게만 NLL Gradient를 줌 (메모리 최적화)
-    top_k_assign: int = 8
-
     # Data
     data_root: str = "/data1/nuScenes"
+    loader_mode: str = "nvs"  # "nvs" | "bbox"
+    bbox_json_path: str = ""  # path to bbox/tracking.json; empty = use GT annotations
 
     # Device
     device: str = "cuda"
+
