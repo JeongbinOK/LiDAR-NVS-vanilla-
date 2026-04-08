@@ -19,7 +19,7 @@ ckpt/
 bbox/
 
 # External detector/tracker repos (cloned on demand by run_all.sh)
-nn/detector/LargeKernel3D/
+nn/detector/OpenPCDet/
 nn/detector/MCTrack/
 
 # Environments

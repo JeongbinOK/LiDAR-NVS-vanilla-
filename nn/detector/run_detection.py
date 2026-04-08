@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """
-LargeKernel3D로 nuScenes 전체 추론 → bbox/detections.json 저장.
+OpenPCDet TransFusion-L로 nuScenes 전체 추론 → bbox/detections.json
 
 Pre-requisites
 --------------
-1. LargeKernel3D submodule 초기화:
-       git submodule update --init nn/detector/LargeKernel3D
-2. mmdet3d + LargeKernel3D 의존성 설치 (별도 env 권장):
-       cd nn/detector/LargeKernel3D && pip install -r requirements.txt
-       pip install -e .
-3. 체크포인트 다운로드 (LargeKernel3D repo README → Google Drive 링크):
-       nn/detector/LargeKernel3D/checkpoints/lk3d_nuscenes.pth
+1. OpenPCDet clone + 의존성 설치:
+       bash nn/detector/install_deps.sh
+2. TransFusion-L 체크포인트 다운로드:
+       nn/detector/OpenPCDet/checkpoints/transfusion_lidar.pth
+3. nuScenes data prep (최초 1회):
+       cd nn/detector/OpenPCDet
+       ln -sf /data1/nuScenes data/nuscenes
+       python -m pcdet.datasets.nuscenes.nuscenes_dataset \\
+           --func create_nuscenes_infos \\
+           --cfg_file tools/cfgs/dataset_configs/nuscenes_dataset.yaml \\
+           --version v1.0-trainval
 
 Output
 ------
@@ -21,15 +25,15 @@ bbox/detections.json  — nuScenes detection format, global frame
         {"translation": [x,y,z], "size": [w,l,h], "rotation": [w,x,y,z],
          "detection_name": "car", "detection_score": 0.9, "velocity": [vx,vy]}
       ]
-    },
-    "meta": {...}
+    }
   }
 
 Usage
 -----
     python nn/detector/run_detection.py \\
         --data-root /data1/nuScenes \\
-        --ckpt nn/detector/LargeKernel3D/checkpoints/lk3d_nuscenes.pth \\
+        --ckpt nn/detector/OpenPCDet/checkpoints/transfusion_lidar.pth \\
+        --gpus 0 \\
         --out bbox/detections.json
 """
 
@@ -37,78 +41,71 @@ import os
 import sys
 import argparse
 import subprocess
+import glob
+import shutil
 
-REPO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'LargeKernel3D')
-# Config path inside the LargeKernel3D repo (adjust if the repo layout differs)
-CFG_PATH = os.path.join(REPO_DIR, 'configs', 'nuscenes', 'lar_detection_nuscenes.py')
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PCDET_DIR  = os.path.join(SCRIPT_DIR, 'OpenPCDet')
+CFG_FILE   = os.path.join(PCDET_DIR, 'tools/cfgs/nuscenes_models/transfusion_lidar.yaml')
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Run LargeKernel3D detection on nuScenes')
-    parser.add_argument('--data-root', default='/data1/nuScenes',
-                        help='nuScenes dataset root')
-    parser.add_argument('--ckpt', required=True,
-                        help='Path to LargeKernel3D nuScenes checkpoint (.pth)')
-    parser.add_argument('--out', default='bbox/detections.json',
-                        help='Output JSON path (nuScenes detection format)')
-    parser.add_argument('--gpus', default='0',
-                        help='Comma-separated GPU ids, e.g. "0,1"')
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(description='Run TransFusion-L detection on nuScenes')
+    ap.add_argument('--data-root',  default='/data1/nuScenes', help='nuScenes dataset root')
+    ap.add_argument('--ckpt',       required=True, help='TransFusion-L checkpoint (.pth)')
+    ap.add_argument('--gpus',       default='0', help='Comma-separated GPU ids, e.g. "0" or "0,1"')
+    ap.add_argument('--batch-size', default='4', help='Inference batch size')
+    ap.add_argument('--out',        default='bbox/detections.json', help='Output JSON path')
+    args = ap.parse_args()
 
-    # Verify submodule is initialised
-    if not os.path.isfile(CFG_PATH):
-        sys.exit(
-            f'ERROR: LargeKernel3D config not found at {CFG_PATH}\n'
-            'Run:  git submodule update --init nn/detector/LargeKernel3D'
-        )
+    if not os.path.isdir(PCDET_DIR):
+        sys.exit(f'ERROR: OpenPCDet not found at {PCDET_DIR}\n'
+                 'Run run_all.sh first to clone the repo.')
+    if not os.path.isfile(CFG_FILE):
+        sys.exit(f'ERROR: TransFusion-L config not found: {CFG_FILE}')
+    if not os.path.isfile(args.ckpt):
+        sys.exit(f'ERROR: Checkpoint not found: {args.ckpt}')
 
-    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+    os.makedirs('bbox', exist_ok=True)
 
-    # jsonfile_prefix: mmdet3d writes "<prefix>.bbox.json"; we strip the ".json" suffix
-    json_prefix = args.out
-    if json_prefix.endswith('.json'):
-        json_prefix = json_prefix[:-5]
+    # Ensure data/nuscenes symlink exists inside OpenPCDet
+    data_link = os.path.join(PCDET_DIR, 'data/nuscenes')
+    if not os.path.exists(data_link):
+        os.makedirs(os.path.join(PCDET_DIR, 'data'), exist_ok=True)
+        os.symlink(args.data_root, data_link)
+        print(f'Symlink created: {data_link} → {args.data_root}')
 
-    gpu_list = args.gpus.split(',')
-    if len(gpu_list) > 1:
-        # Multi-GPU inference via mmdet3d's dist_test.sh
-        script = os.path.join(REPO_DIR, 'tools', 'dist_test.sh')
-        cmd = [
-            'bash', script,
-            CFG_PATH, args.ckpt, str(len(gpu_list)),
-            '--format-only',
-            '--eval-options', f'jsonfile_prefix={json_prefix}',
-        ]
-    else:
-        # Single-GPU
-        test_script = os.path.join(REPO_DIR, 'tools', 'test.py')
-        cmd = [
-            sys.executable, test_script,
-            CFG_PATH, args.ckpt,
-            '--format-only',
-            '--eval-options', f'jsonfile_prefix={json_prefix}',
-        ]
-
+    gpu_ids = args.gpus.split(',')
+    n_gpus  = len(gpu_ids)
     env = os.environ.copy()
     env['CUDA_VISIBLE_DEVICES'] = args.gpus
-    # Let LargeKernel3D's config pick up the data root via environment variable.
-    # The config typically reads: data_root = os.environ.get('NUSCENES_DATA_ROOT', '/default/path')
-    env['NUSCENES_DATA_ROOT'] = args.data_root
 
-    print(f'Running: {" ".join(cmd)}')
-    subprocess.run(cmd, check=True, env=env, cwd=REPO_DIR)
+    if n_gpus > 1:
+        cmd = [
+            'bash', os.path.join(PCDET_DIR, 'scripts/dist_test.sh'),
+            str(n_gpus),
+            '--cfg_file', CFG_FILE,
+            '--ckpt', args.ckpt,
+            '--batch_size', args.batch_size,
+        ]
+    else:
+        cmd = [
+            sys.executable, os.path.join(PCDET_DIR, 'tools/test.py'),
+            '--cfg_file', CFG_FILE,
+            '--ckpt', args.ckpt,
+            '--batch_size', args.batch_size,
+        ]
 
-    # mmdet3d appends '_NuSc_results' or similar; find the actual output file
-    expected = args.out
-    bbox_file = json_prefix + '.bbox.json'
-    nusc_file = json_prefix + '_NuSc_results' + '.json'
+    print(f'[Detection] Running TransFusion-L on {n_gpus} GPU(s) ...')
+    subprocess.run(cmd, check=True, cwd=PCDET_DIR, env=env)
 
-    for candidate in [expected, bbox_file, nusc_file]:
-        if os.path.isfile(candidate):
-            if candidate != expected:
-                os.rename(candidate, expected)
-            break
-
+    # Find the most recently written results_nusc.json under output/
+    pattern = os.path.join(PCDET_DIR, 'output', '**', 'results_nusc.json')
+    candidates = sorted(glob.glob(pattern, recursive=True), key=os.path.getmtime)
+    if not candidates:
+        sys.exit('ERROR: results_nusc.json not found in OpenPCDet/output/\n'
+                 'Check OpenPCDet logs for errors.')
+    shutil.copy(candidates[-1], args.out)
     print(f'\nDetection results saved → {args.out}')
     print('Next step:  python nn/detector/run_tracking.py --det bbox/detections.json')
 
