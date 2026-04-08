@@ -13,15 +13,26 @@
 #      → bash nn/detector/install_deps.sh
 #
 # 이후 실행 (체크포인트 + 의존성 설치 완료 후):
-#   bash nn/detector/run_all.sh [--gpus 0]
+#   bash nn/detector/run_all.sh [--gpus <id>]
+#
+# --gpus 옵션:
+#   --gpus 0      → GPU 0번 사용 (기본값)
+#   --gpus 4      → GPU 4번 사용
+#   --gpus 0,1    → GPU 0, 1번 멀티GPU 사용
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-# ── 설정 ──────────────────────────────────────────────────────────────────
-DATAROOT=/data1/nuScenes
+# ── config.py에서 data_root 읽기 (CLI로 override 가능) ──────────────────────
+DATAROOT=$(python -c "
+import sys
+sys.path.insert(0, '$REPO_ROOT')
+from config import QGSConfig
+print(QGSConfig().data_root)
+" 2>/dev/null) || DATAROOT="/data1/nuScenes"
+
 CKPT="$SCRIPT_DIR/LargeKernel3D/checkpoints/lk3d_nuscenes.pth"
 GPUS=0
 
