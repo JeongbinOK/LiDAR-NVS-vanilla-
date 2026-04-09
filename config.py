@@ -45,8 +45,8 @@ class QGSConfig:
 
     # Data
     data_root: str = "/data1/nuScenes"
-    loader_mode: str = "nvs"  # "nvs" | "bbox"
-    bbox_json_path: str = ""  # path to bbox/tracking.json; empty = use GT annotations
+    loader_mode: str = "bbox"  # "nvs" | "bbox"
+    bbox_json_path: str = "bbox/tracking.json"  # path to bbox/tracking.json; empty = use GT annotations
 
     # Device
     device: str = "cuda"

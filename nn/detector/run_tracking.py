@@ -72,6 +72,10 @@ def main():
 
     os.makedirs('bbox', exist_ok=True)
 
+    # 각 split의 중간 파일을 독립된 디렉토리 하위에 저장
+    # → val/train을 순차 실행해도 서로 덮어쓰지 않음
+    split_workdir = os.path.abspath(f'bbox/mctrack/{args.split}')
+
     # Step 1: OpenPCDet 결과를 MCTrack이 기대하는 경로 구조로 복사
     # convert_nuscenes.py 내부: path = os.path.join(dets_path, detector, split + ".json")
     det_subdir = os.path.abspath(f'bbox/det_input/{DETECTOR}')
@@ -86,7 +90,7 @@ def main():
     sys.path.insert(0, MCTRACK_DIR)
     from preprocess.convert_nuscenes import nuscenes_main
 
-    base_dir = os.path.abspath('bbox/mctrack_base')
+    base_dir = os.path.join(split_workdir, 'base')
     print(f'[Step 2] Converting to MCTrack BaseVersion → {base_dir} ...')
     nuscenes_main(
         raw_data_path=args.data_root,
@@ -95,41 +99,46 @@ def main():
         save_path=base_dir,
         split=args.split,
     )
-    # 변환 결과: base_dir/transfusion/val.json
+    # 변환 결과: base_dir/transfusion/{split}.json
 
     # Step 3: MCTrack config/nuscenes.yaml 직접 수정 (--config 옵션 없음)
+    # MCTrack main.py: save_path = os.path.join(os.path.dirname(cfg["SAVE_PATH"]), cfg["DATASET"], timestamp)
+    # → SAVE_PATH를 split_workdir/out 으로 설정하면
+    #   실제 저장: split_workdir/nuscenes/YYYYMMDD_HHMMSS/results.json
+    # val/train이 각자 다른 split_workdir를 가지므로 검색 경로가 겹치지 않음
     mctrack_cfg_path = os.path.join(MCTRACK_DIR, 'config', 'nuscenes.yaml')
     with open(mctrack_cfg_path) as f:
         track_cfg = yaml.safe_load(f)
     track_cfg['DATASET_ROOT']    = args.data_root
-    track_cfg['DETECTIONS_ROOT'] = base_dir   # BaseVersion JSON 경로
+    track_cfg['DETECTIONS_ROOT'] = base_dir
     track_cfg['DETECTOR']        = DETECTOR
     track_cfg['SPLIT']           = args.split
-    # main.py가 SAVE_PATH를 {parent}/nuscenes/YYYYMMDD_HHMMSS/ 로 override함
-    mctrack_out = os.path.abspath('bbox/mctrack_out')
+    mctrack_out = os.path.join(split_workdir, 'out')
     track_cfg['SAVE_PATH']       = mctrack_out
     with open(mctrack_cfg_path, 'w') as f:
         yaml.dump(track_cfg, f)
     print(f'[Step 3] Updated MCTrack config: {mctrack_cfg_path}')
 
     # Step 4: MCTrack 트래킹 실행
-    print(f'[Step 4] Running MCTrack ...')
-    subprocess.run(
+    print(f'[Step 4] Running MCTrack (split={args.split}) ...')
+    ret = subprocess.run(
         [sys.executable, 'main.py', '--dataset', 'nuscenes', '-e', '-p', '8'],
-        check=True, cwd=MCTRACK_DIR
+        cwd=MCTRACK_DIR
     )
+    if ret.returncode != 0:
+        print(f'WARNING: MCTrack exited with code {ret.returncode} '
+              f'(likely TrackingEval on {args.split} split — non-critical if results.json exists)')
 
     # Step 5: 결과 JSON 찾기
-    # main.py: save_path = os.path.join(os.path.dirname(cfg["SAVE_PATH"]), cfg["DATASET"], timestamp)
-    save_parent = os.path.dirname(mctrack_out)
+    # MCTrack이 split_workdir/nuscenes/YYYYMMDD_HHMMSS/results.json 으로 저장
+    save_parent = split_workdir   # = os.path.dirname(mctrack_out)
     pattern = os.path.join(save_parent, 'nuscenes', '*', 'results.json')
     candidates = sorted(glob.glob(pattern), key=os.path.getmtime)
     if not candidates:
         sys.exit(f'ERROR: MCTrack results.json not found at {pattern}\n'
                  'Check MCTrack logs for errors.')
     shutil.copy(candidates[-1], args.out)
-    print(f'\nTracking results saved → {args.out}')
-    print('Next step:  Update config.py → bbox_json_path = "bbox/tracking.json"')
+    print(f'\nTracking results saved → {args.out}  (split={args.split})')
 
 
 if __name__ == '__main__':

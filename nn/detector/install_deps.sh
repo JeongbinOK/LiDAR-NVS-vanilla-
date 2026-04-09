@@ -43,12 +43,14 @@ else
 fi
 
 # ── MCTrack 의존성 ─────────────────────────────────────────────────────────────
-# numpy==1.22.0 pinned (MCTrack 요구사항)
+# MCTrack requirements.txt는 numpy==1.22.0을 pin하지만 SharedArray와 충돌함.
+# numpy==1.24.4로 고정 후 requirements에서 numpy만 제외하고 설치.
 if [ -d "$MCTRACK_DIR" ]; then
     echo ""
     echo "[MCTrack] 의존성 설치 ..."
+    pip install "numpy==1.24.4"  # SharedArray 호환 버전 (MCTrack도 정상 동작)
     cd "$MCTRACK_DIR"
-    pip install -r requirements.txt   # numpy==1.22.0, lap, motmetrics==1.1.3, numba==0.58.1
+    grep -v "^numpy" requirements.txt | pip install -r /dev/stdin
     cd -
 else
     echo "WARNING: $MCTRACK_DIR 없음. run_all.sh 먼저 실행해서 clone 하세요."
