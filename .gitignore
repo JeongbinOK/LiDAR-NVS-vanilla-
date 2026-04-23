@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 *$py.class
+.pytest_cache/
 
 # Checkpoints / Models
 *.pt
@@ -21,6 +22,10 @@ bbox/
 # External detector/tracker repos (cloned on demand by run_all.sh)
 nn/detector/OpenPCDet/
 nn/detector/MCTrack/
+
+# Rasterizer build artifacts
+renderer/lidar_qgs_rasterizer/build/
+renderer/lidar_qgs_rasterizer/diff_quadratic_rasterization/_C*.so
 
 # Environments
 .env
