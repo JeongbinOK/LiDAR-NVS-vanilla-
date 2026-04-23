@@ -176,13 +176,15 @@ class PointFeatureBackbone(nn.Module):
     """
 
     def __init__(self, dim: int = 64, num_blocks: int = 3,
-                 window_size: int = 48, num_heads: int = 4):
+                 window_size: int = 48, num_heads: int = 4,
+                 in_channels: int = 4):
         super().__init__()
         self.dim = dim
         self.window_size = window_size
+        self.in_channels = int(in_channels)
 
         self.embed = nn.Sequential(
-            nn.Linear(4, dim),
+            nn.Linear(self.in_channels, dim),
             nn.LayerNorm(dim),
             nn.ReLU(),
         )
@@ -221,11 +223,13 @@ class PointFeatureBackbone(nn.Module):
 
         return sorted_feats[unsort_order]
 
-    def forward(self, xyz: torch.Tensor, intensity: torch.Tensor) -> torch.Tensor:
+    def forward(self, xyz: torch.Tensor, point_features: torch.Tensor) -> torch.Tensor:
         """
         Args:
             xyz: [N, 3] point positions
-            intensity: [N] or [N, 1] per-point intensity
+            point_features: [N, C] raw per-point features. If C == 1, the tensor
+                is treated as intensity and concatenated with xyz. Otherwise it
+                is passed through as-is.
 
         Returns:
             features: [N, D] per-point features
@@ -234,11 +238,21 @@ class PointFeatureBackbone(nn.Module):
         W = self.window_size
         device = xyz.device
 
-        if intensity.dim() == 1:
-            intensity = intensity.unsqueeze(1)
+        if point_features.dim() == 1:
+            point_features = point_features.unsqueeze(1)
+        if point_features.dim() != 2:
+            raise ValueError(
+                f"point_features must be [N, C]; got {tuple(point_features.shape)}"
+            )
+        if point_features.shape[1] == 1:
+            point_features = torch.cat([xyz, point_features], dim=1)
+        elif point_features.shape[1] != self.in_channels:
+            raise ValueError(
+                f"expected {self.in_channels} feature channels, got {point_features.shape[1]}"
+            )
 
         # Initial embedding
-        features = self.embed(torch.cat([xyz, intensity], dim=1))  # [N, D]
+        features = self.embed(point_features)  # [N, D]
 
         # Precompute both serialization orders
         arange = torch.arange(N, device=device)

@@ -1,5 +1,5 @@
-"""Neural clustering with 2D Gaussians."""
+"""QGS feed-forward pipeline."""
 
-from nn.model import NeuralClusteringModel
+from nn.model import QGSModel
 
-__all__ = ["NeuralClusteringModel"]
+__all__ = ["QGSModel"]
