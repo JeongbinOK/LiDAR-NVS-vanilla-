@@ -64,7 +64,6 @@ def main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--out-dir", default="")
     parser.add_argument("--data-root", default="")
-    parser.add_argument("--center-mode", default="", choices=["", "fixed"], help="optional override")
     parser.add_argument("--hit-threshold", type=float, default=0.5)
     parser.add_argument("--save-pointclouds", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
@@ -73,9 +72,6 @@ def main():
     cfg.device = args.device
     if args.data_root:
         cfg.data_root = args.data_root
-    if args.center_mode:
-        cfg.head_center_mode = args.center_mode
-
     target_split = cfg.train_split if args.split == "train" else cfg.eval_split
     sys.path.insert(0, os.path.join(os.path.expanduser(cfg.data_root), "loader"))
     from dataset import NuScenesNVSDataset  # noqa: WPS433
@@ -136,7 +132,6 @@ def main():
                 "pair_idx": pair_idx,
                 "checkpoint_epoch": ckpt.get("epoch"),
                 "checkpoint_loss": ckpt.get("loss"),
-                "center_mode": cfg.head_center_mode,
                 **result["summary"],
             }
             pair_summaries.append(summary)
@@ -166,7 +161,6 @@ def main():
     aggregate = {
         "checkpoint_epoch": ckpt.get("epoch"),
         "checkpoint_loss": ckpt.get("loss"),
-        "center_mode": cfg.head_center_mode,
         "split": args.split,
         "pairs": pair_indices,
         "aggregate": _aggregate_pair_summaries(pair_summaries),

@@ -270,14 +270,22 @@ renderkBufferCUDA(
 							  rscale_sign_j.y * cam_pos_local.y * cam_pos_local.y - 
 							  rscale_sign_j.z * cam_pos_local.z;
 	  
-			float discriminant = BB*BB - 4*AA*CC;
-
-			// If the discriminant is less than zero, the ray does not intersect the quadric.
-			if(discriminant < 0)
+			const bool linear_root = fabs(AA) < 1e-6;
+			if(linear_root && fabs(BB) < 1e-8)
 				continue;
 
-			float r2AA = __frcp_rn(2 * AA);
-			float discriminant_sq_r2AA = __fsqrt_rn(discriminant) * r2AA;
+			float discriminant = 0.0f;
+			float r2AA = 0.0f;
+			float discriminant_sq_r2AA = 0.0f;
+			if(!linear_root)
+			{
+				discriminant = BB*BB - 4*AA*CC;
+				// If the discriminant is less than zero, the ray does not intersect the quadric.
+				if(discriminant < 0)
+					continue;
+				r2AA = __frcp_rn(2 * AA);
+				discriminant_sq_r2AA = __fsqrt_rn(discriminant) * r2AA;
+			}
 
 			// store the following variables for subsequent calculations.
 			float root = 0.0f;
@@ -294,11 +302,9 @@ renderkBufferCUDA(
 			int AA_sign = copysign(1, AA);
 			for(int i = -1; i < 2; i += 2){
 
-#if	QUADRATIC_APPROXIMATION
-				if (abs(AA) < 1e-6) // approximation of the intersection equation, see the supplementary material.
-				root = __fdividef(-CC, BB);
+				if (linear_root)
+					root = __fdividef(-CC, BB);
 				else
-#endif				
 				{
 					sign = (float)i * (float)AA_sign;
 					root = -BB * r2AA + sign * discriminant_sq_r2AA;
@@ -319,6 +325,8 @@ renderkBufferCUDA(
 					intersect = true;
 					break;
 				}
+				if (linear_root)
+					break;
 			}
 
 			if (!intersect)
@@ -815,9 +823,15 @@ renderkBufferBackwardCUDA(
 		const float dL_ds = dL_dG * (-G * s / r0_2);
 		const float dL_dr0_2 = dL_dG * (G * s * s / (2 * r0_2 * r0_2));
 		const float u = 2 * a * p_norm;
-		const float dL_du = dL_ds * sqrt(u * u + 1) / (2 * a); 
-
-		float dL_da = 2 * dL_du * p_norm - dL_ds * s / a;
+		float dL_du = 0.0f;
+		float dL_da = 0.0f;
+		float dL_dl_geodesic = dL_ds;
+		if (fabsf(a) >= 1e-6f)
+		{
+			dL_du = dL_ds * sqrt(u * u + 1) / (2 * a);
+			dL_da = 2 * dL_du * p_norm - dL_ds * s / a;
+			dL_dl_geodesic = dL_du * (2 * a);
+		}
 
 		float rcos_s_sin_s_2_2 = r0_2 * r0_2;
 		const float dL_dcos_2 = dL_da * scale_o_blend.z * rscale_sign_blend.x + dL_dr0_2 * (-rscale_o_blend.x * rcos_s_sin_s_2_2);
@@ -827,7 +841,7 @@ renderkBufferBackwardCUDA(
 		const float rl_2 = 1 / (p_norm_2);
 		const float rl_3 = 1 / (p_norm_2 * p_norm);
 		
-		const float dL_dl = dL_du * (2 * a) + dL_dcos_2 * (-2 * p.x * p.x * rl_3) + dL_dsin_2 * (-2 * p.y * p.y * rl_3);
+		const float dL_dl = dL_dl_geodesic + dL_dcos_2 * (-2 * p.x * p.x * rl_3) + dL_dsin_2 * (-2 * p.y * p.y * rl_3);
 
 		float3 dL_dx = {0.0f, 0.0f, 0.0f};
 		dL_dx.x = p.x * (dL_dl * rl_1 + dL_dcos_2 * 2 * rl_2);
@@ -869,20 +883,22 @@ renderkBufferBackwardCUDA(
 		const double CC = rscale_sign_blend.x * cam_pos_local.x * cam_pos_local.x + 
 							   rscale_sign_blend.y * cam_pos_local.y * cam_pos_local.y - 
 							   rscale_sign_blend.z * cam_pos_local.z;
-		const float discriminant = BB * BB - 4 * AA * CC;
-		const float r2AA = __frcp_rn(2 * AA);
+		const bool linear_root_bw = fabs(AA) < 1e-6;
+		const float discriminant = linear_root_bw ? 0.0f : BB * BB - 4 * AA * CC;
+		const float r2AA = linear_root_bw ? 0.0f : __frcp_rn(2 * AA);
 		float dL_dAA = 0.0f;
 		float dL_dBB = 0.0f;
 		float dL_dCC = 0.0f;
 		float rdiscriminant_sq = 0.0f;
-#if QUADRATIC_APPROXIMATION
-		if (abs(AA) < 1e-6){
+		if (linear_root_bw){
 			dL_dAA = 0.0f;
-			dL_dBB = dL_dt * (CC * __frcp_rn(BB * BB));
-			dL_dCC = dL_dt * (-__frcp_rn(BB));
+			if (fabs(BB) >= 1e-8)
+			{
+				dL_dBB = dL_dt * (CC * __frcp_rn(BB * BB));
+				dL_dCC = dL_dt * (-__frcp_rn(BB));
+			}
 		}
 		else
-#endif
 		{
 			rdiscriminant_sq = __frcp_rn(__fsqrt_rn(discriminant));
 			dL_dAA = dL_dt * r2AA * 2 * (- depth - CC * sign * rdiscriminant_sq);
@@ -1051,14 +1067,22 @@ renderkBufferBackwardCUDA(
 							   rscale_sign_j.y * cam_pos_local.y * cam_pos_local.y - 
 							   rscale_sign_j.z * cam_pos_local.z;
 
-			float discriminant = BB * BB - 4 * AA * CC;
-
-			// If the discriminant is less than zero, the ray does not intersect the quadric.
-			if (discriminant < 0)
+			const bool linear_root = fabs(AA) < 1e-6;
+			if(linear_root && fabs(BB) < 1e-8)
 				continue;
-			
-			float r2AA = __frcp_rn(2 * AA);
-			float discriminant_sq_r2AA = sqrt(discriminant) * r2AA;
+
+			float discriminant = 0.0f;
+			float r2AA = 0.0f;
+			float discriminant_sq_r2AA = 0.0f;
+			if(!linear_root)
+			{
+				discriminant = BB * BB - 4 * AA * CC;
+				// If the discriminant is less than zero, the ray does not intersect the quadric.
+				if (discriminant < 0)
+					continue;
+				r2AA = __frcp_rn(2 * AA);
+				discriminant_sq_r2AA = sqrt(discriminant) * r2AA;
+			}
 
 			// store the following variables for subsequent calculations.
 			float root = 0.0f;
@@ -1074,11 +1098,9 @@ renderkBufferBackwardCUDA(
 			float sign = -1.0f;
 			int AA_sign = copysign(1, AA);
 			for(int i = -1; i < 2; i += 2){
-#if	QUADRATIC_APPROXIMATION
-				if (abs(AA) < 1e-6) // approximation of the intersection equation, see the supplementary material.
+				if (linear_root)
 					root = __fdividef(-CC, BB);
 				else
-#endif				
 				{
 					sign = (float)i * (float)AA_sign;
 					root = -BB * r2AA + sign * discriminant_sq_r2AA;
@@ -1097,6 +1119,8 @@ renderkBufferBackwardCUDA(
 					intersect = true;
 					break;
 				}
+				if (linear_root)
+					break;
 			}
 
 			if (!intersect)

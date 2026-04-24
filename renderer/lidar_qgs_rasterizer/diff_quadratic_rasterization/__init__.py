@@ -387,7 +387,8 @@ class LiDARRasterizer(nn.Module):
         means3D:    [N, 3]    primitive centres in world frame
         means2D:    [N, 3]    placeholder for image-space gradients (autograd only)
         opacities:  [N, 1]    α_i in (0, 1)
-        scales:     [N, 3]    (s1, s2, s3); s3 may be signed (curvature sign)
+        scales:     [N, 3]    signed s1/s2 surface signature plus positive s3
+                              curvature magnitude
         rotations:  [N, 4]    quaternions (w, x, y, z)
         intensity:  [N]       per-Gaussian scalar in [0, 1]
         latent:     [N, L]    per-Gaussian latent. L must equal LIDAR_LATENT_DIM.

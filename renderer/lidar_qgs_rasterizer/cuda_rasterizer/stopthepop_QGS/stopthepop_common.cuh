@@ -46,12 +46,21 @@ __device__ __inline__ bool getIntersectPoint(
     const double CC = rscale_sign.x * cam_pos_local.x * cam_pos_local.x + 
 				      rscale_sign.y * cam_pos_local.y * cam_pos_local.y - 
 				      rscale_sign.z * cam_pos_local.z;
-				      float discriminant = BB*BB - 4*AA*CC;
-    if(discriminant < 0)
+    const bool linear_root = fabs(AA) < 1e-6;
+    if(linear_root && fabs(BB) < 1e-8)
 	    return false;
-				      
-    float r2AA = __frcp_rn(2 * AA);
-    float discriminant_sq_r2AA = __fsqrt_rn(discriminant) * r2AA;
+
+    float discriminant = 0.0f;
+    float r2AA = 0.0f;
+    float discriminant_sq_r2AA = 0.0f;
+    if(!linear_root)
+    {
+	    discriminant = BB*BB - 4*AA*CC;
+	    if(discriminant < 0)
+		    return false;
+	    r2AA = __frcp_rn(2 * AA);
+	    discriminant_sq_r2AA = __fsqrt_rn(discriminant) * r2AA;
+    }
 	      
     float root = 0.0f;
     float2 p = {0.0f, 0.0f};
@@ -68,11 +77,9 @@ __device__ __inline__ bool getIntersectPoint(
 	      
     for(int i = -1; i < 2; i+=2){
 
-#if	QUADRATIC_APPROXIMATION
-		if (abs(AA) < 1e-6) // approximation of the intersection equation, see the supplementary material.
+		if (linear_root)
 			root = - CC / BB;
 		else
-#endif				
 		{
 			sign = (float)i * (float)AA_sign;
 			root = -BB * r2AA + sign * discriminant_sq_r2AA;
@@ -92,6 +99,8 @@ __device__ __inline__ bool getIntersectPoint(
 		    intersect = true;
 		    break;
 	    }
+	    if (linear_root)
+		    break;
     }
     if (!intersect)
 	    return false;

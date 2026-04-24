@@ -247,6 +247,8 @@ __forceinline__ __device__ float GetParabolaA(const float2 cos2_sin2, const floa
 
 // Refer to Eq. 10 in the QGS main text.
 __forceinline__ __device__ float QuadraticCurveGeodesicDistanceOriginal(const float l, const float a){
+	if (fabsf(a) < 1e-6f)
+		return l;
 
 	float u = 2*a*l;
 	float sqrt_tmp = __fsqrt_rn(u * u + 1);

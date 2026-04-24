@@ -1,6 +1,11 @@
 """Hyperparameters for the Quadratic Gaussian Splatting (QGS) pipeline."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
+
+
+OFFICIAL_FULL_PTV3_BACKBONE_PARAMS = 46_174_272
 
 
 @dataclass
@@ -8,28 +13,29 @@ class QGSConfig:
     """Hyperparameters for the QGS pipeline."""
 
     # Backbone
-    backbone_type: str = "ptv3"    # "ptv3" or "custom"
     feature_dim: int = 64
-    input_feature_dim: int = 8      # xyz + intensity + time + e_dir
+    input_feature_dim: int = 8      # raw QGS feature contract: xyz + intensity + time + e_dir
+    ptv3_model_in_channels: int = 8  # PTv3 now consumes the native 8D QGS feature contract directly
 
-    # PTv3 backbone settings
+    # PTv3 official full backbone settings
     ptv3_grid_size: float = 0.1
-    ptv3_stride: tuple = (2, 2)
-    ptv3_enc_depths: tuple = (2, 2, 2)
-    ptv3_enc_channels: tuple = (32, 64, 128)
-    ptv3_enc_num_head: tuple = (2, 4, 8)
-    ptv3_enc_patch_size: tuple = (1024, 1024, 1024)
-    ptv3_dec_depths: tuple = (2, 2)
-    ptv3_dec_channels: tuple = (64, 64)
-    ptv3_dec_num_head: tuple = (4, 4)
-    ptv3_dec_patch_size: tuple = (1024, 1024)
+    ptv3_stride: tuple = (2, 2, 2, 2)
+    ptv3_enc_depths: tuple = (2, 2, 2, 6, 2)
+    ptv3_enc_channels: tuple = (32, 64, 128, 256, 512)
+    ptv3_enc_num_head: tuple = (2, 4, 8, 16, 32)
+    ptv3_enc_patch_size: tuple = (1024, 1024, 1024, 1024, 1024)
+    ptv3_dec_depths: tuple = (2, 2, 2, 2)
+    ptv3_dec_channels: tuple = (64, 64, 128, 256)
+    ptv3_dec_num_head: tuple = (4, 4, 8, 16)
+    ptv3_dec_patch_size: tuple = (1024, 1024, 1024, 1024)
     ptv3_enable_flash: bool = True
     ptv3_conv_algo: str = "native"    # "auto" | "native" | "mask_implicit_gemm" | "mask_split_implicit_gemm"
-
-    # Custom backbone fallback settings
-    num_blocks: int = 3
-    window_size: int = 48
-    num_heads: int = 4
+    ptv3_batch_norm_eval: bool = True
+    ptv3_decoupled_stem: bool = True
+    ptv3_pdnorm_bn: bool = True
+    ptv3_pdnorm_ln: bool = True
+    ptv3_pdnorm_decouple: bool = True
+    ptv3_condition_names: tuple = ("static", "dynamic")
 
     # QGS head
     head_hidden_dim: int = 128
@@ -37,9 +43,7 @@ class QGSConfig:
     lidar_latent_dim: int = 16        # must match diff_quadratic_rasterization.LIDAR_LATENT_DIM
     head_alpha_bias_init: float = 2.2     # sigmoid(2.2)≈0.90 — high initial coverage
     head_intensity_residual: bool = True  # intensity = sigmoid(logit + logit(input))
-    head_center_mode: str = "fixed"       # fixed-center geometry-first head
-    head_center_bound_min: float = 0.05   # legacy / unused in fixed-center mode
-    head_center_bound_max: float = 0.5    # legacy / unused in fixed-center mode
+    head_center_bound: float = 0.3        # max analytic-center residual magnitude (m)
     rot_tilt_deg: float = 10.0
     rot_spin_deg: float = 30.0
     scale_log_mean_bound: float = 0.6931471805599453   # ln(2)
@@ -51,6 +55,12 @@ class QGSConfig:
     knn_k_target: int = 16
     knn_k_min: int = 8
     knn_chunk_size: int = 1024
+    quadric_gamma: float = 1.0
+    quadric_kappa_max: float = 5.0
+    quadric_eps_lambda: float = 0.01
+    quadric_eps_kappa: float = 1e-3
+    quadric_eps_s: float = 1e-3
+    quadric_eps_s3: float = 1e-4
 
     # LiDAR rasterizer (spherical projection)
     lidar_height: int = 32
@@ -92,3 +102,36 @@ class QGSConfig:
 
     # Device
     device: str = "cuda"
+
+    def ptv3_backbone_kwargs(self) -> dict:
+        return {
+            "grid_size": float(self.ptv3_grid_size),
+            "model_in_channels": int(self.ptv3_model_in_channels),
+            "stride": tuple(self.ptv3_stride),
+            "enc_depths": tuple(self.ptv3_enc_depths),
+            "enc_channels": tuple(self.ptv3_enc_channels),
+            "enc_num_head": tuple(self.ptv3_enc_num_head),
+            "enc_patch_size": tuple(self.ptv3_enc_patch_size),
+            "dec_depths": tuple(self.ptv3_dec_depths),
+            "dec_channels": tuple(self.ptv3_dec_channels),
+            "dec_num_head": tuple(self.ptv3_dec_num_head),
+            "dec_patch_size": tuple(self.ptv3_dec_patch_size),
+            "enable_flash": bool(self.ptv3_enable_flash),
+            "conv_algo": self.ptv3_conv_algo,
+            "batch_norm_eval": bool(self.ptv3_batch_norm_eval),
+            "decoupled_stem": bool(self.ptv3_decoupled_stem),
+            "pdnorm_bn": bool(self.ptv3_pdnorm_bn),
+            "pdnorm_ln": bool(self.ptv3_pdnorm_ln),
+            "pdnorm_decouple": bool(self.ptv3_pdnorm_decouple),
+            "context_conditions": tuple(self.ptv3_condition_names),
+            "pdnorm_conditions": tuple(self.ptv3_condition_names),
+        }
+
+    def expected_ptv3_backbone_params(self) -> int | None:
+        if not (
+            self.ptv3_decoupled_stem
+            or self.ptv3_pdnorm_bn
+            or self.ptv3_pdnorm_ln
+        ):
+            return OFFICIAL_FULL_PTV3_BACKBONE_PARAMS
+        return None

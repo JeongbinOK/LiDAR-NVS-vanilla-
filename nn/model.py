@@ -16,8 +16,7 @@ from diff_quadratic_rasterization import LIDAR_LATENT_DIM
 from models.geometry.knn_radius import gather_neighbors, hybrid_radius_knn
 from models.geometry.quadric_fit import fit_local_quadrics
 from models.head.qgs_head import QGSHead
-from nn.backbone import PointFeatureBackbone
-from nn.ptv3.wrapper import PTv3Backbone
+from nn.ptv3.wrapper import PTv3Backbone, validate_context_type
 from nn.render_utils import rotmat_to_quat
 
 
@@ -45,29 +44,11 @@ class QGSModel(nn.Module):
         D = cfg.feature_dim
         self.input_feature_dim = int(getattr(cfg, "input_feature_dim", 8))
 
-        if getattr(cfg, "backbone_type", "ptv3") == "ptv3":
-            self.backbone = PTv3Backbone(
-                in_channels=self.input_feature_dim,
-                out_channels=D,
-                grid_size=getattr(cfg, "ptv3_grid_size", 0.1),
-                stride=getattr(cfg, "ptv3_stride", (2, 2)),
-                enc_depths=getattr(cfg, "ptv3_enc_depths", (2, 2, 2)),
-                enc_channels=getattr(cfg, "ptv3_enc_channels", (32, 64, 128)),
-                enc_num_head=getattr(cfg, "ptv3_enc_num_head", (2, 4, 8)),
-                enc_patch_size=getattr(cfg, "ptv3_enc_patch_size", (1024, 1024, 1024)),
-                dec_depths=getattr(cfg, "ptv3_dec_depths", (2, 2)),
-                dec_channels=getattr(cfg, "ptv3_dec_channels", (64, 64)),
-                dec_num_head=getattr(cfg, "ptv3_dec_num_head", (4, 4)),
-                dec_patch_size=getattr(cfg, "ptv3_dec_patch_size", (1024, 1024)),
-                enable_flash=getattr(cfg, "ptv3_enable_flash", True),
-                conv_algo=getattr(cfg, "ptv3_conv_algo", "native"),
-            )
-        else:
-            self.backbone = PointFeatureBackbone(
-                dim=D, num_blocks=cfg.num_blocks,
-                window_size=cfg.window_size, num_heads=cfg.num_heads,
-                in_channels=self.input_feature_dim,
-            )
+        self.backbone = PTv3Backbone(
+            in_channels=self.input_feature_dim,
+            out_channels=D,
+            **cfg.ptv3_backbone_kwargs(),
+        )
 
         latent_dim = getattr(cfg, "lidar_latent_dim", LIDAR_LATENT_DIM)
         if latent_dim != LIDAR_LATENT_DIM:
@@ -82,7 +63,7 @@ class QGSModel(nn.Module):
             gated=getattr(cfg, "use_gated_head", True),
             alpha_bias_init=getattr(cfg, "head_alpha_bias_init", 2.2),
             intensity_residual=getattr(cfg, "head_intensity_residual", True),
-            center_mode=getattr(cfg, "head_center_mode", "fixed"),
+            center_bound=getattr(cfg, "head_center_bound", 0.3),
             rot_tilt_deg=getattr(cfg, "rot_tilt_deg", 10.0),
             rot_spin_deg=getattr(cfg, "rot_spin_deg", 30.0),
             scale_log_mean_bound=getattr(cfg, "scale_log_mean_bound", None),
@@ -95,6 +76,12 @@ class QGSModel(nn.Module):
         self.knn_k_target = int(getattr(cfg, "knn_k_target", 16))
         self.knn_k_min    = int(getattr(cfg, "knn_k_min", 8))
         self.knn_chunk    = int(getattr(cfg, "knn_chunk_size", 1024))
+        self.quadric_gamma = float(getattr(cfg, "quadric_gamma", 1.0))
+        self.quadric_kappa_max = float(getattr(cfg, "quadric_kappa_max", 5.0))
+        self.quadric_eps_lambda = float(getattr(cfg, "quadric_eps_lambda", 0.01))
+        self.quadric_eps_kappa = float(getattr(cfg, "quadric_eps_kappa", 1e-3))
+        self.quadric_eps_s = float(getattr(cfg, "quadric_eps_s", 1e-3))
+        self.quadric_eps_s3 = float(getattr(cfg, "quadric_eps_s3", 1e-4))
 
     # ------------------------------------------------------------------
     def _build_point_features(
@@ -148,6 +135,7 @@ class QGSModel(nn.Module):
         xyz: Tensor,
         intensity_norm: Tensor | None = None,
         *,
+        context_type: str,
         point_features: Tensor | None = None,
         time_scalar: Tensor | None = None,
         ego_motion: Tensor | None = None,
@@ -161,6 +149,9 @@ class QGSModel(nn.Module):
             xyz:            [N, 3] point positions in the context frame.
             intensity_norm: [N] in [0, 1]. Used as the residual anchor in QGSHead
                             when intensity_residual=True.
+            context_type:   "static" or "dynamic". Kept as the upper-level QGS
+                            context label and forwarded only to backbones that
+                            explicitly opt into context-specific behavior.
             point_features:  optional [N, C] raw feature matrix. If omitted, the
                             default 8D contract [xyz, intensity, time, e_dir] is
                             constructed here.
@@ -172,7 +163,7 @@ class QGSModel(nn.Module):
 
         Returns dict (per-Gaussian, all on `xyz.device`):
             'means3D'   [N, 3]   primitive centres in sensor frame.
-            'scales'    [N, 3]   (s1, s2, s3); s3 may be signed.
+            'scales'    [N, 3]   signed s1/s2 surface signature plus positive s3.
             'rotations' [N, 4]   unit quaternion (w, x, y, z).
             'opacities' [N, 1]   in (0, 1).
             'intensity' [N]      in (0, 1).
@@ -184,6 +175,7 @@ class QGSModel(nn.Module):
         """
         N = xyz.shape[0]
         device = xyz.device
+        context_type = validate_context_type(context_type)
         if intensity_norm is None and point_features is None:
             raise ValueError("intensity_norm or point_features must be provided")
 
@@ -226,12 +218,15 @@ class QGSModel(nn.Module):
         # (quadric fit, head) runs in fp32 to avoid linalg dtype mismatches.
         if return_diagnostics and device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
+        backbone_kwargs = {}
+        if getattr(self.backbone, "supports_context_type", False):
+            backbone_kwargs["context_type"] = context_type
         if xyz.is_cuda:
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                features = self.backbone(xyz, point_features)
+                features = self.backbone(xyz, point_features, **backbone_kwargs)
             features = features.float()
         else:
-            features = self.backbone(xyz, point_features)
+            features = self.backbone(xyz, point_features, **backbone_kwargs)
         _record_stage("backbone")
         if features.shape[0] != N:
             raise RuntimeError(
@@ -265,6 +260,12 @@ class QGSModel(nn.Module):
             k_eff=knn["k_eff"].unsqueeze(0),                       # [1, N]
             k_min=self.knn_k_min,
             k_target=self.knn_k_target,
+            quadric_gamma=getattr(self, "quadric_gamma", 1.0),
+            quadric_kappa_max=getattr(self, "quadric_kappa_max", 5.0),
+            quadric_eps_lambda=getattr(self, "quadric_eps_lambda", 0.01),
+            quadric_eps_kappa=getattr(self, "quadric_eps_kappa", 1e-3),
+            quadric_eps_s=getattr(self, "quadric_eps_s", 1e-3),
+            quadric_eps_s3=getattr(self, "quadric_eps_s3", 1e-4),
         )
         _record_stage("quadric_fit")
 
@@ -305,10 +306,19 @@ class QGSModel(nn.Module):
             "diagnostics": diagnostics,
         }
 
-    def forward(self, xyz: Tensor, intensity: Tensor, intensity_norm: Tensor | None = None, **kwargs) -> dict:
+    def forward(
+        self,
+        xyz: Tensor,
+        intensity: Tensor,
+        intensity_norm: Tensor | None = None,
+        *,
+        context_type: str = "static",
+        **kwargs,
+    ) -> dict:
         """Backward-compatible wrapper for older single-context callers."""
         return self.forward_context(
             xyz,
             intensity_norm if intensity_norm is not None else intensity,
+            context_type=context_type,
             **kwargs,
         )

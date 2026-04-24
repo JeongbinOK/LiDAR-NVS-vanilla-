@@ -758,31 +758,85 @@ class Embedding(PointModule):
         embed_channels,
         norm_layer=None,
         act_layer=None,
+        conditions=("static", "dynamic"),
+        decouple=False,
         conv_algo=None,
     ):
         super().__init__()
         self.in_channels = in_channels
         self.embed_channels = embed_channels
+        self.conditions = tuple(conditions)
+        self.decouple = decouple
 
-        # TODO: check remove spconv
-        self.stem = PointSequential(
+        if self.decouple and not self.conditions:
+            raise ValueError("decoupled stem requires at least one condition")
+
+        if self.decouple:
+            self.stem = nn.ModuleList(
+                [
+                    self._make_stem(
+                        in_channels=in_channels,
+                        embed_channels=embed_channels,
+                        norm_layer=norm_layer,
+                        act_layer=act_layer,
+                        indice_key=f"stem_{condition}",
+                        conv_algo=conv_algo,
+                    )
+                    for condition in self.conditions
+                ]
+            )
+        else:
+            self.stem = self._make_stem(
+                in_channels=in_channels,
+                embed_channels=embed_channels,
+                norm_layer=norm_layer,
+                act_layer=act_layer,
+                indice_key="stem",
+                conv_algo=conv_algo,
+            )
+
+    @staticmethod
+    def _make_stem(
+        *,
+        in_channels,
+        embed_channels,
+        norm_layer,
+        act_layer,
+        indice_key,
+        conv_algo,
+    ):
+        stem = PointSequential(
             conv=spconv.SubMConv3d(
                 in_channels,
                 embed_channels,
                 kernel_size=5,
                 padding=1,
                 bias=False,
-                indice_key="stem",
+                indice_key=indice_key,
                 algo=conv_algo,
             )
         )
         if norm_layer is not None:
-            self.stem.add(norm_layer(embed_channels), name="norm")
+            stem.add(norm_layer(embed_channels), name="norm")
         if act_layer is not None:
-            self.stem.add(act_layer(), name="act")
+            stem.add(act_layer(), name="act")
+        return stem
+
+    def _resolve_condition(self, point: Point) -> str:
+        assert "condition" in point.keys()
+        if isinstance(point.condition, str):
+            condition = point.condition
+        else:
+            condition = point.condition[0]
+        assert condition in self.conditions
+        return condition
 
     def forward(self, point: Point):
-        point = self.stem(point)
+        if self.decouple:
+            stem = self.stem[self.conditions.index(self._resolve_condition(point))]
+        else:
+            stem = self.stem
+        point = stem(point)
         return point
 
 
@@ -813,6 +867,7 @@ class PointTransformerV3(PointModule):
         upcast_attention=False,
         upcast_softmax=False,
         cls_mode=False,
+        decoupled_stem=False,
         pdnorm_bn=False,
         pdnorm_ln=False,
         pdnorm_decouple=True,
@@ -868,6 +923,8 @@ class PointTransformerV3(PointModule):
             embed_channels=enc_channels[0],
             norm_layer=bn_layer,
             act_layer=act_layer,
+            conditions=pdnorm_conditions,
+            decouple=decoupled_stem,
             conv_algo=conv_algo,
         )
 

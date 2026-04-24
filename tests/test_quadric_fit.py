@@ -72,25 +72,36 @@ class TestParaboloid:
         assert torch.isfinite(result["tangent_aniso"]).all()
         assert torch.isfinite(result["curvature_aniso"]).all()
 
-    def test_s3_mean_curvature(self):
-        """s3_init should approximate mean curvature (a + b) from the paraboloid."""
+    def test_s3_solves_signed_curvature_least_squares(self):
+        """s3_init should match the signed-QGS curvature LS solution."""
         a, b = 0.5, 0.3
         query, neighbors, k_eff = _make_paraboloid_patch(a=a, b=b, grid_n=7)
 
         result = fit_local_quadrics(query, neighbors, k_eff, k_min=4, k_target=49)
 
-        s3 = result["s_init"][0, 0, 2].item()
+        s = result["s_init"][0, 0]
+        kappa = torch.stack([result["kappa1_init"][0, 0], result["kappa2_init"][0, 0]])
         use_geom = result["use_geom_init"][0, 0].item()
 
         assert use_geom, "use_geom_init should be True for dense patch"
+        assert (s[:2] > 0).all(), f"convex patch should use same positive signature, got {s}"
+        assert s[2].item() > 0.0
 
-        # Mean curvature from paraboloid z = a x^2 + b y^2:
-        # H_2x2 = [[2a, 0], [0, 2b]], kappa1 = 2a, kappa2 = 2b
-        # s3 = (kappa1 + kappa2) / 2 = a + b
-        expected_s3 = a + b   # = 0.8
-        assert abs(s3 - expected_s3) < 0.15, (
-            f"s3={s3:.4f} should be close to mean curvature {expected_s3}"
-        )
+        q = 2.0 * s[:2].sign() / s[:2].abs().clamp(min=1e-3).pow(2)
+        expected_s3 = (q * kappa).sum() / (q * q).sum()
+        assert s[2].item() == pytest.approx(abs(expected_s3.item()), rel=1e-4, abs=1e-5)
+
+    def test_center_is_surface_point_under_pbar(self):
+        a, b = 0.5, 0.3
+        query, neighbors, k_eff = _make_paraboloid_patch(a=a, b=b, grid_n=7)
+        result = fit_local_quadrics(query, neighbors, k_eff, k_min=4, k_target=49)
+
+        center = result["c_init"][0, 0]
+        pbar = neighbors[0, 0].mean(dim=0)
+        expected_z = a * center[0].item() ** 2 + b * center[1].item() ** 2
+
+        assert torch.allclose(center[:2], pbar[:2], atol=0.05)
+        assert center[2].item() == pytest.approx(expected_z, abs=0.05)
 
     def test_fit_residual_low_for_clean_paraboloid(self):
         """fit_residual should be very small for noise-free paraboloid."""
@@ -119,7 +130,7 @@ class TestParaboloid:
         query, neighbors, k_eff = _make_paraboloid_patch(a=0.5, b=0.3, grid_n=7)
         result = fit_local_quadrics(query, neighbors, k_eff, k_min=4, k_target=49)
         s_init = result["s_init"][0, 0]
-        assert s_init[0].item() >= s_init[1].item()
+        assert s_init[0].abs().item() >= s_init[1].abs().item()
 
     def test_near_isotropic_patch_has_low_anisotropy(self):
         query, neighbors, k_eff = _make_paraboloid_patch(a=0.4, b=0.4, grid_n=7)
@@ -130,6 +141,48 @@ class TestParaboloid:
 
         assert tangent_aniso < 0.1, f"tangent_aniso={tangent_aniso:.4f} should be low"
         assert curvature_aniso < 0.1, f"curvature_aniso={curvature_aniso:.4f} should be low"
+
+
+# ---------------------------------------------------------------------------
+# Test 1b: Saddle and sloped plane signed-QGS semantics
+# ---------------------------------------------------------------------------
+
+class TestSignedLocalTangent:
+    def test_saddle_uses_opposite_s1_s2_signs(self):
+        query, neighbors, k_eff = _make_paraboloid_patch(a=0.4, b=-0.3, grid_n=7)
+        result = fit_local_quadrics(query, neighbors, k_eff, k_min=4, k_target=49)
+        s = result["s_init"][0, 0]
+
+        assert result["use_geom_init"][0, 0].item()
+        assert s[0].abs().item() >= s[1].abs().item()
+        assert s[0].item() * s[1].item() < 0.0, f"saddle signature should be mixed, got {s}"
+        assert s[2].item() > 0.0
+
+    def test_sloped_plane_normal_and_linear_free_local_frame(self):
+        xs = torch.linspace(-1.0, 1.0, 7)
+        ys = torch.linspace(-1.0, 1.0, 7)
+        xg, yg = torch.meshgrid(xs, ys, indexing="ij")
+        z = 0.2 * xg - 0.1 * yg + 0.3
+        pts = torch.stack([xg.reshape(-1), yg.reshape(-1), z.reshape(-1)], dim=-1)
+        query = torch.tensor([[[0.0, 0.0, 0.3]]])
+        neighbors = pts.unsqueeze(0).unsqueeze(0)
+        k_eff = torch.full((1, 1), pts.shape[0], dtype=torch.long)
+
+        result = fit_local_quadrics(query, neighbors, k_eff, k_min=4, k_target=49)
+        R = result["R_init"][0, 0]
+        center = result["c_init"][0, 0]
+        normal = R[:, 2]
+        plane_normal = torch.tensor([-0.2, 0.1, 1.0])
+        plane_normal = plane_normal / plane_normal.norm()
+
+        assert abs(torch.dot(normal, plane_normal).item()) > 0.99
+        assert center[2].item() == pytest.approx(
+            0.2 * center[0].item() - 0.1 * center[1].item() + 0.3,
+            abs=1e-4,
+        )
+
+        local = (neighbors[0, 0] - center) @ R
+        assert local[:, 2].abs().max().item() < 1e-4
 
 
 # ---------------------------------------------------------------------------
@@ -158,11 +211,18 @@ class TestFlatPlane:
         assert planarity < 0.05, f"planarity={planarity:.4f} should be low for flat plane"
 
     def test_s3_near_zero(self):
-        """s3 (mean curvature) should be ≈ 0 for flat plane."""
+        """Near-flat patches should keep a tiny positive curvature magnitude."""
         query, neighbors, k_eff = self._make_flat_patch()
         result = fit_local_quadrics(query, neighbors, k_eff, k_min=4, k_target=49)
         s3 = result["s_init"][0, 0, 2].item()
-        assert abs(s3) < 0.1, f"s3={s3:.4f} should be ≈0 for flat plane"
+        assert s3 == pytest.approx(1e-4, abs=5e-5)
+
+    def test_center_near_pbar_for_flat_plane(self):
+        query, neighbors, k_eff = self._make_flat_patch()
+        result = fit_local_quadrics(query, neighbors, k_eff, k_min=4, k_target=49)
+        center = result["c_init"][0, 0]
+        pbar = neighbors[0, 0].mean(dim=0)
+        assert torch.allclose(center, pbar, atol=1e-4)
 
     def test_fit_residual_near_zero(self):
         """fit_residual should be ≈ 0 for perfectly flat plane (all z = 0, var(z) = 0 -> 0/eps)."""

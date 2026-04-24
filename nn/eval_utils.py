@@ -22,6 +22,14 @@ def load_cfg_from_checkpoint(checkpoint_path: str) -> QGSConfig:
     config_path = os.path.join(run_dir, "configs", "config.json")
     with open(config_path) as f:
         raw = json.load(f)
+    if "ptv3_model_in_channels" not in raw:
+        raw["ptv3_model_in_channels"] = raw.get("input_feature_dim", QGSConfig.input_feature_dim)
+    if "ptv3_decoupled_stem" not in raw:
+        raw["ptv3_decoupled_stem"] = False
+    if "ptv3_pdnorm_bn" not in raw:
+        raw["ptv3_pdnorm_bn"] = False
+    if "ptv3_pdnorm_ln" not in raw:
+        raw["ptv3_pdnorm_ln"] = False
     allowed = QGSConfig.__dataclass_fields__.keys()
     return QGSConfig(**{k: v for k, v in raw.items() if k in allowed})
 
@@ -151,42 +159,106 @@ def _safe_quantile(x: torch.Tensor, q: float) -> float:
     return float(torch.quantile(x, q).item())
 
 
-def _context_diagnostics(name: str, primitives: dict, num_points: int) -> dict:
+def _context_group_name(ctx: dict | str) -> str:
+    if isinstance(ctx, dict):
+        context_type = ctx.get("context_type")
+        if context_type in {"static", "dynamic"}:
+            return context_type
+        name = str(ctx.get("name", ""))
+    else:
+        name = str(ctx)
+    if name == "static":
+        return "static"
+    if name.startswith("dynamic"):
+        return "dynamic"
+    raise ValueError(f"cannot infer context group from {ctx!r}")
+
+
+def _summarize_context_groups(context_summaries: list[dict]) -> dict:
+    groups = {
+        "static": {
+            "realized_contexts": 0,
+            "skipped_contexts": 0,
+            "input_points": 0,
+            "points_with_init": 0,
+            "points_without_init": 0,
+            "points_subfloor": 0,
+        },
+        "dynamic": {
+            "realized_contexts": 0,
+            "skipped_contexts": 0,
+            "input_points": 0,
+            "points_with_init": 0,
+            "points_without_init": 0,
+            "points_subfloor": 0,
+        },
+    }
+    for ctx in context_summaries:
+        group = groups[_context_group_name(ctx)]
+        group["input_points"] += int(ctx["n_input_points"])
+        if ctx["skipped"]:
+            group["skipped_contexts"] += 1
+        else:
+            group["realized_contexts"] += 1
+        group["points_with_init"] += int(ctx.get("n_points_with_init") or 0)
+        group["points_without_init"] += int(ctx.get("n_points_without_init") or 0)
+        group["points_subfloor"] += int(ctx.get("n_points_subfloor") or 0)
+    return groups
+
+
+def _context_diagnostics(
+    name: str,
+    context_type: str,
+    primitives: dict,
+    num_points: int,
+) -> dict:
     aux = primitives["aux"]
     geom = primitives["geom_init"]
     g_rot = aux["g_rot"][0]
+    g_center = aux["g_center"][0]
     g_scale = aux["g_scale"][0]
     omega_local = aux["omega_local"][0]
+    delta_c = aux["delta_c"][0]
     delta_mu = aux["delta_mu"][0]
     delta_gap = aux["delta_gap"][0]
     delta_log_abs_s3 = aux["delta_log_abs_s3"][0]
     alpha = primitives["opacities"].squeeze(-1)
     k_eff = primitives["k_eff"].float()
-    used_init = geom["use_geom_init"][0].float()
+    used_init_bool = geom["use_geom_init"][0]
+    used_init = used_init_bool.float()
     tangent_aniso = geom["tangent_aniso"][0]
     curvature_aniso = geom["curvature_aniso"][0]
     kappa1 = geom["kappa1_init"][0]
     kappa2 = geom["kappa2_init"][0]
     scales = primitives["scales"]
     omega_deg = omega_local.abs() * (180.0 / math.pi)
+    n_points_with_init = int(used_init_bool.sum().item())
+    n_points_without_init = int((~used_init_bool).sum().item())
     return {
         "name": name,
+        "context_type": context_type,
         "n_input_points": int(num_points),
         "n_generated": int(primitives["means3D"].shape[0]),
         "skipped": False,
         "skip_reason": None,
-        "center_mode": aux.get("center_mode", "fixed"),
         "used_geom_ratio": float(used_init.mean().item()),
-        "all_points_subfloor": bool((used_init == 0).all().item()),
+        "all_points_subfloor": bool(n_points_without_init == int(num_points)),
+        "n_points_with_init": n_points_with_init,
+        "n_points_without_init": n_points_without_init,
+        "n_points_subfloor": n_points_without_init,
         "k_eff_mean": _safe_mean(k_eff),
         "k_eff_p95": _safe_quantile(k_eff, 0.95),
         "g_rot_mean": _safe_mean(g_rot),
         "g_rot_p95": _safe_quantile(g_rot, 0.95),
+        "g_center_mean": _safe_mean(g_center),
+        "g_center_p95": _safe_quantile(g_center, 0.95),
         "g_scale_mean": _safe_mean(g_scale),
         "g_scale_p95": _safe_quantile(g_scale, 0.95),
         "omega_abs_max_deg": _safe_max(omega_deg),
         "omega_tilt_abs_max_deg": _safe_max(omega_deg[..., :2]),
         "omega_spin_abs_max_deg": _safe_max(omega_deg[..., 2]),
+        "delta_c_abs_mean": _safe_mean(delta_c.norm(dim=-1)),
+        "delta_c_abs_max": _safe_max(delta_c.norm(dim=-1)),
         "delta_mu_abs_mean": _safe_mean(delta_mu.abs()),
         "delta_mu_abs_max": _safe_max(delta_mu.abs()),
         "delta_gap_abs_mean": _safe_mean(delta_gap.abs()),
@@ -199,32 +271,44 @@ def _context_diagnostics(name: str, primitives: dict, num_points: int) -> dict:
         "curvature_aniso_p95": _safe_quantile(curvature_aniso, 0.95),
         "kappa1_abs_mean": _safe_mean(kappa1.abs()),
         "kappa2_abs_mean": _safe_mean(kappa2.abs()),
-        "ordered_scale_violations": int((scales[:, 0] < scales[:, 1]).sum().item()),
+        "ordered_scale_violations": int((scales[:, 0].abs() < scales[:, 1].abs()).sum().item()),
         "alpha_mean": _safe_mean(alpha),
         "alpha_p95": _safe_quantile(alpha, 0.95),
         "memory_stages": primitives.get("diagnostics", {}).get("memory_stages", []),
     }
 
 
-def _skipped_context_diagnostics(name: str, num_points: int, reason: str) -> dict:
+def _skipped_context_diagnostics(
+    name: str,
+    context_type: str,
+    num_points: int,
+    reason: str,
+) -> dict:
     return {
         "name": name,
+        "context_type": context_type,
         "n_input_points": int(num_points),
         "n_generated": 0,
         "skipped": True,
         "skip_reason": reason,
-        "center_mode": None,
         "used_geom_ratio": None,
         "all_points_subfloor": None,
+        "n_points_with_init": None,
+        "n_points_without_init": None,
+        "n_points_subfloor": None,
         "k_eff_mean": None,
         "k_eff_p95": None,
         "g_rot_mean": None,
         "g_rot_p95": None,
+        "g_center_mean": None,
+        "g_center_p95": None,
         "g_scale_mean": None,
         "g_scale_p95": None,
         "omega_abs_max_deg": None,
         "omega_tilt_abs_max_deg": None,
         "omega_spin_abs_max_deg": None,
+        "delta_c_abs_mean": None,
+        "delta_c_abs_max": None,
         "delta_mu_abs_mean": None,
         "delta_mu_abs_max": None,
         "delta_gap_abs_mean": None,
@@ -248,6 +332,7 @@ def build_context_primitives(
     model,
     cfg: QGSConfig,
     name: str,
+    context_type: str,
     xyz: torch.Tensor,
     intensity_norm: torch.Tensor,
     *,
@@ -260,13 +345,14 @@ def build_context_primitives(
     primitives = model.forward_context(
         xyz,
         intensity_norm,
+        context_type=context_type,
         time_scalar=time_scalar,
         ego_motion=ego_motion,
         is_dynamic_flag=is_dynamic_flag,
         neighbor_xyz=xyz,
         return_diagnostics=True,
     )
-    return primitives, _context_diagnostics(name, primitives, xyz.shape[0])
+    return primitives, _context_diagnostics(name, context_type, primitives, xyz.shape[0])
 
 
 def _sensor_visibility_mask(
@@ -515,6 +601,7 @@ def evaluate_pair_sample(
         model,
         cfg,
         "static",
+        "static",
         scene["static_xyz"].to(device),
         scene["static_intensity"].to(device),
         time_scalar=scene["static_time"].to(device),
@@ -535,6 +622,7 @@ def evaluate_pair_sample(
         context_summaries.append(
             _skipped_context_diagnostics(
                 "static",
+                "static",
                 scene["static_xyz"].shape[0],
                 f"n_input_points<{cfg.knn_k_min}",
             )
@@ -546,6 +634,7 @@ def evaluate_pair_sample(
             model,
             cfg,
             f"dynamic_{dyn_idx}",
+            "dynamic",
             dyn["canonical_xyz"].to(device),
             dyn["canonical_intensity"].to(device),
             time_scalar=dyn["canonical_time"].to(device),
@@ -562,6 +651,7 @@ def evaluate_pair_sample(
             context_summaries.append(
                 _skipped_context_diagnostics(
                     f"dynamic_{dyn_idx}",
+                    "dynamic",
                     dyn["canonical_xyz"].shape[0],
                     f"n_input_points<{cfg.knn_k_min}",
                 )
@@ -696,6 +786,7 @@ def evaluate_pair_sample(
             "dynamic_instances": len(scene["dynamic"]),
             "realized_contexts": sum(0 if ctx["skipped"] else 1 for ctx in context_summaries),
             "skipped_contexts": sum(1 if ctx["skipped"] else 0 for ctx in context_summaries),
+            "context_groups": _summarize_context_groups(context_summaries),
             "untracked_stats": scene["untracked_stats"],
             "contexts": context_summaries,
         },

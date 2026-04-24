@@ -504,13 +504,21 @@ renderCUDA(
 							   rscale_sign_j.y * cam_pos_local.y * cam_pos_local.y - 
 							   rscale_sign_j.z * cam_pos_local.z;
 
-			float discriminant = BB * BB - 4 * AA * CC;
-
-			if (discriminant < 0)
+			const bool linear_root = fabs(AA) < 1e-6;
+			if (linear_root && fabs(BB) < 1e-8)
 				continue;
 
-			float r2AA = __frcp_rn(2 * AA);
-			float discriminant_sq_r2AA = sqrt(discriminant) * r2AA;
+			float discriminant = 0.0f;
+			float r2AA = 0.0f;
+			float discriminant_sq_r2AA = 0.0f;
+			if (!linear_root)
+			{
+				discriminant = BB * BB - 4 * AA * CC;
+				if (discriminant < 0)
+					continue;
+				r2AA = __frcp_rn(2 * AA);
+				discriminant_sq_r2AA = sqrt(discriminant) * r2AA;
+			}
 
  
 			float root = 0.0f;
@@ -529,11 +537,9 @@ renderCUDA(
 			int AA_sign = copysign(1, AA);
 			#pragma unroll
 			for(int i = -1; i < 2; i += 2){
-#if	QUADRATIC_APPROXIMATION
-				if (abs(AA) < 1e-6)
+				if (linear_root)
 					root = __fdividef(-CC, BB);
 				else
-#endif
 				{
 					sign = (float)i * (float)AA_sign;
 					root = -BB * r2AA + sign * discriminant_sq_r2AA;
@@ -558,6 +564,8 @@ renderCUDA(
 					intersect = true;
 					break;
 				}
+				if (linear_root)
+					break;
 			}
 
 			if (!intersect)
@@ -730,8 +738,15 @@ renderCUDA(
 			const float dL_ds = dL_dG * __fdividef(-G * s, r0_2);
 			const float dL_dr0_2 = dL_dG * (G * __fdividef(-power, r0_2));
 			const float u = 2 * a * p_norm;
-			const float dL_du = dL_ds * __fdividef(__fsqrt_rn(u * u + 1), (2 * a));
-			float dL_da = 2 * dL_du * p_norm - dL_ds * __fdividef(s, a);
+			float dL_du = 0.0f;
+			float dL_da = 0.0f;
+			float dL_dl_geodesic = dL_ds;
+			if (fabsf(a) >= 1e-6f)
+			{
+				dL_du = dL_ds * __fdividef(__fsqrt_rn(u * u + 1), (2 * a));
+				dL_da = 2 * dL_du * p_norm - dL_ds * __fdividef(s, a);
+				dL_dl_geodesic = dL_du * (2 * a);
+			}
 			float rcos_s_sin_s_2_2 = r0_2 * r0_2;
 			const float dL_dcos_2 = dL_da * scale_j.z * rscale_sign_j.x + dL_dr0_2 * (-rscale_o_j.x * rcos_s_sin_s_2_2);
 			const float dL_dsin_2 = dL_da * scale_j.z * rscale_sign_j.y + dL_dr0_2 * (-rscale_o_j.y * rcos_s_sin_s_2_2);
@@ -740,7 +755,7 @@ renderCUDA(
 			const float rl_2 = __frcp_rn(p_norm_2);
 			const float rl_3 = __frcp_rn(p_norm_2 * p_norm);
 			
-			const float dL_dl = dL_du * (2 * a) + dL_dcos_2 * (-2 * px_2 * rl_3) + dL_dsin_2 * (-2 * py_2 * rl_3);
+			const float dL_dl = dL_dl_geodesic + dL_dcos_2 * (-2 * px_2 * rl_3) + dL_dsin_2 * (-2 * py_2 * rl_3);
 			float3 dL_dx = {0.0f, 0.0f, 0.0f};
 			dL_dx.x = p.x * (dL_dl * rl_1 + dL_dcos_2 * 2 * rl_2);
 			dL_dx.y = p.y * (dL_dl * rl_1 + dL_dsin_2 * 2 * rl_2);
@@ -771,14 +786,12 @@ renderCUDA(
 			float dL_dBB = 0.0f;
 			float dL_dCC = 0.0f;
 			float rdiscriminant_sq = 0.0f;
-#if QUADRATIC_APPROXIMATION
-			if (abs(AA) < 1e-6){
+			if (linear_root){
 				dL_dAA = 0.0f;
 				dL_dBB = dL_dt * (CC * __frcp_rn(BB * BB));
 				dL_dCC = dL_dt * (-__frcp_rn(BB));
 			}
 			else
-#endif
 			{
 				rdiscriminant_sq = __frcp_rn(__fsqrt_rn(discriminant));
 				dL_dAA = dL_dt * r2AA * 2 * (- root - CC * sign * rdiscriminant_sq);

@@ -1,4 +1,4 @@
-"""Unit tests for the fixed-center geometry-first QGS head."""
+"""Unit tests for the local-tangent signed-QGS head."""
 
 from __future__ import annotations
 
@@ -7,11 +7,13 @@ import math
 
 import torch
 
+import models.head as head_module
+from models.head import LatentHead
 from models.head.qgs_head import QGSHead
 
 
 def _make_geom_init(B: int, N: int, device: str = "cpu", dtype=torch.float32) -> dict:
-    s_init = torch.tensor([0.4, 0.2, 0.05], device=device, dtype=dtype).expand(B, N, 3).contiguous()
+    s_init = torch.tensor([0.4, -0.2, 0.05], device=device, dtype=dtype).expand(B, N, 3).contiguous()
     tangent_aniso = torch.full((B, N), math.log(2.0), device=device, dtype=dtype)
     curvature_aniso = torch.full((B, N), 0.25, device=device, dtype=dtype)
     return {
@@ -33,8 +35,9 @@ def _zero_module(module) -> None:
             p.zero_()
 
 
-def test_fixed_center_removes_center_residual_outputs():
-    head = QGSHead(feature_dim=8, latent_dim=4, hidden_dim=16, gated=True, center_mode="fixed")
+def test_zero_center_residual_keeps_analytic_center():
+    head = QGSHead(feature_dim=8, latent_dim=4, hidden_dim=16, gated=True)
+    _zero_module(head)
     feats = torch.randn(1, 6, 8)
     geom = _make_geom_init(1, 6)
     intensity = torch.full((1, 6), 0.42)
@@ -42,18 +45,18 @@ def test_fixed_center_removes_center_residual_outputs():
     out = head(feats, geom, torch.zeros(1, 6), intensity_input=intensity)
 
     assert torch.allclose(out["center"], geom["c_init"])
-    assert "delta_c" not in out["aux"]
+    assert "delta_c" in out["aux"]
     assert "delta_quat" not in out["aux"]
 
 
-def test_geometry_head_output_excludes_dead_quaternion_w_channel():
-    head = QGSHead(feature_dim=8, latent_dim=2, hidden_dim=16, gated=False, center_mode="fixed")
-    assert head.geometry_head.mlp[-1].out_features == 6
+def test_geometry_head_output_contract():
+    head = QGSHead(feature_dim=8, latent_dim=2, hidden_dim=16, gated=False)
+    assert head.geometry_head.mlp[-1].out_features == 9
 
 
 def test_subfloor_forces_scalar_gates_to_one():
     torch.manual_seed(0)
-    head = QGSHead(feature_dim=8, latent_dim=2, hidden_dim=16, gated=True, center_mode="fixed")
+    head = QGSHead(feature_dim=8, latent_dim=2, hidden_dim=16, gated=True)
     feats = torch.randn(1, 10, 8)
     geom = _make_geom_init(1, 10)
     geom["use_geom_init"][0, :3] = False
@@ -62,8 +65,10 @@ def test_subfloor_forces_scalar_gates_to_one():
     out = head(feats, geom, torch.zeros(1, 10), intensity_input=intensity)
 
     assert torch.allclose(out["aux"]["g_rot"][0, :3], torch.ones(3))
+    assert torch.allclose(out["aux"]["g_center"][0, :3], torch.ones(3))
     assert torch.allclose(out["aux"]["g_scale"][0, :3], torch.ones(3))
     assert (out["aux"]["g_rot"][0, 3:] < 1.0).all()
+    assert (out["aux"]["g_center"][0, 3:] < 1.0).all()
     assert (out["aux"]["g_scale"][0, 3:] < 1.0).all()
 
 
@@ -73,7 +78,6 @@ def test_omega_local_respects_axis_bounds():
         latent_dim=2,
         hidden_dim=16,
         gated=False,
-        center_mode="fixed",
         rot_tilt_deg=10.0,
         rot_spin_deg=30.0,
     )
@@ -90,16 +94,34 @@ def test_omega_local_respects_axis_bounds():
     assert torch.all(omega <= bounds + 1e-6)
 
 
-def test_scales_are_always_ordered():
+def test_center_residual_respects_component_bound():
+    head = QGSHead(
+        feature_dim=8,
+        latent_dim=2,
+        hidden_dim=16,
+        gated=False,
+        center_bound=0.3,
+    )
+    feats = torch.randn(1, 12, 8) * 1000.0
+    geom = _make_geom_init(1, 12)
+    intensity = torch.full((1, 12), 0.42)
+
+    out = head(feats, geom, torch.zeros(1, 12), intensity_input=intensity)
+    delta_c = out["aux"]["delta_c"].abs()
+
+    assert torch.all(delta_c <= 0.3 + 1e-6)
+
+
+def test_scale_magnitudes_are_always_ordered():
     torch.manual_seed(1)
-    head = QGSHead(feature_dim=16, latent_dim=4, hidden_dim=32, gated=True, center_mode="fixed")
+    head = QGSHead(feature_dim=16, latent_dim=4, hidden_dim=32, gated=True)
     feats = torch.randn(2, 32, 16)
     geom = _make_geom_init(2, 32)
     intensity = torch.full((2, 32), 0.42)
 
     out = head(feats, geom, torch.zeros(2, 32), intensity_input=intensity)
 
-    assert torch.all(out["s"][..., 0] >= out["s"][..., 1])
+    assert torch.all(out["s"][..., 0].abs() >= out["s"][..., 1].abs())
 
 
 def test_gap_increase_raises_scale_ratio():
@@ -107,39 +129,57 @@ def test_gap_increase_raises_scale_ratio():
     geom = _make_geom_init(1, 4)
     intensity = torch.full((1, 4), 0.42)
 
-    head_lo = QGSHead(feature_dim=8, latent_dim=2, hidden_dim=16, gated=False, center_mode="fixed")
-    head_hi = QGSHead(feature_dim=8, latent_dim=2, hidden_dim=16, gated=False, center_mode="fixed")
+    head_lo = QGSHead(feature_dim=8, latent_dim=2, hidden_dim=16, gated=False)
+    head_hi = QGSHead(feature_dim=8, latent_dim=2, hidden_dim=16, gated=False)
     _zero_module(head_lo)
     _zero_module(head_hi)
 
     with torch.no_grad():
-        head_lo.geometry_head.mlp[-1].bias[4] = -4.0
-        head_hi.geometry_head.mlp[-1].bias[4] = 4.0
+        head_lo.geometry_head.mlp[-1].bias[7] = -4.0
+        head_hi.geometry_head.mlp[-1].bias[7] = 4.0
 
     out_lo = head_lo(feats, geom, torch.zeros(1, 4), intensity_input=intensity)
     out_hi = head_hi(feats, geom, torch.zeros(1, 4), intensity_input=intensity)
-    ratio_lo = (out_lo["s"][..., 0] / out_lo["s"][..., 1]).mean()
-    ratio_hi = (out_hi["s"][..., 0] / out_hi["s"][..., 1]).mean()
+    ratio_lo = (out_lo["s"][..., 0].abs() / out_lo["s"][..., 1].abs()).mean()
+    ratio_hi = (out_hi["s"][..., 0].abs() / out_hi["s"][..., 1].abs()).mean()
 
     assert ratio_hi > ratio_lo
 
 
-def test_s3_residual_is_sign_preserving():
+def test_s1_s2_signature_is_sign_preserving():
+    feats = torch.zeros(1, 2, 8)
+    geom = _make_geom_init(1, 2)
+    geom["s_init"][0, 0, :2] = torch.tensor([0.4, -0.2])
+    geom["s_init"][0, 1, :2] = torch.tensor([-0.4, 0.2])
+    intensity = torch.full((1, 2), 0.42)
+
+    head = QGSHead(feature_dim=8, latent_dim=2, hidden_dim=16, gated=False)
+    _zero_module(head)
+
+    out = head(feats, geom, torch.zeros(1, 2), intensity_input=intensity)
+
+    assert out["s"][0, 0, 2] > 0
+    assert out["s"][0, 0, 0] > 0
+    assert out["s"][0, 0, 1] < 0
+    assert out["s"][0, 1, 0] < 0
+    assert out["s"][0, 1, 1] > 0
+
+
+def test_s3_is_positive_curvature_magnitude():
     feats = torch.zeros(1, 2, 8)
     geom = _make_geom_init(1, 2)
     geom["s_init"][0, 0, 2] = 0.05
     geom["s_init"][0, 1, 2] = -0.05
     intensity = torch.full((1, 2), 0.42)
 
-    head = QGSHead(feature_dim=8, latent_dim=2, hidden_dim=16, gated=False, center_mode="fixed")
+    head = QGSHead(feature_dim=8, latent_dim=2, hidden_dim=16, gated=False)
     _zero_module(head)
     with torch.no_grad():
-        head.geometry_head.mlp[-1].bias[5] = 5.0
+        head.geometry_head.mlp[-1].bias[8] = 5.0
 
     out = head(feats, geom, torch.zeros(1, 2), intensity_input=intensity)
 
-    assert out["s"][0, 0, 2] > 0
-    assert out["s"][0, 1, 2] < 0
+    assert (out["s"][..., 2] > 0).all()
 
 
 def test_intensity_head_consumes_final_geometry():
@@ -149,7 +189,7 @@ def test_intensity_head_consumes_final_geometry():
     geom_b["s_init"][..., 0] = 0.8
     intensity = torch.full((1, 4), 0.42)
 
-    head = QGSHead(feature_dim=8, latent_dim=2, hidden_dim=8, gated=False, center_mode="fixed")
+    head = QGSHead(feature_dim=8, latent_dim=2, hidden_dim=8, gated=False)
     _zero_module(head)
     with torch.no_grad():
         first = head.intensity_head.mlp[0]
@@ -172,7 +212,7 @@ def test_alpha_head_consumes_final_geometry():
     geom_b["s_init"][..., 0] = 0.8
     intensity = torch.full((1, 4), 0.42)
 
-    head = QGSHead(feature_dim=8, latent_dim=2, hidden_dim=8, gated=False, center_mode="fixed")
+    head = QGSHead(feature_dim=8, latent_dim=2, hidden_dim=8, gated=False)
     _zero_module(head)
     with torch.no_grad():
         first = head.alpha_head.mlp[0]
@@ -190,7 +230,7 @@ def test_alpha_head_consumes_final_geometry():
 
 def test_backward_runs_through_all_outputs():
     torch.manual_seed(2)
-    head = QGSHead(feature_dim=8, latent_dim=3, hidden_dim=16, gated=True, center_mode="fixed")
+    head = QGSHead(feature_dim=8, latent_dim=3, hidden_dim=16, gated=True)
     feats = torch.randn(1, 5, 8, requires_grad=True)
     geom = _make_geom_init(1, 5)
     geom["use_geom_init"][0, :2] = False
@@ -199,6 +239,7 @@ def test_backward_runs_through_all_outputs():
     out = head(feats, geom, torch.ones(1, 5), intensity_input=intensity)
     loss = (
         out["R"].pow(2).sum()
+        + out["center"].pow(2).sum()
         + out["s"].pow(2).sum()
         + out["alpha"].sum()
         + out["intensity"].sum()
@@ -208,3 +249,8 @@ def test_backward_runs_through_all_outputs():
 
     assert feats.grad is not None
     assert not torch.isnan(feats.grad).any()
+
+
+def test_latent_head_is_exported_without_appearance_alias():
+    assert LatentHead is head_module.LatentHead
+    assert not hasattr(head_module, "AppearanceHead")

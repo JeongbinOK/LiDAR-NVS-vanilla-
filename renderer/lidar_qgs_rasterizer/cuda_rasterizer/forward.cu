@@ -180,8 +180,8 @@ __device__ bool computeAABB(
     s_sign->z = copysign(1, scale.z);
 
 	// Approximate the circular paraboloid using its major-axis representation.
-	const float a0 = s_sign->z * scale.z * rscale.x;
-	const float a1 = s_sign->z * scale.z * rscale.y;
+	const float a0 = scale.z * s_sign->x * rscale.x;
+	const float a1 = scale.z * s_sign->y * rscale.y;
 	// find x0 S.t. f(ax0^2) = sigma * s_max, see Eq. 23 in the paper of QGS
 	const float l0 = GetRootfromEquation(sigma * abs(scale.x), a0); 
 	const float l1 = GetRootfromEquation(sigma * abs(scale.y), a1); 
@@ -790,14 +790,22 @@ renderCUDA(
 							  rscale_sign_j.y * cam_pos_local.y * cam_pos_local.y - 
 							  rscale_sign_j.z * cam_pos_local.z;
 
-			float discriminant = BB*BB - 4*AA*CC;
+			const bool linear_root = fabs(AA) < 1e-6;
+			if(linear_root && fabs(BB) < 1e-8)
+				continue;
 
-			// If the discriminant is less than zero, the ray does not intersect the quadric.
-			if(discriminant < 0)
-				continue; 
-			
-			float r2AA = __frcp_rn(2 * AA);
-			float discriminant_sq_r2AA = __fsqrt_rn(discriminant) * r2AA;
+			float discriminant = 0.0f;
+			float r2AA = 0.0f;
+			float discriminant_sq_r2AA = 0.0f;
+			if(!linear_root)
+			{
+				discriminant = BB*BB - 4*AA*CC;
+				// If the discriminant is less than zero, the ray does not intersect the quadric.
+				if(discriminant < 0)
+					continue;
+				r2AA = __frcp_rn(2 * AA);
+				discriminant_sq_r2AA = __fsqrt_rn(discriminant) * r2AA;
+			}
 
 			// store the following variables for subsequent calculations.
 			float root = 0.0f;
@@ -814,11 +822,9 @@ renderCUDA(
 			int AA_sign = copysign(1, AA);
 
 			for(int i = -1; i < 2; i+=2){
-#if	QUADRATIC_APPROXIMATION
-				if (abs(AA) < 1e-6) // approximation of the intersection equation, see the supplementary material.
+				if (linear_root)
 					root = - CC / BB;
 				else
-#endif				
 				{
 					sign = (float)i * (float)AA_sign;
 					root = -BB * r2AA + sign * discriminant_sq_r2AA;
@@ -838,7 +844,9 @@ renderCUDA(
 				if (s_2 <= r0_2 * sigma * sigma){
 					intersect = true;
 					break;
-				}	
+				}
+				if (linear_root)
+					break;
 			}
 			if (!intersect)
 				continue;

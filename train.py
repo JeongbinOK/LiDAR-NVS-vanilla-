@@ -1,13 +1,10 @@
-"""Training loop for QGS-Flow Phase A.
+"""Training loop for QGS-Flow shared-scene pair rendering.
 
-Self-supervised single-frame LiDAR rendering:
-  per frame  →  PTv3 → KNN+quadric_fit → QGSHead → primitives
-              → spherical rasterizer → render
-              → compare vs the same frame's binned range/intensity image
-              → loss → backward.
+Each training sample contains two LiDAR keyframes. The pipeline builds one
+shared scene from the pair, predicts static and tracked-dynamic primitives,
+renders both keyframes, and optimizes against the two keyframe LiDAR images.
 
-Phase B (pose interpolation, GT-sweep supervision, dynamic instances) is not
-wired here.
+Intermediate sweep supervision / arbitrary-time rendering is not wired here.
 """
 
 import argparse
@@ -29,7 +26,7 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from config import QGSConfig
+from config import OFFICIAL_FULL_PTV3_BACKBONE_PARAMS, QGSConfig
 sys.path.insert(0, os.path.join(os.path.expanduser(QGSConfig.data_root), "loader"))
 from dataset import NuScenesNVSDataset, nvs_collate_fn
 
@@ -100,6 +97,7 @@ def _build_scene_primitives(
     xyz: torch.Tensor,
     intensity_norm: torch.Tensor,
     *,
+    context_type: str,
     time_scalar: torch.Tensor | None,
     ego_motion: torch.Tensor,
     is_dynamic_flag: torch.Tensor,
@@ -109,6 +107,7 @@ def _build_scene_primitives(
     primitives = model.forward_context(
         xyz,
         intensity_norm,
+        context_type=context_type,
         time_scalar=time_scalar,
         ego_motion=ego_motion,
         is_dynamic_flag=is_dynamic_flag,
@@ -208,6 +207,7 @@ def process_pair(model, loss_fn, drop_head, ray_dir, batch, idx, device, cfg):
     static_flag = torch.zeros(static_xyz.shape[0], device=device, dtype=static_xyz.dtype)
     static_prims, _ = _build_scene_primitives(
         model, cfg, static_xyz, static_i,
+        context_type="static",
         time_scalar=static_t, ego_motion=e_dir,
         is_dynamic_flag=static_flag,
     )
@@ -226,6 +226,7 @@ def process_pair(model, loss_fn, drop_head, ray_dir, batch, idx, device, cfg):
         dyn_flag = torch.ones(canon_xyz.shape[0], device=device, dtype=canon_xyz.dtype)
         dyn_prims, _ = _build_scene_primitives(
             model, cfg, canon_xyz, canon_i,
+            context_type="dynamic",
             time_scalar=canon_t, ego_motion=e_dir,
             is_dynamic_flag=dyn_flag,
         )
@@ -387,6 +388,34 @@ def train(cfg: QGSConfig, overfit_frames: int = 0, resume: str = ""):
         math.radians(cfg.lidar_el_max_deg),
         device=device,
     )
+    if hasattr(model.backbone, "parameter_count"):
+        backbone_core_params = model.backbone.parameter_count(include_projection=False)
+        backbone_total_params = model.backbone.parameter_count(include_projection=True)
+    else:
+        backbone_core_params = sum(p.numel() for p in model.backbone.parameters() if p.requires_grad)
+        backbone_total_params = backbone_core_params
+    expected_backbone_params = cfg.expected_ptv3_backbone_params()
+    branch_parts = []
+    if cfg.ptv3_decoupled_stem:
+        branch_parts.append("stem")
+    if cfg.ptv3_pdnorm_bn:
+        branch_parts.append("bn")
+    if cfg.ptv3_pdnorm_ln:
+        branch_parts.append("ln")
+    branch_label = "+".join(branch_parts) if branch_parts else "none"
+    print(
+        "PTv3 official_full "
+        f"(branches={branch_label}, backbone={backbone_core_params:,}, "
+        f"wrapper={backbone_total_params:,}, base_8ch={OFFICIAL_FULL_PTV3_BACKBONE_PARAMS:,})"
+    )
+    if (
+        expected_backbone_params is not None
+        and backbone_core_params != expected_backbone_params
+    ):
+        raise RuntimeError(
+            "PTv3 official_full expected "
+            f"{expected_backbone_params:,} backbone params, got {backbone_core_params:,}"
+        )
 
     # Per-module lr groups: PTv3 backbone needs lower lr (bf16+flash-attn);
     # head MLPs tolerate the higher lr. Falls back to cfg.lr if either is None.
@@ -573,14 +602,6 @@ def main():
     parser.add_argument("--resume", type=str, default="",
                         help="Path to checkpoint to resume training from")
     parser.add_argument("--device", default=_defaults.device)
-    parser.add_argument("--backbone", default=_defaults.backbone_type,
-                        choices=["ptv3", "custom"])
-    parser.add_argument(
-        "--head-center-mode",
-        default=_defaults.head_center_mode,
-        choices=["fixed"],
-        help="Center policy for the fixed-center QGSHead",
-    )
     args = parser.parse_args()
 
     cfg = QGSConfig(
@@ -589,8 +610,6 @@ def main():
         lr=args.lr,
         batch_size=args.batch_size,
         device=args.device,
-        backbone_type=args.backbone,
-        head_center_mode=args.head_center_mode,
     )
 
     train(cfg, overfit_frames=args.overfit, resume=args.resume)

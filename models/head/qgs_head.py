@@ -1,10 +1,9 @@
 """
-Geometry-first QGS head with fixed-center semantics.
+Geometry-first QGS head for local-tangent signed QGS initialisation.
 
-The head now keeps the query point as the primitive center anchor and predicts
-only rotation / scale residuals for geometry. Appearance (`alpha`, `latent`)
-and intensity are handled by separate heads, with intensity explicitly
-conditioned on the final geometry.
+The analytic quadric fit supplies the primitive centre, tangent frame, signed
+tangent support, and curvature magnitude.  The head predicts bounded residuals
+for centre, rotation, and scale while preserving the `s1/s2` surface signature.
 """
 
 from __future__ import annotations
@@ -79,7 +78,7 @@ def _nonzero_sign(x: Tensor) -> Tensor:
 
 
 class GeometryHead(nn.Module):
-    """Predict local rotation / ordered-scale residuals and scalar gates."""
+    """Predict local centre / rotation / ordered-scale residuals and gates."""
 
     def __init__(
         self,
@@ -91,9 +90,9 @@ class GeometryHead(nn.Module):
     ) -> None:
         super().__init__()
         self.gated = bool(gated)
-        self.mlp = _make_mlp(feature_dim + 1, hidden_dim, 6, depth=2)
+        self.mlp = _make_mlp(feature_dim + 1, hidden_dim, 9, depth=2)
         if self.gated:
-            self.gate = _make_mlp(6, max(hidden_dim // 2, 16), 2, depth=1)
+            self.gate = _make_mlp(6, max(hidden_dim // 2, 16), 3, depth=1)
             nn.init.constant_(self.gate[-1].bias, gate_bias_init)
 
     def forward(
@@ -102,7 +101,7 @@ class GeometryHead(nn.Module):
         gate_input: Tensor,
         is_dynamic_flag: Tensor,
         use_geom_init: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor]:
+        ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         dyn = is_dynamic_flag.unsqueeze(-1)
         raw = self.mlp(torch.cat([features, dyn], dim=-1))
 
@@ -111,7 +110,7 @@ class GeometryHead(nn.Module):
         else:
             gates = torch.ones(
                 *features.shape[:-1],
-                2,
+                3,
                 dtype=features.dtype,
                 device=features.device,
             )
@@ -121,7 +120,7 @@ class GeometryHead(nn.Module):
             gates = gates.clone()
             gates[subfloor] = 1.0
 
-        return raw, gates[..., 0], gates[..., 1]
+        return raw, gates[..., 0], gates[..., 1], gates[..., 2]
 
 
 class AlphaHead(nn.Module):
@@ -143,8 +142,8 @@ class AlphaHead(nn.Module):
         return self.mlp(inp).squeeze(-1)
 
 
-class AppearanceHead(nn.Module):
-    """Predict latent appearance channels from backbone features."""
+class LatentHead(nn.Module):
+    """Predict latent channels from backbone features."""
 
     def __init__(self, feature_dim: int, hidden_dim: int, latent_dim: int) -> None:
         super().__init__()
@@ -178,7 +177,7 @@ class IntensityHead(nn.Module):
 
 
 class QGSHead(nn.Module):
-    """Fixed-center geometry-first QGS predictor."""
+    """Local-tangent geometry-first QGS predictor."""
 
     def __init__(
         self,
@@ -189,7 +188,7 @@ class QGSHead(nn.Module):
         gate_bias_init: float = -2.0,
         alpha_bias_init: float = 2.2,
         intensity_residual: bool = True,
-        center_mode: str = "fixed",
+        center_bound: float = 0.3,
         rot_tilt_deg: float = 10.0,
         rot_spin_deg: float = 30.0,
         scale_log_mean_bound: float | None = None,
@@ -198,16 +197,9 @@ class QGSHead(nn.Module):
         s3_fallback_abs: float = 0.05,
     ) -> None:
         super().__init__()
-
-        center_mode = str(center_mode).lower()
-        if center_mode != "fixed":
-            raise ValueError(
-                f"QGSHead now only supports fixed centers; got center_mode={center_mode!r}"
-            )
-
-        self.center_mode = center_mode
         self.alpha_bias_init = float(alpha_bias_init)
         self.intensity_residual = bool(intensity_residual)
+        self.center_bound = float(center_bound)
         self.rot_tilt_bound = math.radians(float(rot_tilt_deg))
         self.rot_spin_bound = math.radians(float(rot_spin_deg))
         self.scale_log_mean_bound = (
@@ -227,7 +219,7 @@ class QGSHead(nn.Module):
             gate_bias_init=gate_bias_init,
         )
         self.alpha_head = AlphaHead(feature_dim, hidden_dim)
-        self.appearance_head = AppearanceHead(feature_dim, hidden_dim, latent_dim)
+        self.latent_head = LatentHead(feature_dim, hidden_dim, latent_dim)
         self.intensity_head = IntensityHead(feature_dim, hidden_dim)
 
     def forward(
@@ -257,7 +249,7 @@ class QGSHead(nn.Module):
             dim=-1,
         )
 
-        raw_geom, g_rot, g_scale = self.geometry_head(
+        raw_geom, g_rot, g_center, g_scale = self.geometry_head(
             features,
             gate_input,
             is_dynamic_flag,
@@ -265,9 +257,10 @@ class QGSHead(nn.Module):
         )
 
         raw_omega = raw_geom[..., :3]
-        raw_mu = raw_geom[..., 3]
-        raw_gap = raw_geom[..., 4]
-        raw_s3 = raw_geom[..., 5]
+        raw_delta_c = raw_geom[..., 3:6]
+        raw_mu = raw_geom[..., 6]
+        raw_gap = raw_geom[..., 7]
+        raw_s3 = raw_geom[..., 8]
 
         omega_bound = raw_geom.new_tensor(
             [self.rot_tilt_bound, self.rot_tilt_bound, self.rot_spin_bound]
@@ -275,43 +268,49 @@ class QGSHead(nn.Module):
         omega_local = g_rot.unsqueeze(-1) * torch.tanh(raw_omega) * omega_bound
         R = R_init @ _exp_so3(omega_local)
 
+        delta_c = g_center.unsqueeze(-1) * torch.tanh(raw_delta_c) * self.center_bound
+        center = c_init + delta_c
+
+        s1_sign = torch.where(use_geom_init, _nonzero_sign(s_init[..., 0]), torch.ones_like(s_init[..., 0]))
+        s2_sign = torch.where(use_geom_init, _nonzero_sign(s_init[..., 1]), torch.ones_like(s_init[..., 1]))
         s1_base = torch.where(
             use_geom_init,
-            s_init[..., 0].clamp(min=_EPS),
+            s_init[..., 0].abs().clamp(min=_EPS),
             torch.full_like(s_init[..., 0], self.s12_fallback),
         )
         s2_base = torch.where(
             use_geom_init,
-            s_init[..., 1].clamp(min=_EPS),
+            s_init[..., 1].abs().clamp(min=_EPS),
             torch.full_like(s_init[..., 1], self.s12_fallback),
         )
 
         mu_init = 0.5 * (torch.log(s1_base) + torch.log(s2_base))
-        gap_init = torch.log(s1_base) - torch.log(s2_base)
+        gap_init = (torch.log(s1_base) - torch.log(s2_base)).clamp(min=0.0)
 
         delta_mu = g_scale * torch.tanh(raw_mu) * self.scale_log_mean_bound
         delta_gap = g_scale * torch.tanh(raw_gap) * self.scale_log_gap_bound
         mu = mu_init + delta_mu
         gap = torch.clamp(gap_init + delta_gap, min=0.0)
 
-        s1 = torch.exp(mu + 0.5 * gap)
-        s2 = torch.exp(mu - 0.5 * gap)
+        s1_abs = torch.exp(mu + 0.5 * gap)
+        s2_abs = torch.exp(mu - 0.5 * gap)
+        s1 = s1_sign * s1_abs
+        s2 = s2_sign * s2_abs
 
         s3_init = s_init[..., 2]
-        s3_sign = torch.where(use_geom_init, _nonzero_sign(s3_init), torch.ones_like(s3_init))
         s3_abs_base = torch.where(
             use_geom_init,
             s3_init.abs().clamp(min=_EPS),
             torch.full_like(s3_init, self.s3_fallback_abs),
         )
         delta_log_abs_s3 = g_scale * torch.tanh(raw_s3) * self.s3_log_bound
-        s3 = s3_sign * s3_abs_base * torch.exp(delta_log_abs_s3)
+        s3 = s3_abs_base * torch.exp(delta_log_abs_s3)
 
         normal = R[..., :, 2]
         geometry_summary = torch.cat(
             [
-                torch.log(s1.clamp(min=_EPS)).unsqueeze(-1),
-                torch.log(s2.clamp(min=_EPS)).unsqueeze(-1),
+                torch.log(s1_abs.clamp(min=_EPS)).unsqueeze(-1),
+                torch.log(s2_abs.clamp(min=_EPS)).unsqueeze(-1),
                 s3.unsqueeze(-1),
                 normal,
             ],
@@ -319,7 +318,7 @@ class QGSHead(nn.Module):
         )
         logit_alpha = self.alpha_head(features, geometry_summary, is_dynamic_flag)
         alpha = torch.sigmoid(logit_alpha + self.alpha_bias_init)
-        latent = self.appearance_head(features, is_dynamic_flag)
+        latent = self.latent_head(features, is_dynamic_flag)
         delta_logit_intensity = self.intensity_head(
             features,
             geometry_summary,
@@ -335,7 +334,7 @@ class QGSHead(nn.Module):
             intensity = torch.sigmoid(delta_logit_intensity)
 
         return {
-            "center": c_init,
+            "center": center,
             "R": R,
             "s": torch.stack([s1, s2, s3], dim=-1),
             "alpha": alpha,
@@ -343,8 +342,10 @@ class QGSHead(nn.Module):
             "latent": latent,
             "aux": {
                 "g_rot": g_rot,
+                "g_center": g_center,
                 "g_scale": g_scale,
                 "omega_local": omega_local,
+                "delta_c": delta_c,
                 "delta_mu": delta_mu,
                 "delta_gap": delta_gap,
                 "delta_log_abs_s3": delta_log_abs_s3,
@@ -353,6 +354,5 @@ class QGSHead(nn.Module):
                 "curvature_aniso": curvature_aniso,
                 "used_init": use_geom_init,
                 "gate_input": gate_input,
-                "center_mode": self.center_mode,
             },
         }
