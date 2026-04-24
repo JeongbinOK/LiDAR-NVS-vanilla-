@@ -144,10 +144,11 @@ class PTv3Backbone(nn.Module):
         point_features: torch.Tensor,
         *,
         context_type: str | None = None,
+        offsets: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Args:
-            xyz: [N, 3] point positions
+            xyz: [N, 3] point positions (concatenated if offsets is given).
             point_features: [N, C] raw per-point feature matrix. The feature
                 dimension must match the external QGS contract `in_channels`.
             context_type: optional QGS context label. The official full PTv3
@@ -155,6 +156,11 @@ class PTv3Backbone(nn.Module):
                 branch. When omitted, the wrapper falls back to the first
                 configured condition. `model_in_channels > in_channels` is kept
                 only for legacy checkpoint compatibility.
+            offsets: optional [K] long tensor of cumulative point counts for
+                multi-instance batching (e.g. `[N_0, N_0+N_1, ..., ΣN_i]`).
+                PTv3 uses this to keep attention / spconv within each
+                instance. When omitted, the whole cloud is treated as one
+                batch (offset = `[N]`).
 
         Returns:
             features: [N, out_channels] per-point features
@@ -177,6 +183,19 @@ class PTv3Backbone(nn.Module):
         N = xyz.shape[0]
         device = xyz.device
 
+        if offsets is None:
+            offset_tensor = torch.tensor([N], dtype=torch.long, device=device)
+        else:
+            offset_tensor = offsets.to(device=device, dtype=torch.long)
+            if offset_tensor.dim() != 1 or offset_tensor.numel() < 1:
+                raise ValueError(
+                    f"offsets must be a 1-D tensor of cumsums; got shape {tuple(offset_tensor.shape)}"
+                )
+            if int(offset_tensor[-1].item()) != N:
+                raise ValueError(
+                    f"offsets[-1]={int(offset_tensor[-1].item())} must equal N={N}"
+                )
+
         # Build PTv3 input dict
         feat = point_features.float()
         if self.model_in_channels != self.in_channels:
@@ -191,7 +210,7 @@ class PTv3Backbone(nn.Module):
             coord=xyz.float(),
             feat=feat,
             grid_size=self.grid_size,
-            offset=torch.tensor([N], dtype=torch.long, device=device),
+            offset=offset_tensor,
             condition=context_type,
         )
 

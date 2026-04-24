@@ -219,23 +219,24 @@ def process_pair(model, loss_fn, drop_head, ray_dir, batch, idx, device, cfg):
         frame0_primitives.append(static_prims)
         frame1_primitives.append(static_prims)
 
-    for dyn in scene["dynamic"]:
-        canon_xyz = dyn["canonical_xyz"].to(device)
-        canon_i = dyn["canonical_intensity"].to(device)
-        canon_t = dyn["canonical_time"].to(device)
-        dyn_flag = torch.ones(canon_xyz.shape[0], device=device, dtype=canon_xyz.dtype)
-        dyn_prims, _ = _build_scene_primitives(
-            model, cfg, canon_xyz, canon_i,
+    dyn_list = scene["dynamic"]
+    if dyn_list:
+        dyn_xyz_list = [d["canonical_xyz"].to(device) for d in dyn_list]
+        dyn_int_list = [d["canonical_intensity"].to(device) for d in dyn_list]
+        dyn_time_list = [d["canonical_time"].to(device) for d in dyn_list]
+        dyn_prims_list = model.forward_contexts_batched(
+            dyn_xyz_list, dyn_int_list,
             context_type="dynamic",
-            time_scalar=canon_t, ego_motion=e_dir,
-            is_dynamic_flag=dyn_flag,
+            time_list=dyn_time_list,
+            ego_motion=e_dir,
         )
-        if dyn_prims is None:
-            continue
-        if dyn.get("box_0") is not None:
-            frame0_primitives.append(_transform_primitives(dyn_prims, _box_to_pose(dyn["box_0"].to(device))))
-        if dyn.get("box_1") is not None:
-            frame1_primitives.append(_transform_primitives(dyn_prims, _box_to_pose(dyn["box_1"].to(device))))
+        for dyn, dyn_prims in zip(dyn_list, dyn_prims_list):
+            if dyn_prims is None:
+                continue
+            if dyn.get("box_0") is not None:
+                frame0_primitives.append(_transform_primitives(dyn_prims, _box_to_pose(dyn["box_0"].to(device))))
+            if dyn.get("box_1") is not None:
+                frame1_primitives.append(_transform_primitives(dyn_prims, _box_to_pose(dyn["box_1"].to(device))))
 
     frame0 = _concat_primitives(frame0_primitives)
     frame1 = _concat_primitives(frame1_primitives)
