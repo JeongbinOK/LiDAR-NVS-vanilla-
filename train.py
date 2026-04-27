@@ -35,6 +35,7 @@ from models.head import DropHead, make_lidar_ray_grid
 from nn.model import QGSModel
 from nn.qgs_loss import QGSLoss
 from nn.render_utils import (
+    build_gt_normal_map,
     build_target_lidar_image,
     quat_to_rotmat,
     render_primitives,
@@ -252,12 +253,18 @@ def process_pair(model, loss_fn, drop_head, ray_dir, batch, idx, device, cfg):
         el_min_rad=el_min_rad, el_max_rad=el_max_rad,
         r_near=cfg.r_near, r_far=cfg.r_far,
     )
+    target0.update(build_gt_normal_map(
+        target0["range_image"], target0["valid_mask"], ray_dir,
+    ))
     target1 = build_target_lidar_image(
         xyz1, i1,
         height=cfg.lidar_height, width=cfg.lidar_width,
         el_min_rad=el_min_rad, el_max_rad=el_max_rad,
         r_near=cfg.r_near, r_far=cfg.r_far,
     )
+    target1.update(build_gt_normal_map(
+        target1["range_image"], target1["valid_mask"], ray_dir,
+    ))
 
     rendered0 = render_primitives(
         frame0,
@@ -303,6 +310,8 @@ def process_pair(model, loss_fn, drop_head, ray_dir, batch, idx, device, cfg):
         "depth": 0.5 * (loss0["depth"] + loss1["depth"]),
         "intensity": 0.5 * (loss0["intensity"] + loss1["intensity"]),
         "raydrop": 0.5 * (loss0["raydrop"] + loss1["raydrop"]),
+        "distortion": 0.5 * (loss0["distortion"] + loss1["distortion"]),
+        "normal": 0.5 * (loss0["normal"] + loss1["normal"]),
         "n_valid": 0.5 * (loss0["n_valid"] + loss1["n_valid"]),
         "valid_ratio": 0.5 * (loss0["valid_ratio"] + loss1["valid_ratio"]),
     }
@@ -379,6 +388,8 @@ def train(cfg: QGSConfig, overfit_frames: int = 0, resume: str = ""):
         w_depth=cfg.loss_w_range,
         w_intensity=cfg.loss_w_intensity,
         w_raydrop=getattr(cfg, "loss_w_raydrop", 0.1),
+        w_distortion=getattr(cfg, "loss_w_distortion", 0.05),
+        w_normal=getattr(cfg, "loss_w_normal", 0.05),
         alpha_eps=cfg.loss_alpha_eps,
     ).to(device)
     drop_head = DropHead(latent_dim=cfg.lidar_latent_dim).to(device)
@@ -569,6 +580,8 @@ def train(cfg: QGSConfig, overfit_frames: int = 0, resume: str = ""):
             f"depth={avg['depth']:.3f} "
             f"int={avg['intensity']:.3f} "
             f"raydrop={avg['raydrop']:.3f} "
+            f"dist={avg.get('distortion', 0.0):.3f} "
+            f"nrm={avg.get('normal', 0.0):.3f} "
             f"valid={avg.get('valid_ratio', 0.0):.3f} "
             f"{dt:.1f}s"
         )

@@ -3,7 +3,8 @@
 Provides:
   - `rotmat_to_quat`        : differentiable [...,3,3] → [...,4] (w,x,y,z)
   - `build_target_lidar_image`: bin a LiDAR sweep onto the spherical grid used
-                                 by the rasterizer (first-hit range, mean intensity)
+                                 by the rasterizer (first-hit range, first-hit intensity)
+  - `build_gt_normal_map`   : estimate per-pixel GT surface normals from a range image
   - `render_primitives`     : wrap a primitive dict into a `LiDARRasterizer` call
 """
 
@@ -112,8 +113,8 @@ def build_target_lidar_image(
         v_int = round((el - el_min) * (H / (el_max - el_min)) - 0.5)
 
     Per pixel we record the *first-hit* range (min over all points falling in
-    the pixel) and an alpha-blend-style mean intensity. Intensity is expected
-    pre-normalised to [0, 1] (raw nuScenes intensity divided by 255).
+    the pixel) and the intensity of that same first-hit point. Intensity is
+    expected pre-normalised to [0, 1] (raw nuScenes intensity divided by 255).
 
     Args:
         xyz: [N, 3]  sensor-frame points.
@@ -124,7 +125,7 @@ def build_target_lidar_image(
 
     Returns dict:
         'range_image':     [H, W]  zeroed where no point hit.
-        'intensity_image': [H, W]  zeroed where no point hit.
+        'intensity_image': [H, W]  zeroed where no point hit (first-hit point's intensity).
         'valid_mask':      [H, W] bool.
     """
     if xyz.shape[0] != intensity.shape[0]:
@@ -163,11 +164,21 @@ def build_target_lidar_image(
     range_flat = torch.full((HW,), float("inf"), dtype=dtype, device=device)
     range_flat.scatter_reduce_(0, pix_v, r_v, reduce="amin", include_self=True)
 
-    int_sum = torch.zeros(HW, dtype=dtype, device=device)
-    cnt = torch.zeros(HW, dtype=dtype, device=device)
-    int_sum.scatter_add_(0, pix_v, int_v)
-    cnt.scatter_add_(0, pix_v, torch.ones_like(int_v))
-    intensity_flat = int_sum / cnt.clamp(min=1.0)
+    # First-hit intensity: pick the same return as first-hit range.
+    # For duplicate pixel indices, use deterministic tie-break by earliest point.
+    intensity_flat = torch.zeros(HW, dtype=dtype, device=device)
+    if pix_v.numel() > 0:
+        first_r = range_flat[pix_v]                                  # [M]
+        is_first = torch.isclose(r_v, first_r, rtol=0.0, atol=1e-6) # [M]
+        local_idx = torch.arange(pix_v.shape[0], device=device, dtype=torch.long)
+        sentinel = pix_v.shape[0]
+        cand_idx = torch.where(is_first, local_idx, local_idx.new_full(local_idx.shape, sentinel))
+
+        first_idx_flat = local_idx.new_full((HW,), sentinel)
+        first_idx_flat.scatter_reduce_(0, pix_v, cand_idx, reduce="amin", include_self=True)
+
+        has_hit = first_idx_flat < sentinel
+        intensity_flat[has_hit] = int_v[first_idx_flat[has_hit]]
 
     valid_flat = range_flat.isfinite()
     range_flat = torch.where(valid_flat, range_flat, torch.zeros_like(range_flat))
@@ -176,6 +187,68 @@ def build_target_lidar_image(
         "range_image":     range_flat.view(height, width),
         "intensity_image": intensity_flat.view(height, width),
         "valid_mask":      valid_flat.view(height, width),
+    }
+
+
+# ---------------------------------------------------------------------------
+# GT normal map
+# ---------------------------------------------------------------------------
+
+def build_gt_normal_map(
+    range_image: Tensor,
+    valid_mask: Tensor,
+    ray_grid: Tensor,
+) -> dict:
+    """Estimate per-pixel surface normals from a range image via finite differences.
+
+    Unprojects each pixel to 3D (P = ray_dir * r), then computes the cross
+    product of horizontal and vertical central-difference tangent vectors.
+    Azimuth (W) is treated as circular; elevation (H) uses replicate padding.
+
+    Args:
+        range_image: [H, W]  first-hit range in metres (0 where invalid).
+        valid_mask:  [H, W]  bool, True where a LiDAR return exists.
+        ray_grid:    [3, H, W]  unit ray directions in sensor frame.
+
+    Returns dict:
+        'normal_image': [3, H, W]  unit normals oriented toward sensor.
+        'normal_valid': [H, W]  bool — valid where pixel and both horizontal
+                                and vertical neighbours are valid.
+    """
+    H, W = range_image.shape
+
+    # Unproject: [3, H, W]
+    pts = ray_grid * range_image.unsqueeze(0)
+
+    # Horizontal central difference — azimuth is circular, so wrap edges.
+    pts_h = torch.cat([pts[:, :, -1:], pts, pts[:, :, :1]], dim=2)  # [3, H, W+2]
+    t_h = pts_h[:, :, 2:] - pts_h[:, :, :-2]                        # [3, H, W]
+
+    # Vertical central difference — elevation is NOT circular, replicate at edges.
+    pts_v = F.pad(pts, (0, 0, 1, 1), mode='replicate')               # [3, H+2, W]
+    t_v = pts_v[:, 2:, :] - pts_v[:, :-2, :]                         # [3, H, W]
+
+    # Surface normal via cross product, normalise.
+    n = torch.linalg.cross(t_h, t_v, dim=0)                          # [3, H, W]
+    n_norm = n.norm(dim=0, keepdim=True).clamp(min=1e-8)
+    n = n / n_norm
+
+    # Orient normals toward sensor (dot with inward direction = -ray_grid should be > 0).
+    cos_angle = (n * (-ray_grid)).sum(dim=0, keepdim=True)            # [1, H, W]
+    n = torch.where(cos_angle < 0, -n, n)
+
+    # Normal validity: require both horizontal and vertical neighbours.
+    vm_left  = torch.cat([valid_mask[:, -1:], valid_mask[:, :-1]], dim=1)
+    vm_right = torch.cat([valid_mask[:, 1:],  valid_mask[:, :1]], dim=1)
+    vm_up = torch.zeros_like(valid_mask)
+    vm_down = torch.zeros_like(valid_mask)
+    vm_up[1:, :] = valid_mask[:-1, :]
+    vm_down[:-1, :] = valid_mask[1:, :]
+    normal_valid = valid_mask & vm_left & vm_right & vm_up & vm_down # [H, W]
+
+    return {
+        "normal_image": n,
+        "normal_valid": normal_valid,
     }
 
 

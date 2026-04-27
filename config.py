@@ -76,6 +76,8 @@ class QGSConfig:
     loss_w_intensity: float = 0.1
     loss_alpha_eps: float = 1e-3
     loss_w_raydrop: float = 0.1
+    loss_w_distortion: float = 0.05   # 2DGS depth distortion regulariser
+    loss_w_normal: float = 0.05       # QGS curvature-aware normal consistency
 
     # Preprocessing
     ego_radius: float = 2.5
