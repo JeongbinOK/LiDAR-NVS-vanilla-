@@ -465,7 +465,25 @@ def train(cfg: QGSConfig, overfit_frames: int = 0, resume: str = ""):
         model.load_state_dict(ckpt["model_state_dict"])
         if "drop_head_state_dict" in ckpt:
             drop_head.load_state_dict(ckpt["drop_head_state_dict"])
-        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        if "optimizer_state_dict" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        if "scheduler_state_dict" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+            last_lr = ckpt["scheduler_state_dict"].get("_last_lr")
+            if last_lr is not None:
+                for group, lr in zip(optimizer.param_groups, last_lr):
+                    group["lr"] = lr
+
+        max_lrs = [lr_b, lr_h]
+        for group, max_lr in zip(optimizer.param_groups, max_lrs):
+            loaded_lr = group.get("lr", max_lr)
+            if loaded_lr > max_lr * 1.01:
+                print(
+                    f"Warning: resume lr for {group.get('name', 'group')} "
+                    f"was {loaded_lr:.3e}; clamping to config lr {max_lr:.3e}"
+                )
+                group["lr"] = max_lr
+            group["initial_lr"] = max_lr
         start_epoch = ckpt["epoch"] + 1
         best_loss = ckpt.get("loss", float("inf"))
         print(f"Resumed from {resume} (epoch {ckpt['epoch']+1}, loss={best_loss:.4f})")
