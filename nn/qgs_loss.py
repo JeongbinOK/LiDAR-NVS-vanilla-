@@ -20,6 +20,7 @@ from torch import Tensor
 
 import diff_quadratic_rasterization as dq
 from diff_quadratic_rasterization import LiDARRasterOutput
+from nn.render_utils import build_gt_normal_map
 
 # DISTORTION_OFFSET and CURV_DISTORTION_OFFSET are not re-exported by the
 # Python wrapper, so compute from the base offset (channel_layout.h).
@@ -52,6 +53,7 @@ class QGSLoss(nn.Module):
         rendered: LiDARRasterOutput,
         target: dict,
         drop_prob: Tensor | None = None,
+        ray_grid: Tensor | None = None,
     ) -> dict:
         valid_mask = target["valid_mask"]
         if drop_prob is not None and drop_prob.dim() == valid_mask.dim() + 1 and drop_prob.shape[0] == 1:
@@ -94,29 +96,30 @@ class QGSLoss(nn.Module):
                     else distortion_map.new_zeros(())
                 )
 
-        # Curvature-aware normal consistency loss (QGS §3).
-        # λ_K = 1 − σ(ln(|κ| + ε)): suppresses the loss at high-curvature
-        # regions (edges/corners) to prevent over-smoothing.
+        # Curvature-guided normal consistency (QGS Eq. 18-20).
+        # L_n(u,v)   = Σ_i ω_i (1 - n_i^T N)
+        #            = α_accum(u,v) - <Σ_i ω_i n_i, N>
+        # L_Kn(u,v)  = λ_K(K(u,v)) · L_n(u,v)
+        # λ_K(K)     = 1 - sigmoid(ln(|K| + ε))
+        #
+        # Here N is the differential normal from the rendered depth map, not a
+        # GT normal target. The rasterizer already returns the alpha-blended
+        # normal sum Σ_i ω_i n_i and curvature map K(u,v)=Σ_i ω_i K_i.
         normal_loss = rendered.range.new_zeros(())
-        normal_image = target.get("normal_image")
-        normal_valid = target.get("normal_valid")
-        pred_n = getattr(rendered, "normal", None)
-        kappa = getattr(rendered, "curvature", None)
-        if (
-            self.w_normal > 0.0
-            and normal_image is not None
-            and normal_valid is not None
-            and pred_n is not None
-            and kappa is not None
-        ):
-            mask = valid_mask & normal_valid                          # [H, W]
+        pred_n_sum = getattr(rendered, "normal", None)
+        kappa_map = getattr(rendered, "curvature", None)
+        if self.w_normal > 0.0 and pred_n_sum is not None and kappa_map is not None and ray_grid is not None:
+            depth_for_normal = getattr(rendered, "middepth", rendered.range)
+            render_valid = rendered.alpha_accum > self.alpha_eps
+            diff_normal = build_gt_normal_map(depth_for_normal, render_valid, ray_grid)
+            ref_n = diff_normal["normal_image"]
+            ref_valid = diff_normal["normal_valid"]
+
+            mask = render_valid & ref_valid
             if mask.any():
-                gt_n   = normal_image                                 # [3, H, W]
-                # cos similarity per pixel (dot product of unit vectors)
-                cos_sim = (pred_n * gt_n).sum(dim=0)                  # [H, W]
-                residual = 1.0 - cos_sim                              # [H, W], ≥ 0
-                # curvature weight: low-curvature → weight ≈ 1, high-curvature → weight ≈ 0
-                lam = 1.0 - torch.sigmoid(torch.log(kappa.abs().clamp(min=1e-6)))
+                dot_sum = (pred_n_sum * ref_n).sum(dim=0)
+                residual = (rendered.alpha_accum - dot_sum).clamp_min(0.0)
+                lam = 1.0 - torch.sigmoid(torch.log(kappa_map.abs().clamp(min=1e-6)))
                 normal_loss = (lam[mask] * residual[mask]).mean()
 
         total = (

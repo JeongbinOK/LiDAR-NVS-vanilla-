@@ -302,8 +302,8 @@ def process_pair(model, loss_fn, drop_head, ray_dir, batch, idx, device, cfg):
         ray_dir,
     )
 
-    loss0 = loss_fn(rendered0, target0, drop0)
-    loss1 = loss_fn(rendered1, target1, drop1)
+    loss0 = loss_fn(rendered0, target0, drop0, ray_grid)
+    loss1 = loss_fn(rendered1, target1, drop1, ray_grid)
     total = loss0["total"] + loss1["total"]
     loss_dict = {
         "total": total,
@@ -562,7 +562,10 @@ def train(cfg: QGSConfig, overfit_frames: int = 0, resume: str = ""):
             pbar.set_postfix(
                 loss=f"{avg_batch['total']:.4f}",
                 depth=f"{avg_batch['depth']:.3f}",
-                raydrop=f"{avg_batch['raydrop']:.3f}",
+                int=f"{avg_batch['intensity']:.3f}",
+                drop=f"{avg_batch['raydrop']:.3f}",
+                dist=f"{avg_batch.get('distortion', 0.0):.4f}",
+                nrm=f"{avg_batch.get('normal', 0.0):.4f}",
                 lr=f"{cur_lr_b:.1e}/{cur_lr_h:.1e}",
             )
 
