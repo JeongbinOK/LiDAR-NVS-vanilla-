@@ -484,8 +484,7 @@ def frame_metrics(
     pred_valid = drop < (1.0 - hit_threshold)
     intersect = pred_valid & gt_valid
 
-    alpha_safe = rendered.alpha_accum.clamp(min=1e-3)
-    pred_intensity = rendered.intensity / alpha_safe
+    pred_intensity = rendered.intensity
     pred_range = rendered.middepth
 
     gt_pts = range_image_to_points(ray_grid, target["range_image"], gt_valid)

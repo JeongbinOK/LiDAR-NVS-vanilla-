@@ -2,7 +2,7 @@
 
 Loss family:
   - Depth      : L1 on median depth over GT hit rays
-  - Intensity  : L1 on alpha-normalised intensity over GT hit rays
+  - Intensity  : L1 on alpha-blended intensity over GT hit rays
   - Raydrop    : BCE on predicted drop probability over all rays
 
 The loss deliberately avoids any direct alpha coverage regularizer. Collapse to
@@ -51,7 +51,7 @@ class QGSLoss(nn.Module):
         depth_gt = target["range_image"]
         intensity_gt = target["intensity_image"]
         depth_pred = rendered.middepth
-        intensity_pred = rendered.intensity / rendered.alpha_accum.clamp(min=self.alpha_eps)
+        intensity_pred = rendered.intensity
 
         depth_loss = F.l1_loss(depth_pred[valid_mask], depth_gt[valid_mask]) if valid_mask.any() else rendered.range.new_zeros(())
         intensity_loss = (

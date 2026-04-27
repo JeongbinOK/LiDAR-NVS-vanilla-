@@ -3,7 +3,7 @@ Curvature-aware ray-drop head — Phase A3.4.
 
 Takes the per-pixel rasterised LiDAR fields (latent, range, normal, curvature,
 alpha_accum) and the per-pixel ray direction, runs a small MLP on the
-alpha-normalised features, and returns a final drop probability of the form
+raw premultiplied raster features, and returns a final drop probability of the form
 
     p_drop(u, v) = (1 - α_accum) + α_accum · σ(MLP(features))
 
@@ -12,8 +12,8 @@ ray) and the second is the learned physical-drop probability conditioned on
 material/incidence cues.
 
 Inputs are expected in [B, C, H, W] layout. Each tensor produced by the CUDA
-rasterizer is an alpha-weighted sum (∑ T_i α_i v_i); we divide by α_accum to
-recover the per-pixel mean before feeding the MLP.
+rasterizer is an alpha-weighted sum (∑ T_i α_i v_i), and the MLP consumes those
+raw premultiplied values directly.
 
 This module is intentionally pure-Python — the rasterizer kernels stay
 backbone-agnostic, and the drop head is the only place that knows about the
@@ -95,7 +95,7 @@ class DropHead(nn.Module):
     def __init__(self, latent_dim: int, hidden_dim: int = 32):
         super().__init__()
         # Feature vector per pixel:
-        #   latent (L) ∥ |κ_norm| (1) ∥ cos_inc (1) ∥ log(1+range_norm) (1) ∥ ray_dir (3)
+        #   latent (L) ∥ |κ| (1) ∥ cos_inc (1) ∥ log(1+range) (1) ∥ ray_dir (3)
         self.latent_dim = int(latent_dim)
         self.in_dim = self.latent_dim + 1 + 1 + 1 + 3
         self.mlp = nn.Sequential(
@@ -133,22 +133,18 @@ class DropHead(nn.Module):
                 f"ray_dir must be [3, H, W] or [B, 3, H, W], got {tuple(ray_dir.shape)}"
             )
 
-        alpha_safe = alpha_accum.clamp(min=eps)                 # [B, H, W]
-        a1 = alpha_safe.unsqueeze(1)                            # [B, 1, H, W]
+        latent_feat = latent                                    # [B, L, H, W]
+        range_feat = torch.log1p(range_.clamp(min=0.0))         # [B, H, W]
+        normal_unit = F.normalize(normal, p=2, dim=1, eps=1e-8) # [B, 3, H, W]
+        curv_feat = curvature.abs()                             # [B, H, W]
 
-        latent_n   = latent / a1                                # [B, L, H, W]
-        range_n    = range_ / alpha_safe                        # [B, H, W]
-        normal_n   = F.normalize(normal / a1, p=2, dim=1, eps=1e-8)  # [B, 3, H, W]
-        curv_n     = (curvature / alpha_safe).abs()             # [B, H, W]
-
-        cos_inc = -(normal_n * ray_dir).sum(dim=1)              # [B, H, W]
-        log_r   = torch.log1p(range_n.clamp(min=0.0))           # [B, H, W]
+        cos_inc = -(normal_unit * ray_dir).sum(dim=1)           # [B, H, W]
 
         feats = torch.cat([
-            latent_n,                                            # L
-            curv_n.unsqueeze(1),                                 # 1
+            latent_feat,                                         # L
+            curv_feat.unsqueeze(1),                              # 1
             cos_inc.unsqueeze(1),                                # 1
-            log_r.unsqueeze(1),                                  # 1
+            range_feat.unsqueeze(1),                             # 1
             ray_dir,                                             # 3
         ], dim=1)                                                # [B, in_dim, H, W]
 

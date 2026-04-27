@@ -591,27 +591,39 @@ def train(cfg: QGSConfig, overfit_frames: int = 0, resume: str = ""):
 # CLI
 # ---------------------------------------------------------------------------
 
+def _load_config(path: str) -> QGSConfig:
+    with open(path) as f:
+        raw = json.load(f)
+    allowed = {field.name for field in dataclasses.fields(QGSConfig)}
+    return QGSConfig(**{k: v for k, v in raw.items() if k in allowed})
+
+
 def main():
     _defaults = QGSConfig()
     parser = argparse.ArgumentParser(description="Train QGS-Flow Phase A")
+    parser.add_argument("--config", type=str, default="",
+                        help="Path to a saved configs/config.json to use as the base config")
     parser.add_argument("--data-root", default=_defaults.data_root)
-    parser.add_argument("--epochs", type=int, default=_defaults.num_epochs)
-    parser.add_argument("--lr", type=float, default=_defaults.lr)
-    parser.add_argument("--batch-size", type=int, default=_defaults.batch_size)
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--overfit", type=int, default=0,
                         help="Overfit on N pairs (0 = full training)")
     parser.add_argument("--resume", type=str, default="",
                         help="Path to checkpoint to resume training from")
-    parser.add_argument("--device", default=_defaults.device)
+    parser.add_argument("--device", default=None)
     args = parser.parse_args()
 
-    cfg = QGSConfig(
-        data_root=args.data_root,
-        num_epochs=args.epochs,
-        lr=args.lr,
-        batch_size=args.batch_size,
-        device=args.device,
-    )
+    cfg = _load_config(args.config) if args.config else QGSConfig()
+    cfg.data_root = args.data_root
+    if args.epochs is not None:
+        cfg.num_epochs = args.epochs
+    if args.lr is not None:
+        cfg.lr = args.lr
+    if args.batch_size is not None:
+        cfg.batch_size = args.batch_size
+    if args.device is not None:
+        cfg.device = args.device
 
     train(cfg, overfit_frames=args.overfit, resume=args.resume)
 

@@ -34,3 +34,23 @@ def test_qgs_loss_penalizes_alpha_collapse():
 
     assert bad_loss["total"] > good_loss["total"]
     assert bad_loss["raydrop"] > good_loss["raydrop"]
+
+
+def test_qgs_loss_uses_raw_alpha_blended_intensity():
+    loss_fn = QGSLoss(w_depth=0.0, w_intensity=1.0, w_raydrop=0.0)
+
+    target = {
+        "range_image": torch.tensor([[10.0]]),
+        "intensity_image": torch.tensor([[0.2]]),
+        "valid_mask": torch.tensor([[True]]),
+    }
+    rendered = SimpleNamespace(
+        range=torch.tensor([[5.0]]),
+        middepth=torch.tensor([[10.0]]),
+        intensity=torch.tensor([[0.2]]),
+        alpha_accum=torch.tensor([[0.25]]),
+    )
+
+    loss = loss_fn(rendered, target, drop_prob=torch.tensor([[0.0]]))
+
+    assert torch.allclose(loss["intensity"], torch.tensor(0.0))

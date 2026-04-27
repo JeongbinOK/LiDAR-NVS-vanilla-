@@ -150,6 +150,41 @@ def test_drop_head_gradient_flows_to_mlp():
     assert any(g.abs().sum() > 0 for g in grads), "no MLP grads — head is dead"
 
 
+def test_drop_head_mlp_features_are_raw_premultiplied_values():
+    from models.head import DropHead
+
+    head = DropHead(latent_dim=2)
+    captured = {}
+
+    def capture_input(_module, inputs):
+        captured["x"] = inputs[0].detach().clone()
+
+    handle = head.mlp[0].register_forward_pre_hook(capture_input)
+    try:
+        latent = torch.tensor([[[[0.2]], [[0.4]]]])
+        range_ = torch.tensor([[[3.0]]])
+        normal = torch.tensor([[[[0.0]], [[0.5]], [[0.0]]]])
+        curvature = torch.tensor([[[-0.125]]])
+        alpha_accum = torch.tensor([[[0.25]]])
+        ray_dir = torch.tensor([[[0.0]], [[1.0]], [[0.0]]])
+
+        head(latent, range_, normal, curvature, alpha_accum, ray_dir)
+    finally:
+        handle.remove()
+
+    expected = torch.tensor([[
+        0.2,
+        0.4,
+        0.125,
+        -1.0,
+        math.log1p(3.0),
+        0.0,
+        1.0,
+        0.0,
+    ]])
+    assert torch.allclose(captured["x"], expected, atol=1e-6)
+
+
 # ---------------------------------------------------------------------------
 # End-to-end integration with the CUDA rasterizer.
 # ---------------------------------------------------------------------------
