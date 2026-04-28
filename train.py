@@ -86,6 +86,74 @@ def _ensure_2d_pose(pose: torch.Tensor) -> torch.Tensor:
     return pose
 
 
+def _warmup_cosine_lr_scale(
+    step: int,
+    warmup_iters: int,
+    total_iters: int,
+    start_factor: float = 1e-3,
+) -> float:
+    warmup_iters = max(1, int(warmup_iters))
+    total_iters = max(warmup_iters, int(total_iters))
+    step = max(0, int(step))
+
+    if step < warmup_iters:
+        if warmup_iters == 1:
+            return 1.0
+        progress = step / (warmup_iters - 1)
+        return start_factor + (1.0 - start_factor) * progress
+
+    cosine_iters = max(1, total_iters - warmup_iters)
+    if cosine_iters == 1:
+        return 0.0
+
+    cosine_step = min(step - warmup_iters, cosine_iters - 1)
+    progress = cosine_step / (cosine_iters - 1)
+    return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+
+def _build_warmup_cosine_scheduler(
+    optimizer: torch.optim.Optimizer,
+    warmup_iters: int,
+    total_iters: int,
+    start_factor: float = 1e-3,
+) -> torch.optim.lr_scheduler.LambdaLR:
+    return torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lr_lambda=lambda step: _warmup_cosine_lr_scale(
+            step, warmup_iters=warmup_iters, total_iters=total_iters,
+            start_factor=start_factor,
+        ),
+    )
+
+
+def _restore_scheduler_state(
+    scheduler: torch.optim.lr_scheduler.LambdaLR,
+    optimizer: torch.optim.Optimizer,
+    scheduler_state_dict: dict,
+    warmup_iters: int,
+    total_iters: int,
+) -> None:
+    try:
+        scheduler.load_state_dict(scheduler_state_dict)
+        return
+    except (KeyError, ValueError, RuntimeError):
+        pass
+
+    if not isinstance(scheduler_state_dict, dict) or "last_epoch" not in scheduler_state_dict:
+        return
+
+    last_epoch = int(scheduler_state_dict["last_epoch"])
+    last_lr = scheduler_state_dict.get("_last_lr")
+    if last_lr is None:
+        scale = _warmup_cosine_lr_scale(last_epoch, warmup_iters, total_iters)
+        last_lr = [base_lr * scale for base_lr in scheduler.base_lrs]
+
+    scheduler.last_epoch = last_epoch
+    scheduler._last_lr = list(last_lr)
+    for group, lr in zip(optimizer.param_groups, last_lr):
+        group["lr"] = lr
+
+
 def _filter_frame_points(xyz: torch.Tensor, intensity: torch.Tensor, cfg: QGSConfig):
     r = xyz.norm(dim=1)
     keep = (r > cfg.ego_radius) & (r < cfg.r_far)
@@ -302,8 +370,8 @@ def process_pair(model, loss_fn, drop_head, ray_dir, batch, idx, device, cfg):
         ray_dir,
     )
 
-    loss0 = loss_fn(rendered0, target0, drop0, ray_grid)
-    loss1 = loss_fn(rendered1, target1, drop1, ray_grid)
+    loss0 = loss_fn(rendered0, target0, drop0, ray_dir)
+    loss1 = loss_fn(rendered1, target1, drop1, ray_dir)
     total = loss0["total"] + loss1["total"]
     loss_dict = {
         "total": total,
@@ -447,14 +515,11 @@ def train(cfg: QGSConfig, overfit_frames: int = 0, resume: str = ""):
 
     total_iters = max(1, cfg.num_epochs * max(1, len(dataloader)))
     warmup_iters = min(cfg.warmup_iters, max(1, total_iters // 4))
-    warmup = torch.optim.lr_scheduler.LinearLR(
-        optimizer, start_factor=1e-3, end_factor=1.0, total_iters=warmup_iters,
-    )
-    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=max(1, total_iters - warmup_iters), eta_min=0.0,
-    )
-    scheduler = torch.optim.lr_scheduler.SequentialLR(
-        optimizer, schedulers=[warmup, cosine], milestones=[warmup_iters],
+    scheduler = _build_warmup_cosine_scheduler(
+        optimizer,
+        warmup_iters=warmup_iters,
+        total_iters=total_iters,
+        start_factor=1e-3,
     )
 
     print("Model Parameters per Module:")
@@ -479,11 +544,13 @@ def train(cfg: QGSConfig, overfit_frames: int = 0, resume: str = ""):
         if "optimizer_state_dict" in ckpt:
             optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         if "scheduler_state_dict" in ckpt:
-            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-            last_lr = ckpt["scheduler_state_dict"].get("_last_lr")
-            if last_lr is not None:
-                for group, lr in zip(optimizer.param_groups, last_lr):
-                    group["lr"] = lr
+            _restore_scheduler_state(
+                scheduler,
+                optimizer,
+                ckpt["scheduler_state_dict"],
+                warmup_iters=warmup_iters,
+                total_iters=total_iters,
+            )
 
         max_lrs = [lr_b, lr_h]
         for group, max_lr in zip(optimizer.param_groups, max_lrs):

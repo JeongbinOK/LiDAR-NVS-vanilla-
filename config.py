@@ -19,15 +19,15 @@ class QGSConfig:
 
     # PTv3 default backbone settings (aligned to outputs/train_044)
     ptv3_grid_size: float = 0.1
-    ptv3_stride: tuple = (2, 2)  # full=(2, 2, 2, 2), mid=(2, 2, 2)
-    ptv3_enc_depths: tuple = (2, 2, 4)  # full=(2, 2, 2, 6, 2), mid=(2, 2, 2, 4)
-    ptv3_enc_channels: tuple = (32, 64, 128)  # full=(32, 64, 128, 256, 512), mid=(32, 64, 128, 256)
-    ptv3_enc_num_head: tuple = (2, 4, 8)  # full=(2, 4, 8, 16, 32), mid=(2, 4, 8, 16)
-    ptv3_enc_patch_size: tuple = (1024, 1024, 1024)  # full=(1024, 1024, 1024, 1024, 1024), mid=(1024, 1024, 1024, 1024)
-    ptv3_dec_depths: tuple = (2, 2)  # full=(2, 2, 2, 2), mid=(2, 2, 2)
-    ptv3_dec_channels: tuple = (64, 128)  # full=(64, 64, 128, 256), mid=(64, 64, 128)
-    ptv3_dec_num_head: tuple = (4, 8)  # full=(4, 4, 8, 16), mid=(4, 4, 8)
-    ptv3_dec_patch_size: tuple = (1024, 1024)  # full=(1024, 1024, 1024, 1024), mid=(1024, 1024, 1024)
+    ptv3_stride: tuple = (2, 2, 2)  # full=(2, 2, 2, 2), mid=(2, 2, 2), small=(2, 2)
+    ptv3_enc_depths: tuple = (2, 2, 2, 4)  # full=(2, 2, 2, 6, 2), mid=(2, 2, 2, 4), small=(2, 2, 4)
+    ptv3_enc_channels: tuple = (32, 64, 128, 256)  # full=(32, 64, 128, 256, 512), mid=(32, 64, 128, 256), small=(32, 64, 128)
+    ptv3_enc_num_head: tuple = (2, 4, 8, 16)  # full=(2, 4, 8, 16, 32), mid=(2, 4, 8, 16), small=(2, 4, 8)
+    ptv3_enc_patch_size: tuple = (1024, 1024, 1024, 1024)  # full=(1024, 1024, 1024, 1024, 1024), mid=(1024, 1024, 1024, 1024), small=(1024, 1024, 1024)
+    ptv3_dec_depths: tuple = (2, 2, 2)  # full=(2, 2, 2, 2), mid=(2, 2, 2), small=(2, 2)
+    ptv3_dec_channels: tuple = (64, 64, 128)  # full=(64, 64, 128, 256), mid=(64, 64, 128), small=(64, 128)
+    ptv3_dec_num_head: tuple = (4, 4, 8)  # full=(4, 4, 8, 16), mid=(4, 4, 8), small=(4, 8)
+    ptv3_dec_patch_size: tuple = (1024, 1024, 1024)  # full=(1024, 1024, 1024, 1024), mid=(1024, 1024, 1024), small=(1024, 1024)
     ptv3_enable_flash: bool = True
     ptv3_conv_algo: str = "native"    # "auto" | "native" | "mask_implicit_gemm" | "mask_split_implicit_gemm"
     ptv3_batch_norm_eval: bool = True
