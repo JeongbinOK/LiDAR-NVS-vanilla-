@@ -190,23 +190,13 @@ def decompose_scene(
     B1 = boxes_1.shape[0] if boxes_1.numel() > 0 else 0
 
     # -----------------------------------------------------------------------
-    # Transform frame-1 points and boxes into frame-0 sensor frame
+    # Transform frame-1 static candidates into frame-0 sensor frame.
+    # Dynamic masking/localization stays in each frame's own box-local system.
     # -----------------------------------------------------------------------
     if p1.shape[0] > 0:
         p1_in_frame0 = _transform_points(p1.float(), rel_input_1_pose.float()).to(dtype)
     else:
         p1_in_frame0 = p1
-
-    # Transform frame-1 boxes into frame-0 LiDAR
-    boxes_1_in_frame0: list[Tensor] = []
-    for bi in range(B1):
-        boxes_1_in_frame0.append(
-            _transform_box_to_frame0(boxes_1[bi].float(), rel_input_1_pose.float()).to(dtype)
-        )
-    if len(boxes_1_in_frame0) > 0:
-        boxes_1_f0 = torch.stack(boxes_1_in_frame0, dim=0)   # [B1, 7]
-    else:
-        boxes_1_f0 = boxes_1.clone()
 
     # -----------------------------------------------------------------------
     # Identify tracked instances (present in BOTH frames)
@@ -242,10 +232,11 @@ def decompose_scene(
         else:
             in_untracked_0 |= mask
 
-    # Process frame-1 boxes
+    # Process frame-1 boxes in frame-1 LiDAR coordinates. This keeps dynamic
+    # frame-1 membership aligned with the frame-1 bbox and avoids box0 drift.
     for bi in range(B1):
         iid = int(instance_ids_1[bi].item())
-        mask = _points_in_box(p1_in_frame0.float(), boxes_1_f0[bi].float())
+        mask = _points_in_box(p1.float(), boxes_1[bi].float())
         if iid in tracked_ids:
             in_tracked_1 |= mask
             per_instance_mask_1[iid] = per_instance_mask_1.get(iid, torch.zeros(N1, dtype=torch.bool, device=device)) | mask
@@ -285,13 +276,16 @@ def decompose_scene(
         box0_idx = (instance_ids_0 == iid).nonzero(as_tuple=True)[0]
         box0 = boxes_0[box0_idx[0]] if len(box0_idx) > 0 else None
 
-        # Retrieve frame-1 bbox (in frame-0 LiDAR)
+        # Retrieve frame-1 bbox in frame-1 LiDAR coordinates.
         box1_idx = (instance_ids_1 == iid).nonzero(as_tuple=True)[0]
-        box1_f0 = boxes_1_f0[box1_idx[0]] if len(box1_idx) > 0 and boxes_1_f0.numel() > 0 else None
+        box1 = boxes_1[box1_idx[0]] if len(box1_idx) > 0 and boxes_1.numel() > 0 else None
 
         canon_pts_list: list[Tensor] = []
         canon_int_list: list[Tensor] = []
         canon_time_list: list[Tensor] = []
+        fallback_xyz_list: list[Tensor] = []
+        fallback_int_list: list[Tensor] = []
+        fallback_time_list: list[Tensor] = []
 
         if present_0 and box0 is not None:
             pts0 = p0[per_instance_mask_0[iid]]
@@ -301,19 +295,27 @@ def decompose_scene(
             canon_pts_list.append(pts0_canon)
             canon_int_list.append(int0)
             canon_time_list.append(t0)
+            fallback_xyz_list.append(pts0.to(dtype))
+            fallback_int_list.append(int0)
+            fallback_time_list.append(t0)
 
-        if present_1 and box0 is not None:
-            # Canonical space is anchored to the frame-0 box so both frames
-            # share one object-centric coordinate system.
+        if present_1 and box1 is not None:
+            # Canonical dynamic space is object-local per frame: frame0 points
+            # use box0 local, frame1 points use box1 local, then both local
+            # clouds are concatenated into one shared object-local cloud.
+            pts1 = p1[per_instance_mask_1[iid]]
             pts1_f0 = p1_in_frame0[per_instance_mask_1[iid]]
             int1 = intensity_1[per_instance_mask_1[iid]]
             pts1_canon = _to_canonical(
-                pts1_f0.float(), box0[:3].float(), box0[6].float()
+                pts1.float(), box1[:3].float(), box1[6].float()
             ).to(dtype)
             t1 = torch.ones(pts1_canon.shape[0], dtype=dtype, device=device)
             canon_pts_list.append(pts1_canon)
             canon_int_list.append(int1)
             canon_time_list.append(t1)
+            fallback_xyz_list.append(pts1_f0.to(dtype))
+            fallback_int_list.append(int1)
+            fallback_time_list.append(t1)
 
         if len(canon_pts_list) == 0:
             # No points extracted for this instance — skip
@@ -322,14 +324,20 @@ def decompose_scene(
         canonical_xyz = torch.cat(canon_pts_list, dim=0)
         canonical_intensity = torch.cat(canon_int_list, dim=0)
         canonical_time = torch.cat(canon_time_list, dim=0)
+        fallback_xyz = torch.cat(fallback_xyz_list, dim=0)
+        fallback_intensity = torch.cat(fallback_int_list, dim=0)
+        fallback_time = torch.cat(fallback_time_list, dim=0)
 
         dynamic_list.append({
             "instance_id":          iid,
             "canonical_xyz":        canonical_xyz,
             "canonical_intensity":  canonical_intensity,
             "canonical_time":       canonical_time,
+            "fallback_xyz":         fallback_xyz,   # [N_i, 3] frame-0 LiDAR
+            "fallback_intensity":   fallback_intensity,
+            "fallback_time":        fallback_time,
             "box_0":                box0,           # [7] frame-0 bbox in frame-0 LiDAR
-            "box_1":                box1_f0,        # [7] frame-1 bbox in frame-0 LiDAR
+            "box_1":                box1,           # [7] frame-1 bbox in frame-1 LiDAR
             "present_in_0":         bool(present_0),
             "present_in_1":         bool(present_1),
         })
