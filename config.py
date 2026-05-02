@@ -8,26 +8,46 @@ from dataclasses import dataclass
 OFFICIAL_FULL_PTV3_BACKBONE_PARAMS = 46_174_272
 
 
+def resolve_lidar_latent_dim(lidar_latent_dim: int | None = None) -> int:
+    """Resolve/check the latent width against the compiled rasterizer extension."""
+    from diff_quadratic_rasterization import LIDAR_LATENT_DIM
+
+    built_dim = int(LIDAR_LATENT_DIM)
+    if lidar_latent_dim is None:
+        return built_dim
+    requested = int(lidar_latent_dim)
+    if requested != built_dim:
+        raise ValueError(
+            f"lidar_latent_dim={requested} must equal "
+            f"diff_quadratic_rasterization.LIDAR_LATENT_DIM={built_dim}. "
+            "Rebuild the rasterizer with LIDAR_LATENT_DIM=<value> or remove "
+            "the explicit override."
+        )
+    return requested
+
+
 @dataclass
 class QGSConfig:
     """Hyperparameters for the QGS pipeline."""
 
     # Backbone
     feature_dim: int = 64
+    primitive_mode: str = "voxel_anchor"  # "voxel_anchor"=anchor primitives, "per_point"=legacy point primitives
     input_feature_dim: int = 8      # raw QGS feature contract: xyz + intensity + time + e_dir
-    ptv3_model_in_channels: int = 8  # PTv3 now consumes the native 8D QGS feature contract directly
+    anchor_token_dim: int = 22      # voxel-anchor token width consumed by PTv3 in voxel_anchor mode
+    ptv3_model_in_channels: int | None = None  # None resolves to mode feature width; kept for legacy configs
 
     # PTv3 default backbone settings (aligned to outputs/train_044)
     ptv3_grid_size: float = 0.1
-    ptv3_stride: tuple = (2, 2, 2)  # full=(2, 2, 2, 2), mid=(2, 2, 2), small=(2, 2)
-    ptv3_enc_depths: tuple = (2, 2, 2, 4)  # full=(2, 2, 2, 6, 2), mid=(2, 2, 2, 4), small=(2, 2, 4)
-    ptv3_enc_channels: tuple = (32, 64, 128, 256)  # full=(32, 64, 128, 256, 512), mid=(32, 64, 128, 256), small=(32, 64, 128)
-    ptv3_enc_num_head: tuple = (2, 4, 8, 16)  # full=(2, 4, 8, 16, 32), mid=(2, 4, 8, 16), small=(2, 4, 8)
-    ptv3_enc_patch_size: tuple = (1024, 1024, 1024, 1024)  # full=(1024, 1024, 1024, 1024, 1024), mid=(1024, 1024, 1024, 1024), small=(1024, 1024, 1024)
-    ptv3_dec_depths: tuple = (2, 2, 2)  # full=(2, 2, 2, 2), mid=(2, 2, 2), small=(2, 2)
-    ptv3_dec_channels: tuple = (64, 64, 128)  # full=(64, 64, 128, 256), mid=(64, 64, 128), small=(64, 128)
-    ptv3_dec_num_head: tuple = (4, 4, 8)  # full=(4, 4, 8, 16), mid=(4, 4, 8), small=(4, 8)
-    ptv3_dec_patch_size: tuple = (1024, 1024, 1024)  # full=(1024, 1024, 1024, 1024), mid=(1024, 1024, 1024), small=(1024, 1024)
+    ptv3_stride: tuple = (2, 2)  # full=(2, 2, 2, 2), mid=(2, 2, 2), small=(2, 2)
+    ptv3_enc_depths: tuple = (2, 2, 4)  # full=(2, 2, 2, 6, 2), mid=(2, 2, 2, 4), small=(2, 2, 4)
+    ptv3_enc_channels: tuple = (32, 64, 128)  # full=(32, 64, 128, 256, 512), mid=(32, 64, 128, 256), small=(32, 64, 128)
+    ptv3_enc_num_head: tuple = (2, 4, 8)  # full=(2, 4, 8, 16, 32), mid=(2, 4, 8, 16), small=(2, 4, 8)
+    ptv3_enc_patch_size: tuple = (1024, 1024, 1024)  # full=(1024, 1024, 1024, 1024, 1024), mid=(1024, 1024, 1024, 1024), small=(1024, 1024, 1024)
+    ptv3_dec_depths: tuple = (2, 2)  # full=(2, 2, 2, 2), mid=(2, 2, 2), small=(2, 2)
+    ptv3_dec_channels: tuple = (64, 128)  # full=(64, 64, 128, 256), mid=(64, 64, 128), small=(64, 128)
+    ptv3_dec_num_head: tuple = (4, 8)  # full=(4, 4, 8, 16), mid=(4, 4, 8), small=(4, 8)
+    ptv3_dec_patch_size: tuple = (1024, 1024)  # full=(1024, 1024, 1024, 1024), mid=(1024, 1024, 1024), small=(1024, 1024)
     ptv3_enable_flash: bool = True
     ptv3_conv_algo: str = "native"    # "auto" | "native" | "mask_implicit_gemm" | "mask_split_implicit_gemm"
     ptv3_batch_norm_eval: bool = True
@@ -40,7 +60,7 @@ class QGSConfig:
     # QGS head
     head_hidden_dim: int = 128
     use_gated_head: bool = True       # A2.2 flagship; False = A2.1 ablation
-    lidar_latent_dim: int = 16        # must match diff_quadratic_rasterization.LIDAR_LATENT_DIM
+    lidar_latent_dim: int | None = None  # None resolves to compiled rasterizer LIDAR_LATENT_DIM
     head_alpha_bias_init: float = 2.2     # sigmoid(2.2)≈0.90 — high initial coverage
     head_intensity_residual: bool = True  # intensity = sigmoid(logit + logit(input))
     head_center_bound: float = 0.3        # max analytic-center residual magnitude (m)
@@ -61,6 +81,12 @@ class QGSConfig:
     quadric_eps_kappa: float = 1e-3
     quadric_eps_s: float = 1e-3
     quadric_eps_s3: float = 1e-4
+
+    # Voxel-anchor primitive generation
+    anchor_token_variant: str = "full"        # full|no_fit_quality|no_intensity_stats|with_normal
+    anchor_filter_mode: str = "residual"      # residual|residual_planarity
+    anchor_residual_threshold: float = 0.806  # tau_r for anchor residual filtering
+    anchor_planarity_threshold: float = 0.2   # only used by residual_planarity filtering
 
     # LiDAR rasterizer (spherical projection)
     lidar_height: int = 32
@@ -104,6 +130,46 @@ class QGSConfig:
 
     # Device
     device: str = "cuda"
+
+    def __post_init__(self) -> None:
+        self.lidar_latent_dim = resolve_lidar_latent_dim(self.lidar_latent_dim)
+        allowed_modes = {"voxel_anchor", "per_point"}
+        if self.primitive_mode not in allowed_modes:
+            raise ValueError(
+                f"primitive_mode must be one of {sorted(allowed_modes)}; "
+                f"got {self.primitive_mode!r}"
+            )
+        allowed_token_variants = {
+            "full",
+            "no_fit_quality",
+            "no_intensity_stats",
+            "with_normal",
+        }
+        if self.anchor_token_variant not in allowed_token_variants:
+            raise ValueError(
+                "anchor_token_variant must be one of "
+                f"{sorted(allowed_token_variants)}; got {self.anchor_token_variant!r}"
+            )
+        allowed_filter_modes = {"residual", "residual_planarity"}
+        if self.anchor_filter_mode not in allowed_filter_modes:
+            raise ValueError(
+                f"anchor_filter_mode must be one of {sorted(allowed_filter_modes)}; "
+                f"got {self.anchor_filter_mode!r}"
+            )
+        if self.anchor_token_variant == "with_normal":
+            self.anchor_token_dim = 25
+        elif self.anchor_token_dim != 22:
+            raise ValueError(
+                "anchor_token_dim must remain 22 except for "
+                "anchor_token_variant='with_normal'"
+            )
+        if self.ptv3_model_in_channels is None:
+            self.ptv3_model_in_channels = self.resolved_input_channels()
+
+    def resolved_input_channels(self) -> int:
+        if self.primitive_mode == "per_point":
+            return int(self.input_feature_dim)
+        return int(self.anchor_token_dim)
 
     def ptv3_backbone_kwargs(self) -> dict:
         return {

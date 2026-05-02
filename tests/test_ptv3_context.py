@@ -6,8 +6,9 @@ import pytest
 import torch
 import torch.nn as nn
 
-from config import OFFICIAL_FULL_PTV3_BACKBONE_PARAMS, QGSConfig
-from nn.model import QGSModel
+from config import OFFICIAL_FULL_PTV3_BACKBONE_PARAMS, QGSConfig, resolve_lidar_latent_dim
+from nn.model import LIDAR_LATENT_DIM, QGSModel
+from nn.ptv3.model import Point
 from nn.ptv3.wrapper import PTv3Backbone
 
 
@@ -18,6 +19,8 @@ class _RecorderBackbone(nn.Module):
         super().__init__()
         self.out_channels = out_channels
         self.seen_context_type: str | None = None
+        self.seen_feature_width: int | None = None
+        self.seen_offsets: torch.Tensor | None = None
 
     def forward(
         self,
@@ -25,8 +28,11 @@ class _RecorderBackbone(nn.Module):
         point_features: torch.Tensor,
         *,
         context_type: str,
+        offsets: torch.Tensor | None = None,
     ) -> torch.Tensor:
         self.seen_context_type = context_type
+        self.seen_feature_width = int(point_features.shape[1])
+        self.seen_offsets = offsets
         return torch.zeros(xyz.shape[0], self.out_channels, device=xyz.device, dtype=xyz.dtype)
 
 
@@ -103,11 +109,34 @@ def _stub_geom_init(points: torch.Tensor, neighbors: torch.Tensor, k_eff: torch.
     }
 
 
+def _anchor_output(num_anchors: int, token_width: int = 22):
+    from models.geometry.voxel_anchor import VoxelAnchorOutput
+
+    return VoxelAnchorOutput(
+        c_init=torch.randn(num_anchors, 3),
+        R_init=torch.eye(3).view(1, 3, 3).expand(num_anchors, 3, 3).contiguous(),
+        s_init=torch.full((num_anchors, 3), 0.1),
+        kappa1=torch.zeros(num_anchors),
+        kappa2=torch.zeros(num_anchors),
+        fit_quality=torch.zeros(num_anchors, 4),
+        tangent_aniso=torch.zeros(num_anchors),
+        curvature_aniso=torch.zeros(num_anchors),
+        n_points=torch.full((num_anchors,), 8, dtype=torch.long),
+        i_mean=torch.full((num_anchors,), 0.5),
+        i_std=torch.zeros(num_anchors),
+        src_ratio=torch.zeros(num_anchors),
+        token=torch.randn(num_anchors, token_width),
+        use_geom_init=torch.ones(num_anchors, dtype=torch.bool),
+        k_eff=torch.full((num_anchors,), 8, dtype=torch.long),
+        diagnostics={"query_voxels": num_anchors, "final_anchors": num_anchors},
+    )
+
+
 def test_qgs_model_forward_context_rejects_invalid_context_type(monkeypatch):
     backbone = _ContextAgnosticBackbone(8)
     monkeypatch.setattr("nn.model.PTv3Backbone", lambda *args, **kwargs: backbone)
 
-    model = QGSModel(QGSConfig(feature_dim=8, lidar_latent_dim=16))
+    model = QGSModel(QGSConfig(feature_dim=8, lidar_latent_dim=LIDAR_LATENT_DIM, primitive_mode="per_point"))
     xyz = torch.zeros(4, 3)
     intensity = torch.zeros(4)
 
@@ -116,7 +145,7 @@ def test_qgs_model_forward_context_rejects_invalid_context_type(monkeypatch):
 
 
 def test_qgs_model_forward_context_passes_context_type_to_opt_in_backbone(monkeypatch):
-    cfg = QGSConfig(feature_dim=8, lidar_latent_dim=16)
+    cfg = QGSConfig(feature_dim=8, lidar_latent_dim=LIDAR_LATENT_DIM, primitive_mode="per_point")
     recorder = _RecorderBackbone(cfg.feature_dim)
     monkeypatch.setattr("nn.model.PTv3Backbone", lambda *args, **kwargs: recorder)
 
@@ -144,7 +173,7 @@ def test_qgs_model_keeps_context_api_with_context_agnostic_backbone(monkeypatch)
     backbone = _ContextAgnosticBackbone(8)
     monkeypatch.setattr("nn.model.PTv3Backbone", lambda *args, **kwargs: backbone)
 
-    cfg = QGSConfig(feature_dim=8, lidar_latent_dim=16)
+    cfg = QGSConfig(feature_dim=8, lidar_latent_dim=LIDAR_LATENT_DIM, primitive_mode="per_point")
     model = QGSModel(cfg)
     model.qgs_head = _StubHead(cfg.lidar_latent_dim)
 
@@ -162,6 +191,73 @@ def test_qgs_model_keeps_context_api_with_context_agnostic_backbone(monkeypatch)
     )
 
     assert out["means3D"].shape == (6, 3)
+
+
+def test_qgs_config_validates_primitive_mode():
+    with pytest.raises(ValueError, match="primitive_mode"):
+        QGSConfig(primitive_mode="bad")
+
+
+def test_qgs_config_auto_resolves_lidar_latent_dim_from_extension():
+    cfg = QGSConfig()
+
+    assert cfg.lidar_latent_dim == LIDAR_LATENT_DIM
+    assert resolve_lidar_latent_dim(None) == LIDAR_LATENT_DIM
+
+
+def test_qgs_config_rejects_explicit_lidar_latent_dim_mismatch():
+    with pytest.raises(ValueError, match="LIDAR_LATENT_DIM"):
+        QGSConfig(lidar_latent_dim=LIDAR_LATENT_DIM + 1)
+
+
+def test_qgs_model_uses_mode_specific_input_width(monkeypatch):
+    seen = []
+
+    def _make_backbone(*args, **kwargs):
+        seen.append((kwargs["in_channels"] if "in_channels" in kwargs else args[0], kwargs))
+        return _ContextAgnosticBackbone(kwargs["out_channels"])
+
+    monkeypatch.setattr("nn.model.PTv3Backbone", _make_backbone)
+
+    QGSModel(QGSConfig(primitive_mode="per_point", feature_dim=8, lidar_latent_dim=LIDAR_LATENT_DIM))
+    QGSModel(QGSConfig(primitive_mode="voxel_anchor", feature_dim=8, lidar_latent_dim=LIDAR_LATENT_DIM))
+
+    assert seen[0][0] == 8
+    assert seen[1][0] == 22
+
+
+def test_qgs_model_forward_anchor_context_uses_22d_token(monkeypatch):
+    cfg = QGSConfig(primitive_mode="voxel_anchor", feature_dim=8, lidar_latent_dim=LIDAR_LATENT_DIM)
+    recorder = _RecorderBackbone(cfg.feature_dim)
+    monkeypatch.setattr("nn.model.PTv3Backbone", lambda *args, **kwargs: recorder)
+
+    model = QGSModel(cfg)
+    model.qgs_head = _StubHead(cfg.lidar_latent_dim)
+    out = model.forward_anchor_context(_anchor_output(3), context_type="dynamic")
+
+    assert recorder.seen_context_type == "dynamic"
+    assert recorder.seen_feature_width == 22
+    assert out["means3D"].shape == (3, 3)
+
+
+def test_qgs_model_forward_anchor_contexts_batched_preserves_empty_slots(monkeypatch):
+    cfg = QGSConfig(primitive_mode="voxel_anchor", feature_dim=8, lidar_latent_dim=LIDAR_LATENT_DIM)
+    recorder = _RecorderBackbone(cfg.feature_dim)
+    monkeypatch.setattr("nn.model.PTv3Backbone", lambda *args, **kwargs: recorder)
+
+    model = QGSModel(cfg)
+    model.qgs_head = _StubHead(cfg.lidar_latent_dim)
+    outs = model.forward_anchor_contexts_batched(
+        [_anchor_output(2), _anchor_output(0), _anchor_output(1)],
+        context_type="dynamic",
+    )
+
+    assert outs[0] is not None
+    assert outs[1] is None
+    assert outs[2] is not None
+    assert recorder.seen_offsets.tolist() == [2, 3]
+    assert outs[0]["aux"]["g_rot"].shape == (1, 2)
+    assert outs[2]["aux"]["g_rot"].shape == (1, 1)
 
 
 def test_ptv3_backbone_forwards_condition_with_native_8ch_input():
@@ -226,26 +322,52 @@ def test_ptv3_backbone_rejects_point_count_mismatch():
         backbone(xyz, feats)
 
 
+def test_ptv3_serialization_accepts_single_grid_cell_cloud():
+    point = Point(
+        coord=torch.zeros(12, 3),
+        feat=torch.randn(12, 22),
+        grid_size=0.1,
+        offset=torch.tensor([6, 12], dtype=torch.long),
+    )
+
+    point.serialization(order=("hilbert", "hilbert-trans"))
+
+    assert point.serialized_depth == 1
+    assert point.serialized_code.shape == (2, 12)
+
+
 def test_qgs_config_defaults_to_official_full_with_context_branches():
     cfg = QGSConfig()
-    assert cfg.ptv3_model_in_channels == 8
+    assert cfg.primitive_mode == "voxel_anchor"
+    assert cfg.ptv3_model_in_channels == 22
+    assert cfg.resolved_input_channels() == 22
     assert cfg.ptv3_batch_norm_eval is True
     assert cfg.ptv3_decoupled_stem is True
     assert cfg.ptv3_pdnorm_bn is True
     assert cfg.ptv3_pdnorm_ln is True
     assert tuple(cfg.ptv3_condition_names) == ("static", "dynamic")
-    assert tuple(cfg.ptv3_stride) == (2, 2, 2, 2)
-    assert tuple(cfg.ptv3_enc_depths) == (2, 2, 2, 6, 2)
-    assert tuple(cfg.ptv3_enc_channels) == (32, 64, 128, 256, 512)
-    assert tuple(cfg.ptv3_dec_depths) == (2, 2, 2, 2)
-    assert tuple(cfg.ptv3_dec_channels) == (64, 64, 128, 256)
+    assert tuple(cfg.ptv3_stride) == (2, 2)
+    assert tuple(cfg.ptv3_enc_depths) == (2, 2, 4)
+    assert tuple(cfg.ptv3_enc_channels) == (32, 64, 128)
+    assert tuple(cfg.ptv3_dec_depths) == (2, 2)
+    assert tuple(cfg.ptv3_dec_channels) == (64, 128)
 
 
 def test_legacy_unbranched_official_full_parameter_count_matches_target():
     cfg = QGSConfig(
+        primitive_mode="per_point",
         ptv3_decoupled_stem=False,
         ptv3_pdnorm_bn=False,
         ptv3_pdnorm_ln=False,
+        ptv3_stride=(2, 2, 2, 2),
+        ptv3_enc_depths=(2, 2, 2, 6, 2),
+        ptv3_enc_channels=(32, 64, 128, 256, 512),
+        ptv3_enc_num_head=(2, 4, 8, 16, 32),
+        ptv3_enc_patch_size=(1024, 1024, 1024, 1024, 1024),
+        ptv3_dec_depths=(2, 2, 2, 2),
+        ptv3_dec_channels=(64, 64, 128, 256),
+        ptv3_dec_num_head=(4, 4, 8, 16),
+        ptv3_dec_patch_size=(1024, 1024, 1024, 1024),
     )
     backbone_kwargs = cfg.ptv3_backbone_kwargs()
     backbone_kwargs["enable_flash"] = False

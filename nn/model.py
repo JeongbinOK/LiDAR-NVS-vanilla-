@@ -15,6 +15,7 @@ from torch import Tensor
 from diff_quadratic_rasterization import LIDAR_LATENT_DIM
 from models.geometry.knn_radius import gather_neighbors, hybrid_radius_knn
 from models.geometry.quadric_fit import fit_local_quadrics
+from models.geometry.voxel_anchor import VoxelAnchorOutput
 from models.head.qgs_head import QGSHead
 from nn.ptv3.wrapper import PTv3Backbone, validate_context_type
 from nn.render_utils import rotmat_to_quat
@@ -42,12 +43,22 @@ class QGSModel(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         D = cfg.feature_dim
-        self.input_feature_dim = int(getattr(cfg, "input_feature_dim", 8))
+        self.primitive_mode = getattr(cfg, "primitive_mode", "per_point")
+        self.input_feature_dim = int(
+            cfg.resolved_input_channels()
+            if hasattr(cfg, "resolved_input_channels")
+            else getattr(cfg, "input_feature_dim", 8)
+        )
+        backbone_kwargs = cfg.ptv3_backbone_kwargs()
+        backbone_kwargs["model_in_channels"] = max(
+            int(backbone_kwargs.get("model_in_channels", self.input_feature_dim)),
+            self.input_feature_dim,
+        )
 
         self.backbone = PTv3Backbone(
             in_channels=self.input_feature_dim,
             out_channels=D,
-            **cfg.ptv3_backbone_kwargs(),
+            **backbone_kwargs,
         )
 
         latent_dim = getattr(cfg, "lidar_latent_dim", LIDAR_LATENT_DIM)
@@ -82,6 +93,73 @@ class QGSModel(nn.Module):
         self.quadric_eps_kappa = float(getattr(cfg, "quadric_eps_kappa", 1e-3))
         self.quadric_eps_s = float(getattr(cfg, "quadric_eps_s", 1e-3))
         self.quadric_eps_s3 = float(getattr(cfg, "quadric_eps_s3", 1e-4))
+
+    def _run_backbone(
+        self,
+        xyz: Tensor,
+        point_features: Tensor,
+        *,
+        context_type: str,
+        offsets: Tensor | None = None,
+    ) -> Tensor:
+        backbone_kwargs = {}
+        if offsets is not None:
+            backbone_kwargs["offsets"] = offsets
+        if getattr(self.backbone, "supports_context_type", False):
+            backbone_kwargs["context_type"] = context_type
+        if xyz.is_cuda:
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                features = self.backbone(xyz, point_features, **backbone_kwargs)
+            return features.float()
+        return self.backbone(xyz, point_features, **backbone_kwargs)
+
+    @staticmethod
+    def _geom_init_from_anchor(anchor_out: VoxelAnchorOutput) -> dict:
+        return {
+            "c_init": anchor_out.c_init.unsqueeze(0),
+            "R_init": anchor_out.R_init.unsqueeze(0),
+            "s_init": anchor_out.s_init.unsqueeze(0),
+            "fit_quality": anchor_out.fit_quality.unsqueeze(0),
+            "use_geom_init": anchor_out.use_geom_init.unsqueeze(0),
+            "kappa1_init": anchor_out.kappa1.unsqueeze(0),
+            "kappa2_init": anchor_out.kappa2.unsqueeze(0),
+            "tangent_aniso": anchor_out.tangent_aniso.unsqueeze(0),
+            "curvature_aniso": anchor_out.curvature_aniso.unsqueeze(0),
+        }
+
+    @staticmethod
+    def _pack_primitives(
+        head_out: dict,
+        features: Tensor,
+        geom_init: dict,
+        k_eff: Tensor,
+        diagnostics: dict | None = None,
+    ) -> dict:
+        R = head_out["R"][0]
+        rotations = rotmat_to_quat(R)
+        return {
+            "means3D": head_out["center"][0],
+            "scales": head_out["s"][0],
+            "rotations": rotations,
+            "opacities": head_out["alpha"][0].unsqueeze(-1),
+            "intensity": head_out["intensity"][0],
+            "latent": head_out["latent"][0],
+            "features": features,
+            "aux": head_out["aux"],
+            "geom_init": geom_init,
+            "k_eff": k_eff,
+            "diagnostics": diagnostics or {"memory_stages": []},
+        }
+
+    @staticmethod
+    def _slice_aux(aux: dict, start: int, end: int) -> dict:
+        sliced = {}
+        for key, value in aux.items():
+            if torch.is_tensor(value) and value.dim() >= 2 and value.shape[0] == 1:
+                sliced[key] = value[:, start:end]
+            else:
+                sliced[key] = value
+        return sliced
 
     # ------------------------------------------------------------------
     def _build_point_features(
@@ -218,15 +296,9 @@ class QGSModel(nn.Module):
         # (quadric fit, head) runs in fp32 to avoid linalg dtype mismatches.
         if return_diagnostics and device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
-        backbone_kwargs = {}
-        if getattr(self.backbone, "supports_context_type", False):
-            backbone_kwargs["context_type"] = context_type
-        if xyz.is_cuda:
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                features = self.backbone(xyz, point_features, **backbone_kwargs)
-            features = features.float()
-        else:
-            features = self.backbone(xyz, point_features, **backbone_kwargs)
+        features = self._run_backbone(
+            xyz, point_features, context_type=context_type
+        )
         _record_stage("backbone")
         if features.shape[0] != N:
             raise RuntimeError(
@@ -288,23 +360,154 @@ class QGSModel(nn.Module):
         )
         _record_stage("head")
 
-        # 5. Pack primitives for the rasterizer (drop the batch dim).
-        R = head_out["R"][0]                                        # [N, 3, 3]
-        rotations = rotmat_to_quat(R)                               # [N, 4]
+        return self._pack_primitives(head_out, features, geom_init, knn["k_eff"], diagnostics)
 
-        return {
-            "means3D":   head_out["center"][0],                     # [N, 3]
-            "scales":    head_out["s"][0],                          # [N, 3]
-            "rotations": rotations,                                 # [N, 4]
-            "opacities": head_out["alpha"][0].unsqueeze(-1),        # [N, 1]
-            "intensity": head_out["intensity"][0],                  # [N]
-            "latent":    head_out["latent"][0],                     # [N, L]
-            "features":  features,                                  # [N, D]
-            "aux":       head_out["aux"],
-            "geom_init": geom_init,
-            "k_eff":     knn["k_eff"],
-            "diagnostics": diagnostics,
+    def forward_anchor_context(
+        self,
+        anchor_out: VoxelAnchorOutput,
+        *,
+        context_type: str,
+        return_diagnostics: bool = False,
+    ) -> dict | None:
+        """Predict primitives from a post-filter voxel-anchor output."""
+        context_type = validate_context_type(context_type)
+        N = int(anchor_out.c_init.shape[0])
+        if N == 0:
+            return None
+        if anchor_out.token.shape != (N, self.input_feature_dim):
+            raise ValueError(
+                f"anchor token must be [{N}, {self.input_feature_dim}], "
+                f"got {tuple(anchor_out.token.shape)}"
+            )
+
+        diagnostics = {"memory_stages": []}
+        if return_diagnostics and anchor_out.c_init.device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(anchor_out.c_init.device)
+
+        features = self._run_backbone(
+            anchor_out.c_init,
+            anchor_out.token,
+            context_type=context_type,
+        )
+        if features.shape[0] != N:
+            raise RuntimeError(
+                f"Backbone changed anchor count: {N} → {features.shape[0]}"
+            )
+        geom_init = self._geom_init_from_anchor(anchor_out)
+        is_dynamic = torch.full(
+            (1, N),
+            1.0 if context_type == "dynamic" else 0.0,
+            device=features.device,
+            dtype=features.dtype,
+        )
+        head_out = self.qgs_head(
+            features.unsqueeze(0),
+            geom_init,
+            is_dynamic,
+            intensity_input=anchor_out.i_mean.unsqueeze(0),
+        )
+        return self._pack_primitives(
+            head_out,
+            features,
+            geom_init,
+            anchor_out.k_eff,
+            diagnostics,
+        )
+
+    def forward_anchor_contexts_batched(
+        self,
+        anchor_outputs: list[VoxelAnchorOutput | None],
+        *,
+        context_type: str = "dynamic",
+    ) -> list[dict | None]:
+        """Run PTv3 once over non-empty voxel-anchor outputs and split back."""
+        if not anchor_outputs:
+            return []
+        context_type = validate_context_type(context_type)
+        valid_indices = [
+            idx for idx, out in enumerate(anchor_outputs)
+            if out is not None and out.c_init.shape[0] > 0
+        ]
+        results: list[dict | None] = [None] * len(anchor_outputs)
+        if not valid_indices:
+            return results
+
+        valid = [anchor_outputs[idx] for idx in valid_indices]
+        assert all(out is not None for out in valid)
+        sizes = [int(out.c_init.shape[0]) for out in valid if out is not None]
+        cat_xyz = torch.cat([out.c_init for out in valid if out is not None], dim=0)
+        cat_token = torch.cat([out.token for out in valid if out is not None], dim=0)
+        if cat_token.shape[1] != self.input_feature_dim:
+            raise ValueError(
+                f"anchor token width {cat_token.shape[1]} does not match "
+                f"model input width {self.input_feature_dim}"
+            )
+        offsets = torch.cumsum(
+            torch.tensor(sizes, dtype=torch.long, device=cat_xyz.device), dim=0
+        )
+        features = self._run_backbone(
+            cat_xyz,
+            cat_token,
+            context_type=context_type,
+            offsets=offsets,
+        )
+
+        geom_init = {
+            "c_init": torch.cat([out.c_init for out in valid if out is not None], dim=0).unsqueeze(0),
+            "R_init": torch.cat([out.R_init for out in valid if out is not None], dim=0).unsqueeze(0),
+            "s_init": torch.cat([out.s_init for out in valid if out is not None], dim=0).unsqueeze(0),
+            "fit_quality": torch.cat([out.fit_quality for out in valid if out is not None], dim=0).unsqueeze(0),
+            "use_geom_init": torch.cat([out.use_geom_init for out in valid if out is not None], dim=0).unsqueeze(0),
+            "kappa1_init": torch.cat([out.kappa1 for out in valid if out is not None], dim=0).unsqueeze(0),
+            "kappa2_init": torch.cat([out.kappa2 for out in valid if out is not None], dim=0).unsqueeze(0),
+            "tangent_aniso": torch.cat([out.tangent_aniso for out in valid if out is not None], dim=0).unsqueeze(0),
+            "curvature_aniso": torch.cat([out.curvature_aniso for out in valid if out is not None], dim=0).unsqueeze(0),
         }
+        k_eff = torch.cat([out.k_eff for out in valid if out is not None], dim=0)
+        i_mean = torch.cat([out.i_mean for out in valid if out is not None], dim=0)
+        is_dynamic = torch.full(
+            (1, cat_xyz.shape[0]),
+            1.0 if context_type == "dynamic" else 0.0,
+            device=features.device,
+            dtype=features.dtype,
+        )
+        head_out = self.qgs_head(
+            features.unsqueeze(0),
+            geom_init,
+            is_dynamic,
+            intensity_input=i_mean.unsqueeze(0),
+        )
+
+        center_splits = torch.split(head_out["center"][0], sizes, dim=0)
+        scale_splits = torch.split(head_out["s"][0], sizes, dim=0)
+        rot_splits = torch.split(rotmat_to_quat(head_out["R"][0]), sizes, dim=0)
+        alpha_splits = torch.split(head_out["alpha"][0].unsqueeze(-1), sizes, dim=0)
+        int_splits = torch.split(head_out["intensity"][0], sizes, dim=0)
+        latent_splits = torch.split(head_out["latent"][0], sizes, dim=0)
+        feat_splits = torch.split(features, sizes, dim=0)
+        k_eff_splits = torch.split(k_eff, sizes, dim=0)
+
+        start = 0
+        for local_idx, orig_idx in enumerate(valid_indices):
+            out = valid[local_idx]
+            assert out is not None
+            end = start + sizes[local_idx]
+            sub_geom = self._geom_init_from_anchor(out)
+            results[orig_idx] = {
+                "means3D": center_splits[local_idx],
+                "scales": scale_splits[local_idx],
+                "rotations": rot_splits[local_idx],
+                "opacities": alpha_splits[local_idx],
+                "intensity": int_splits[local_idx],
+                "latent": latent_splits[local_idx],
+                "features": feat_splits[local_idx],
+                "aux": self._slice_aux(head_out["aux"], start, end),
+                "geom_init": sub_geom,
+                "k_eff": k_eff_splits[local_idx],
+                "diagnostics": {"memory_stages": []},
+            }
+            start = end
+        return results
 
     def forward_contexts_batched(
         self,
@@ -390,15 +593,12 @@ class QGSModel(nn.Module):
         )
 
         # 2. Backbone (single call, batched via offsets)
-        backbone_kwargs = {"offsets": offsets}
-        if getattr(self.backbone, "supports_context_type", False):
-            backbone_kwargs["context_type"] = context_type
-        if cat_xyz.is_cuda:
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                features = self.backbone(cat_xyz, point_features, **backbone_kwargs)
-            features = features.float()
-        else:
-            features = self.backbone(cat_xyz, point_features, **backbone_kwargs)
+        features = self._run_backbone(
+            cat_xyz,
+            point_features,
+            context_type=context_type,
+            offsets=offsets,
+        )
         if features.shape[0] != N_total:
             raise RuntimeError(
                 f"Backbone changed point count: {N_total} → {features.shape[0]}"

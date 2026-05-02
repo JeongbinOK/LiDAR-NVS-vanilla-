@@ -136,6 +136,7 @@ def test_load_cfg_from_checkpoint_preserves_legacy_ptv3_stem_width(tmp_path):
     cfg = load_cfg_from_checkpoint(str(checkpoint_path))
 
     assert cfg.input_feature_dim == 8
+    assert cfg.primitive_mode == "per_point"
     assert cfg.ptv3_model_in_channels == 8
     assert cfg.ptv3_decoupled_stem is False
     assert cfg.ptv3_pdnorm_bn is False

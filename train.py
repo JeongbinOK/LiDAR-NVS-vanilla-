@@ -26,11 +26,12 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from config import OFFICIAL_FULL_PTV3_BACKBONE_PARAMS, QGSConfig
+from config import OFFICIAL_FULL_PTV3_BACKBONE_PARAMS, QGSConfig, resolve_lidar_latent_dim
 sys.path.insert(0, os.path.join(os.path.expanduser(QGSConfig.data_root), "loader"))
 from dataset import NuScenesNVSDataset, nvs_collate_fn
 
 from models.geometry import decompose_scene
+from models.geometry.voxel_anchor import DynamicVoxelAnchorBuilder, VoxelAnchorBuilder
 from models.head import DropHead, make_lidar_ray_grid
 from nn.model import QGSModel
 from nn.qgs_loss import QGSLoss
@@ -185,6 +186,30 @@ def _build_scene_primitives(
     return primitives, xyz
 
 
+def _make_static_anchor_builder(cfg: QGSConfig) -> VoxelAnchorBuilder:
+    return VoxelAnchorBuilder(
+        k_min=cfg.knn_k_min,
+        k_target=cfg.knn_k_target,
+        residual_threshold=cfg.anchor_residual_threshold,
+        filter_mode=cfg.anchor_filter_mode,
+        planarity_threshold=cfg.anchor_planarity_threshold,
+        token_variant=cfg.anchor_token_variant,
+        knn_chunk_size=min(cfg.knn_chunk_size, 256),
+    )
+
+
+def _make_dynamic_anchor_builder(cfg: QGSConfig) -> DynamicVoxelAnchorBuilder:
+    return DynamicVoxelAnchorBuilder(
+        k_min=cfg.knn_k_min,
+        k_target=cfg.knn_k_target,
+        residual_threshold=cfg.anchor_residual_threshold,
+        filter_mode=cfg.anchor_filter_mode,
+        planarity_threshold=cfg.anchor_planarity_threshold,
+        token_variant=cfg.anchor_token_variant,
+        knn_chunk_size=min(cfg.knn_chunk_size, 256),
+    )
+
+
 def _transform_primitives(primitives: dict, T: torch.Tensor) -> dict:
     R = quat_to_rotmat(primitives["rotations"])
     R_out = T[:3, :3] @ R
@@ -222,6 +247,47 @@ def _concat_primitives(primitives: list[dict]) -> dict:
         else:
             out[key] = values
     return out
+
+
+@torch.no_grad()
+def _primitive_residual_stats(primitives: list[dict]) -> dict[str, torch.Tensor]:
+    """Aggregate QGSHead residual/gate magnitudes for train-time diagnostics."""
+    rows = []
+    weights = []
+    for prim in primitives:
+        aux = prim.get("aux", {})
+        if not aux:
+            continue
+        n = int(prim["means3D"].shape[0])
+        if n == 0:
+            continue
+        omega_deg = aux["omega_local"][0].abs() * (180.0 / math.pi)
+        row = {
+            "diag_g_rot": aux["g_rot"][0].mean(),
+            "diag_g_center": aux["g_center"][0].mean(),
+            "diag_g_scale": aux["g_scale"][0].mean(),
+            "diag_omega_deg": omega_deg.norm(dim=-1).mean(),
+            "diag_delta_c": aux["delta_c"][0].norm(dim=-1).mean(),
+            "diag_delta_mu": aux["delta_mu"][0].abs().mean(),
+            "diag_delta_gap": aux["delta_gap"][0].abs().mean(),
+            "diag_delta_s3": aux["delta_log_abs_s3"][0].abs().mean(),
+            "diag_delta_int": aux["delta_logit_intensity"][0].abs().mean(),
+        }
+        rows.append(row)
+        weights.append(n)
+
+    if not rows:
+        return {}
+
+    total = float(sum(weights))
+    stats = {}
+    for key in rows[0]:
+        vals = torch.stack([
+            row[key] * (weight / total)
+            for row, weight in zip(rows, weights)
+        ])
+        stats[key] = vals.sum()
+    return stats
 
 
 def process_pair(model, loss_fn, drop_head, ray_dir, batch, idx, device, cfg):
@@ -270,26 +336,29 @@ def process_pair(model, loss_fn, drop_head, ray_dir, batch, idx, device, cfg):
     e_dir = rel_input_1_pose[:3, 3].to(dtype=xyz0.dtype, device=device)
     inv_pose = torch.linalg.inv(rel_input_1_pose)
 
-    static_xyz = scene["static_xyz"].to(device)
-    static_i = scene["static_intensity"].to(device)
-    static_t = scene["static_time"].to(device)
-    static_flag = torch.zeros(static_xyz.shape[0], device=device, dtype=static_xyz.dtype)
-    static_prims, _ = _build_scene_primitives(
-        model, cfg, static_xyz, static_i,
-        context_type="static",
-        time_scalar=static_t, ego_motion=e_dir,
-        is_dynamic_flag=static_flag,
-    )
-
     frame0_primitives = []
     frame1_primitives = []
-
-    if static_prims is not None:
-        frame0_primitives.append(static_prims)
-        frame1_primitives.append(static_prims)
+    diagnostic_primitives = []
 
     dyn_list = scene["dynamic"]
-    if dyn_list:
+    if cfg.primitive_mode == "per_point":
+        static_xyz = scene["static_xyz"].to(device)
+        static_i = scene["static_intensity"].to(device)
+        static_t = scene["static_time"].to(device)
+        static_flag = torch.zeros(static_xyz.shape[0], device=device, dtype=static_xyz.dtype)
+        static_prims, _ = _build_scene_primitives(
+            model, cfg, static_xyz, static_i,
+            context_type="static",
+            time_scalar=static_t, ego_motion=e_dir,
+            is_dynamic_flag=static_flag,
+        )
+
+        if static_prims is not None:
+            diagnostic_primitives.append(static_prims)
+            frame0_primitives.append(static_prims)
+            frame1_primitives.append(static_prims)
+
+    if cfg.primitive_mode == "per_point" and dyn_list:
         dyn_xyz_list = [d["canonical_xyz"].to(device) for d in dyn_list]
         dyn_int_list = [d["canonical_intensity"].to(device) for d in dyn_list]
         dyn_time_list = [d["canonical_time"].to(device) for d in dyn_list]
@@ -302,10 +371,54 @@ def process_pair(model, loss_fn, drop_head, ray_dir, batch, idx, device, cfg):
         for dyn, dyn_prims in zip(dyn_list, dyn_prims_list):
             if dyn_prims is None:
                 continue
+            diagnostic_primitives.append(dyn_prims)
             if dyn.get("box_0") is not None:
                 frame0_primitives.append(_transform_primitives(dyn_prims, _box_to_pose(dyn["box_0"].to(device))))
             if dyn.get("box_1") is not None:
                 frame1_primitives.append(_transform_primitives(dyn_prims, _box_to_pose(dyn["box_1"].to(device))))
+    elif cfg.primitive_mode == "voxel_anchor":
+        dyn_anchor_outputs = []
+        if dyn_list:
+            dynamic_builder = _make_dynamic_anchor_builder(cfg)
+            dyn_anchor_pairs = dynamic_builder(dyn_list)
+            dyn_anchor_outputs = [out for _, out in dyn_anchor_pairs]
+            dyn_prims_list = model.forward_anchor_contexts_batched(
+                dyn_anchor_outputs,
+                context_type="dynamic",
+            )
+        else:
+            dyn_prims_list = []
+
+        static_xyz_parts = [scene["static_xyz"].to(device)]
+        static_i_parts = [scene["static_intensity"].to(device)]
+        static_t_parts = [scene["static_time"].to(device)]
+        for dyn, dyn_anchor_out, dyn_prims in zip(dyn_list, dyn_anchor_outputs, dyn_prims_list):
+            if dyn_prims is None or dyn_anchor_out.c_init.shape[0] == 0:
+                static_xyz_parts.append(dyn["fallback_xyz"].to(device))
+                static_i_parts.append(dyn["fallback_intensity"].to(device))
+                static_t_parts.append(dyn["fallback_time"].to(device))
+                continue
+            diagnostic_primitives.append(dyn_prims)
+            if dyn.get("box_0") is not None:
+                frame0_primitives.append(_transform_primitives(dyn_prims, _box_to_pose(dyn["box_0"].to(device))))
+            if dyn.get("box_1") is not None:
+                frame1_primitives.append(_transform_primitives(dyn_prims, _box_to_pose(dyn["box_1"].to(device))))
+
+        static_xyz = torch.cat(static_xyz_parts, dim=0)
+        static_i = torch.cat(static_i_parts, dim=0)
+        static_t = torch.cat(static_t_parts, dim=0)
+        src = static_t
+        static_anchor_out = _make_static_anchor_builder(cfg)(static_xyz, static_i, src)
+        static_prims = model.forward_anchor_context(
+            static_anchor_out,
+            context_type="static",
+        )
+        if static_prims is not None:
+            diagnostic_primitives.append(static_prims)
+            frame0_primitives.append(static_prims)
+            frame1_primitives.append(static_prims)
+    else:
+        raise ValueError(f"unsupported primitive_mode {cfg.primitive_mode!r}")
 
     frame0 = _concat_primitives(frame0_primitives)
     frame1 = _concat_primitives(frame1_primitives)
@@ -383,6 +496,7 @@ def process_pair(model, loss_fn, drop_head, ray_dir, batch, idx, device, cfg):
         "n_valid": 0.5 * (loss0["n_valid"] + loss1["n_valid"]),
         "valid_ratio": 0.5 * (loss0["valid_ratio"] + loss1["valid_ratio"]),
     }
+    loss_dict.update(_primitive_residual_stats(diagnostic_primitives))
     return loss_dict
 
 
@@ -633,6 +747,8 @@ def train(cfg: QGSConfig, overfit_frames: int = 0, resume: str = ""):
                 drop=f"{avg_batch['raydrop']:.3f}",
                 dist=f"{avg_batch.get('distortion', 0.0):.4f}",
                 nrm=f"{avg_batch.get('normal', 0.0):.4f}",
+                dC=f"{avg_batch.get('diag_delta_c', 0.0):.3f}",
+                dI=f"{avg_batch.get('diag_delta_int', 0.0):.3f}",
                 lr=f"{cur_lr_b:.1e}/{cur_lr_h:.1e}",
             )
 
@@ -653,9 +769,20 @@ def train(cfg: QGSConfig, overfit_frames: int = 0, resume: str = ""):
             f"dist={avg.get('distortion', 0.0):.3f} "
             f"nrm={avg.get('normal', 0.0):.3f} "
             f"valid={avg.get('valid_ratio', 0.0):.3f} "
+            f"dC={avg.get('diag_delta_c', 0.0):.4f} "
+            f"dOmega={avg.get('diag_omega_deg', 0.0):.3f}deg "
+            f"dMu={avg.get('diag_delta_mu', 0.0):.4f} "
+            f"dGap={avg.get('diag_delta_gap', 0.0):.4f} "
+            f"dS3={avg.get('diag_delta_s3', 0.0):.4f} "
+            f"dI={avg.get('diag_delta_int', 0.0):.4f} "
+            f"g={avg.get('diag_g_rot', 0.0):.3f}/"
+            f"{avg.get('diag_g_center', 0.0):.3f}/"
+            f"{avg.get('diag_g_scale', 0.0):.3f} "
             f"{dt:.1f}s"
         )
         tqdm.write(log)
+        with open(os.path.join(run_dir, "train_metrics.jsonl"), "a") as f:
+            f.write(json.dumps({"epoch": epoch + 1, **avg}) + "\n")
 
         model_has_nan = any(
             torch.isnan(p).any() or torch.isinf(p).any()
@@ -695,8 +822,23 @@ def train(cfg: QGSConfig, overfit_frames: int = 0, resume: str = ""):
 def _load_config(path: str) -> QGSConfig:
     with open(path) as f:
         raw = json.load(f)
+    if "primitive_mode" not in raw:
+        raw["primitive_mode"] = "per_point"
+    if "ptv3_model_in_channels" not in raw:
+        raw["ptv3_model_in_channels"] = raw.get("input_feature_dim", QGSConfig.input_feature_dim)
     allowed = {field.name for field in dataclasses.fields(QGSConfig)}
     return QGSConfig(**{k: v for k, v in raw.items() if k in allowed})
+
+
+def _load_config_for_resume(checkpoint_path: str) -> QGSConfig | None:
+    cfg_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(checkpoint_path))),
+        "configs",
+        "config.json",
+    )
+    if not os.path.isfile(cfg_path):
+        return None
+    return _load_config(cfg_path)
 
 
 def main():
@@ -708,14 +850,44 @@ def main():
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--lidar-latent-dim", type=int, default=None)
     parser.add_argument("--overfit", type=int, default=0,
                         help="Overfit on N pairs (0 = full training)")
     parser.add_argument("--resume", type=str, default="",
                         help="Path to checkpoint to resume training from")
     parser.add_argument("--device", default=None)
+    parser.add_argument("--primitive-mode", choices=("voxel_anchor", "per_point"), default=None)
+    parser.add_argument(
+        "--anchor-token-variant",
+        choices=("full", "no_fit_quality", "no_intensity_stats", "with_normal"),
+        default=None,
+        help="Voxel-anchor token ablation variant",
+    )
+    parser.add_argument(
+        "--anchor-filter-mode",
+        choices=("residual", "residual_planarity"),
+        default=None,
+        help="Voxel-anchor hard-filter ablation mode",
+    )
+    parser.add_argument(
+        "--anchor-residual-threshold",
+        type=float,
+        default=None,
+        help="Voxel-anchor residual threshold tau_r",
+    )
+    parser.add_argument(
+        "--anchor-planarity-threshold",
+        type=float,
+        default=None,
+        help="Voxel-anchor planarity threshold for residual_planarity mode",
+    )
     args = parser.parse_args()
 
-    cfg = _load_config(args.config) if args.config else QGSConfig()
+    cfg = _load_config(args.config) if args.config else None
+    if cfg is None and args.resume:
+        cfg = _load_config_for_resume(args.resume)
+    if cfg is None:
+        cfg = QGSConfig()
     cfg.data_root = args.data_root
     if args.epochs is not None:
         cfg.num_epochs = args.epochs
@@ -723,8 +895,23 @@ def main():
         cfg.lr = args.lr
     if args.batch_size is not None:
         cfg.batch_size = args.batch_size
+    if args.lidar_latent_dim is not None:
+        cfg.lidar_latent_dim = resolve_lidar_latent_dim(args.lidar_latent_dim)
     if args.device is not None:
         cfg.device = args.device
+    if args.primitive_mode is not None:
+        cfg.primitive_mode = args.primitive_mode
+        cfg.ptv3_model_in_channels = cfg.resolved_input_channels()
+    if args.anchor_token_variant is not None:
+        cfg.anchor_token_variant = args.anchor_token_variant
+        cfg.anchor_token_dim = 25 if args.anchor_token_variant == "with_normal" else 22
+        cfg.ptv3_model_in_channels = cfg.resolved_input_channels()
+    if args.anchor_filter_mode is not None:
+        cfg.anchor_filter_mode = args.anchor_filter_mode
+    if args.anchor_residual_threshold is not None:
+        cfg.anchor_residual_threshold = args.anchor_residual_threshold
+    if args.anchor_planarity_threshold is not None:
+        cfg.anchor_planarity_threshold = args.anchor_planarity_threshold
 
     train(cfg, overfit_frames=args.overfit, resume=args.resume)
 
