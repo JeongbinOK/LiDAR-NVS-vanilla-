@@ -137,17 +137,18 @@ void aabb_spherical(float x, float y, float z,
     el_min = fmaxf(el_c - theta_half, -HALF_PI_F);
     el_max = fminf(el_c + theta_half,  HALF_PI_F);
 
-    // Azimuth extent. The horizontal half-angle subtended on the sphere is
-    // approximately θ_half / cos(el_c) (small-angle expansion).
-    // Clamp denominator away from zero to handle near-pole primitives.
+    // Azimuth extent of the spherical cap. The exact longitude half-width is
+    // asin(sin(theta_half) / cos(el_c)) unless the cap reaches a pole, in
+    // which case every azimuth has at least one supported ray.
     const float cos_el = fmaxf(fabsf(cosf(el_c)), SPH_EPS);
-    const float az_half = fminf(theta_half / cos_el, PI_F);
+    const bool full_circle = (sin_half >= cos_el);
+    const float az_half = full_circle ? PI_F : asinf(fminf(sin_half / cos_el, 1.0f));
 
     az_min = az_c - az_half;
     az_max = az_c + az_half;
 
-    // If the half-extent is full π, no wrap; just clamp.
-    if (az_half >= PI_F) {
+    // If the cap reaches a pole, no wrap; just cover the full azimuth range.
+    if (full_circle) {
         az_min = -PI_F;  az_max = PI_F;
         return;
     }

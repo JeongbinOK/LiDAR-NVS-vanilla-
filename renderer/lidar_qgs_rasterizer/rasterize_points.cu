@@ -171,7 +171,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	const bool debug,
 	const bool stop_z_gradient,
 	const bool reciprocal_z,
-	const bool lidar_mode)
+	const bool lidar_mode,
+	const float r_near,
+	const float r_far)
 {
   const int P = means3D.size(0);
   const int H = dL_dout_color.size(1);
@@ -233,7 +235,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	  return_depth,
 	  return_normal,
 	  debug,
-	  lidar_mode);
+	  lidar_mode,
+	  r_near,
+	  r_far);
   }
   // also return dL_dview2gaussian so it could be used when view2gaussian is precomputed
   return std::make_tuple(dL_dmeans2D, dL_dcolors, dL_dopacity, dL_dmeans3D, dL_dsh, dL_dscales, dL_drotations, dL_dview2gaussian);

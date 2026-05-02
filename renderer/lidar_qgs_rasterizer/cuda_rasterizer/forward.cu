@@ -80,9 +80,10 @@ __device__ glm::vec3 computeColorFromSH(int idx, int deg, int max_coeffs, const 
 // Forward method for creating a view to gaussian coordinate system transformation matrix
 __device__ void computeView2Gaussian(const float3& mean, const glm::vec4 rot, const float* viewmatrix, float* view2gaussian, glm::mat4& G2V)
 {
-	// glm matrices use column-major order
-	// Normalize quaternion to get valid rotation
-	glm::vec4 q = rot;// / glm::length(rot);
+	// glm matrices use column-major order. Public API accepts quaternions
+	// (w, x, y, z); normalize defensively so the transform remains a rotation.
+	float q_len = glm::length(rot);
+	glm::vec4 q = rot / max(q_len, 1e-8f);
 	float r = q.x;
 	float x = q.y;
 	float y = q.z;
@@ -540,16 +541,9 @@ __global__ void preprocessLidarCUDA(int P, int D, int M,
 	float3 p_orig = { orig_points[3 * idx], orig_points[3 * idx + 1], orig_points[3 * idx + 2] };
 	float3 p_view = transformPoint4x3(p_orig, viewmatrix);
 
-	// --- Frustum test: vertical FOV + range gate ---
+	// --- Center spherical coordinates ---
 	float r_sph, az_c, el_c;
 	qgs_lidar::project_to_sphere(p_view.x, p_view.y, p_view.z, r_sph, az_c, el_c);
-	if (r_sph < r_near || r_sph > r_far || el_c < el_min || el_c > el_max) {
-		if (prefiltered) {
-			printf("Point is filtered although prefiltered is set. This shouldn't happen!\n");
-			__trap();
-		}
-		return;
-	}
 
 	// --- View2Gaussian (same as camera path) ---
 	glm::mat4 G2V;
@@ -581,6 +575,16 @@ __global__ void preprocessLidarCUDA(int P, int D, int M,
 	const glm::vec3 s = scales[idx];
 	const float R_eff = scale_modifier * sigma *
 		fmaxf(fmaxf(fabsf(s.x), fabsf(s.y)), fabsf(s.z));
+
+	// Conservative range cull for the whole candidate ball. Per-root near/far
+	// checks in the render kernel remain the exact LiDAR range gate.
+	if (r_sph + R_eff < r_near || r_sph - R_eff > r_far) {
+		if (prefiltered) {
+			printf("Point is filtered although prefiltered is set. This shouldn't happen!\n");
+			__trap();
+		}
+		return;
+	}
 
 	float az_min, az_max, el_lo, el_hi;
 	bool wrapped;
@@ -684,7 +688,9 @@ renderCUDA(
 	const bool lidar_mode,
 	const float el_min_rad,
 	const float w_per_rad_az,
-	const float h_per_rad_el)
+	const float h_per_rad_el,
+	const float r_near,
+	const float r_far)
 {
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
@@ -829,6 +835,8 @@ renderCUDA(
 					sign = (float)i * (float)AA_sign;
 					root = -BB * r2AA + sign * discriminant_sq_r2AA;
 				}
+				if (lidar_mode && (root < r_near || root > r_far))
+					continue;
 
 				// see Equations (9), (10), and (12) in the QGS main text.
 				p = {cam_pos_local.x + root * cam_ray_local.x, cam_pos_local.y + root * cam_ray_local.y};
@@ -1020,7 +1028,9 @@ void FORWARD::render(
 	const bool lidar_mode,
 	const float el_min_rad,
 	const float w_per_rad_az,
-	const float h_per_rad_el)
+	const float h_per_rad_el,
+	const float r_near,
+	const float r_far)
 {
 #if PIXEL_RESORTING
 	renderkBufferCUDA<NUM_CHANNELS> << <grid, block >> > (
@@ -1046,7 +1056,7 @@ void FORWARD::render(
 		bg_color,
 		out_color,
 		n_touched,
-		lidar_mode, el_min_rad, w_per_rad_az, h_per_rad_el);
+		lidar_mode, el_min_rad, w_per_rad_az, h_per_rad_el, r_near, r_far);
 #else
 	renderCUDA<NUM_CHANNELS> << <grid, block >> > (
 		P,
@@ -1071,7 +1081,7 @@ void FORWARD::render(
 		bg_color,
 		out_color,
 		n_touched,
-		lidar_mode, el_min_rad, w_per_rad_az, h_per_rad_el);
+		lidar_mode, el_min_rad, w_per_rad_az, h_per_rad_el, r_near, r_far);
 #endif
 }
 

@@ -103,7 +103,9 @@ namespace CudaRasterizer
 			bool debug,
 			// A3.x — LiDAR-mode backward. cam_intr is reinterpreted host-side
 			// when lidar_mode=true (see rasterizer_impl.cu).
-			bool lidar_mode = false);
+			bool lidar_mode = false,
+			float r_near = 0.2f,
+			float r_far = 100.0f);
 
 	};
 };

@@ -78,7 +78,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	const bool debug,
 	const bool stop_z_gradient,
 	const bool reciprocal_z,
-	const bool lidar_mode = false);
+	const bool lidar_mode = false,
+	const float r_near = 0.2f,
+	const float r_far = 100.0f);
 		
 torch::Tensor markVisible(
 		torch::Tensor& means3D,

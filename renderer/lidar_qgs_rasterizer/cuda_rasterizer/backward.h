@@ -55,7 +55,9 @@ namespace BACKWARD
 		const bool lidar_mode = false,
 		const float el_min_rad = 0.0f,
 		const float w_per_rad_az = 0.0f,
-		const float h_per_rad_el = 0.0f);
+		const float h_per_rad_el = 0.0f,
+		const float r_near = 0.2f,
+		const float r_far = 100.0f);
 
 	void preprocess(
 		int P, int D, int M,

@@ -120,7 +120,9 @@ namespace FORWARD
 		const bool lidar_mode = false,
 		const float el_min_rad = 0.f,
 		const float w_per_rad_az = 0.f,
-		const float h_per_rad_el = 0.f);
+		const float h_per_rad_el = 0.f,
+		const float r_near = 0.2f,
+		const float r_far = 100.0f);
 
 	void duplicate(
 		int P,

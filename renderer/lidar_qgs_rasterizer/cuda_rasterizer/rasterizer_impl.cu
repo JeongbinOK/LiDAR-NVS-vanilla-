@@ -479,7 +479,9 @@ int CudaRasterizer::Rasterizer::forward(
 		lidar_mode,
 		el_min_rad_render,
 		w_per_rad_az_render,
-		h_per_rad_el_render), debug)
+		h_per_rad_el_render,
+		r_near,
+		r_far), debug)
 
 	return num_rendered;
 }
@@ -525,7 +527,9 @@ void CudaRasterizer::Rasterizer::backward(
 	const bool return_depth,
 	const bool return_normal,
 	bool debug,
-	bool lidar_mode)
+	bool lidar_mode,
+	float r_near,
+	float r_far)
 {
 	GeometryState geomState = GeometryState::fromChunk(geom_buffer, P);
 	BinningState binningState = BinningState::fromChunk(binning_buffer, R);
@@ -594,7 +598,9 @@ void CudaRasterizer::Rasterizer::backward(
 		lidar_mode,
 		el_min_rad,
 		w_per_rad_az,
-		h_per_rad_el), debug)
+		h_per_rad_el,
+		r_near,
+		r_far), debug)
 
 	CHECK_CUDA(BACKWARD::preprocess(P, D, M,
 		width, height,

@@ -140,6 +140,67 @@ __device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::
 	dL_dmeans[idx] += glm::vec3(dL_dmean.x, dL_dmean.y, dL_dmean.z);
 }
  
+__device__ void computeView2Gaussian_values(
+	const float3& mean,
+	const glm::vec4 rot,
+	const float* viewmatrix,
+	float* out
+)
+{
+	float q_len = glm::length(rot);
+	glm::vec4 q = rot / max(q_len, 1e-8f);
+	float r = q.x;
+	float x = q.y;
+	float y = q.z;
+	float z = q.w;
+
+	glm::mat3 R = glm::mat3(
+		 1.f - 2.f * (y * y + z * z), 2.f * (x * y - r * z), 2.f * (x * z + r * y),
+		 2.f * (x * y + r * z), 1.f - 2.f * (x * x + z * z), 2.f * (y * z - r * x),
+		 2.f * (x * z - r * y), 2.f * (y * z + r * x), 1.f - 2.f * (x * x + y * y)
+	);
+
+	glm::mat4 G2W = glm::mat4(
+		R[0][0], R[1][0], R[2][0], 0.0f,
+		R[0][1], R[1][1], R[2][1], 0.0f,
+		R[0][2], R[1][2], R[2][2], 0.0f,
+		mean.x, mean.y, mean.z, 1.0f
+	);
+
+	glm::mat4 W2V = glm::mat4(
+		 viewmatrix[0], viewmatrix[1], viewmatrix[2], viewmatrix[3],
+		 viewmatrix[4], viewmatrix[5], viewmatrix[6], viewmatrix[7],
+		 viewmatrix[8], viewmatrix[9], viewmatrix[10], viewmatrix[11],
+		 viewmatrix[12], viewmatrix[13], viewmatrix[14], viewmatrix[15]
+	);
+
+	glm::mat4 G2V = W2V * G2W;
+	glm::mat3 R_transpose = glm::mat3(
+		G2V[0][0], G2V[1][0], G2V[2][0],
+		G2V[0][1], G2V[1][1], G2V[2][1],
+		G2V[0][2], G2V[1][2], G2V[2][2]
+	);
+	glm::vec3 t = glm::vec3(G2V[3][0], G2V[3][1], G2V[3][2]);
+	glm::vec3 t2 = -R_transpose * t;
+
+	out[0] = R_transpose[0][0];
+	out[1] = R_transpose[0][1];
+	out[2] = R_transpose[0][2];
+	out[3] = 0.0f;
+	out[4] = R_transpose[1][0];
+	out[5] = R_transpose[1][1];
+	out[6] = R_transpose[1][2];
+	out[7] = 0.0f;
+	out[8] = R_transpose[2][0];
+	out[9] = R_transpose[2][1];
+	out[10] = R_transpose[2][2];
+	out[11] = 0.0f;
+	out[12] = t2.x;
+	out[13] = t2.y;
+	out[14] = t2.z;
+	out[15] = 1.0f;
+}
+
 // Backward method for creating a view to gaussian coordinate system transformation matrix
 __device__ void computeView2Gaussian_backward(
 	const float focal_x, const float focal_y,
@@ -156,7 +217,8 @@ __device__ void computeView2Gaussian_backward(
 	float3& dL_dmean2D
 )
 {
-	glm::vec4 q = rot;// / glm::length(rot);
+	float q_len = glm::length(rot);
+	glm::vec4 q = rot / max(q_len, 1e-8f);
 	float r = q.x;
 	float x = q.y;
 	float y = q.z;
@@ -266,18 +328,52 @@ __device__ void computeView2Gaussian_backward(
 	dL_dmean->y = dL_dG2W_t.y;
 	dL_dmean->z = dL_dG2W_t.z;
 
-	glm::mat3 dL_dMt = dL_dR;
- 
-	// // Gradients of loss w.r.t. normalized quaternion
-	glm::vec4 dL_dq;
-	dL_dq.x = 2 * z * (dL_dMt[0][1] - dL_dMt[1][0]) + 2 * y * (dL_dMt[2][0] - dL_dMt[0][2]) + 2 * x * (dL_dMt[1][2] - dL_dMt[2][1]);
-	dL_dq.y = 2 * y * (dL_dMt[1][0] + dL_dMt[0][1]) + 2 * z * (dL_dMt[2][0] + dL_dMt[0][2]) + 2 * r * (dL_dMt[1][2] - dL_dMt[2][1]) - 4 * x * (dL_dMt[2][2] + dL_dMt[1][1]);
-	dL_dq.z = 2 * x * (dL_dMt[1][0] + dL_dMt[0][1]) + 2 * r * (dL_dMt[2][0] - dL_dMt[0][2]) + 2 * z * (dL_dMt[1][2] + dL_dMt[2][1]) - 4 * y * (dL_dMt[2][2] + dL_dMt[0][0]);
-	dL_dq.w = 2 * r * (dL_dMt[0][1] - dL_dMt[1][0]) + 2 * x * (dL_dMt[2][0] + dL_dMt[0][2]) + 2 * y * (dL_dMt[1][2] + dL_dMt[2][1]) - 4 * z * (dL_dMt[1][1] + dL_dMt[0][0]);
- 
-	// Gradients of loss w.r.t. unnormalized quaternion
+	// Analytic quaternion chain rule. Acceptance tests project this raw
+	// component gradient onto unit-quaternion tangent perturbations.
+	const float da = dL_dR[0][0];
+	const float db = dL_dR[0][1];
+	const float dc = dL_dR[0][2];
+	const float dd = dL_dR[1][0];
+	const float de = dL_dR[1][1];
+	const float df = dL_dR[1][2];
+	const float dg = dL_dR[2][0];
+	const float dh = dL_dR[2][1];
+	const float di = dL_dR[2][2];
+
+	glm::vec4 dL_dq(0.0f);
+	dL_dq.x =
+		-2.0f * z * db + 2.0f * y * dc +
+		 2.0f * z * dd - 2.0f * x * df -
+		 2.0f * y * dg + 2.0f * x * dh;
+	dL_dq.y =
+		 2.0f * y * db + 2.0f * z * dc +
+		 2.0f * y * dd - 4.0f * x * de -
+		 2.0f * r * df + 2.0f * z * dg +
+		 2.0f * r * dh - 4.0f * x * di;
+	dL_dq.z =
+		-4.0f * y * da + 2.0f * x * db +
+		 2.0f * r * dc + 2.0f * x * dd +
+		 2.0f * z * df - 2.0f * r * dg +
+		 2.0f * z * dh - 4.0f * y * di;
+	dL_dq.w =
+		-4.0f * z * da - 2.0f * r * db +
+		 2.0f * x * dc + 2.0f * r * dd -
+		 4.0f * z * de + 2.0f * y * df +
+		 2.0f * x * dg + 2.0f * y * dh;
+	dL_dq = -dL_dq;
+
+	glm::vec4 dL_drot_unnorm(0.0f);
+	if (q_len > 1e-8f)
+	{
+		const float inv_len = 1.0f / q_len;
+		const float q_dot_grad = q.x * dL_dq.x + q.y * dL_dq.y + q.z * dL_dq.z + q.w * dL_dq.w;
+		dL_drot_unnorm.x = (dL_dq.x - q.x * q_dot_grad) * inv_len;
+		dL_drot_unnorm.y = (dL_dq.y - q.y * q_dot_grad) * inv_len;
+		dL_drot_unnorm.z = (dL_dq.z - q.z * q_dot_grad) * inv_len;
+		dL_drot_unnorm.w = (dL_dq.w - q.w * q_dot_grad) * inv_len;
+	}
 	float4* dL_drot = (float4*)(dL_drots + idx);
-	*dL_drot = float4{ dL_dq.x, dL_dq.y, dL_dq.z, dL_dq.w };
+	*dL_drot = float4{ dL_drot_unnorm.x, dL_drot_unnorm.y, dL_drot_unnorm.z, dL_drot_unnorm.w };
 }
 
 
@@ -354,7 +450,9 @@ renderCUDA(
 	const bool lidar_mode,
 	const float el_min_rad,
 	const float w_per_rad_az,
-	const float h_per_rad_el)
+	const float h_per_rad_el,
+	const float r_near,
+	const float r_far)
 {
 	// We rasterize again. Compute necessary block info.
 	auto block = cg::this_thread_block();
@@ -544,6 +642,8 @@ renderCUDA(
 					sign = (float)i * (float)AA_sign;
 					root = -BB * r2AA + sign * discriminant_sq_r2AA;
 				}
+				if (lidar_mode && (root < r_near || root > r_far))
+					continue;
 
 				p = {
 					__fmaf_rn(root, cam_ray_local.x, cam_pos_local.x),
@@ -820,20 +920,20 @@ renderCUDA(
 			// dL_dAA(BB,CC) may introduce more numerical errors.
 			const float3 rscale_4_sign = {rscale_sign_j.x * rscale_o_j.x, rscale_sign_j.y * rscale_o_j.y, rscale_sign_j.z * rscale_o_j.z};
 			dL_dscale_221.x += dL_da * (-rscale_4_sign.x * cos2_sin2.x * scale_j.z)
-						  + dL_dr0_2 * (rscale_o_j.x * rscale_o_j.x * cos2_sin2.x * rcos_s_sin_s_2_2);
+						  + dL_dr0_2 * (rscale_o_j.x * rscale_o_j.x * cos2_sin2.x * rcos_s_sin_s_2_2)
 						  + dL_dAA * (-rscale_4_sign.x * cam_ray_local.x * cam_ray_local.x)
 						  + dL_dBB * (-2 * rscale_4_sign.x * cam_ray_local.x * cam_pos_local.x)
 						  + dL_dCC * (-rscale_4_sign.x * cam_pos_local.x * cam_pos_local.x);
-						  
+
 			dL_dscale_221.y += dL_da * (-rscale_4_sign.y * cos2_sin2.y * scale_j.z)
-						  + dL_dr0_2 * (rscale_o_j.y * rscale_o_j.y * cos2_sin2.y * rcos_s_sin_s_2_2);
+						  + dL_dr0_2 * (rscale_o_j.y * rscale_o_j.y * cos2_sin2.y * rcos_s_sin_s_2_2)
 						  + dL_dAA * (-rscale_4_sign.y * cam_ray_local.y * cam_ray_local.y)
 						  + dL_dBB * (-2 * rscale_4_sign.y * cam_ray_local.y * cam_pos_local.y)
 						  + dL_dCC * (-rscale_4_sign.y * cam_pos_local.y * cam_pos_local.y);
- 
-			dL_dscale_221.z += dL_da * (rscale_sign_j.x * cos2_sin2.x + rscale_sign_j.y * cos2_sin2.y);
+
+			dL_dscale_221.z += dL_da * (rscale_sign_j.x * cos2_sin2.x + rscale_sign_j.y * cos2_sin2.y)
 						  + dL_dBB * (cam_ray_local.z * rscale_4_sign.z)
-						  + dL_dCC * (cam_pos_local.z * rscale_4_sign.z);	 
+						  + dL_dCC * (cam_pos_local.z * rscale_4_sign.z);
 			// from normal regularization loss
 			dL_dscale_221.x += dL_point_normal_unnormalized.x * (-2 * rscale_4_sign.x * p.x);
 			dL_dscale_221.y += dL_point_normal_unnormalized.y * (-2 * rscale_4_sign.y * p.y);
@@ -975,7 +1075,9 @@ void BACKWARD::render(
 	const bool lidar_mode,
 	const float el_min_rad,
 	const float w_per_rad_az,
-	const float h_per_rad_el)
+	const float h_per_rad_el,
+	const float r_near,
+	const float r_far)
 {
 #if PIXEL_RESORTING
 	renderkBufferBackwardCUDA<NUM_CHANNELS> << <grid, block >> >(
@@ -1008,7 +1110,9 @@ void BACKWARD::render(
 		lidar_mode,
 		el_min_rad,
 		w_per_rad_az,
-		h_per_rad_el
+		h_per_rad_el,
+		r_near,
+		r_far
 	);
 #else
 	renderCUDA<NUM_CHANNELS> << <grid, block >> >(
@@ -1040,7 +1144,9 @@ void BACKWARD::render(
 		lidar_mode,
 		el_min_rad,
 		w_per_rad_az,
-		h_per_rad_el
+		h_per_rad_el,
+		r_near,
+		r_far
 		);
 #endif
 }

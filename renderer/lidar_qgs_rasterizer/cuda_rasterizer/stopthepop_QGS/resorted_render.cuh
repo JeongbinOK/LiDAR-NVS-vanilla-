@@ -93,7 +93,9 @@ renderkBufferCUDA(
 	const bool lidar_mode,
 	const float el_min_rad,
 	const float w_per_rad_az,
-	const float h_per_rad_el)
+	const float h_per_rad_el,
+	const float r_near,
+	const float r_far)
 {
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
@@ -309,6 +311,8 @@ renderkBufferCUDA(
 					sign = (float)i * (float)AA_sign;
 					root = -BB * r2AA + sign * discriminant_sq_r2AA;
 				}
+				if (lidar_mode && (root < r_near || root > r_far))
+					continue;
 				p = {
 					__fmaf_rn(root, cam_ray_local.x, cam_pos_local.x),
 					__fmaf_rn(root, cam_ray_local.y, cam_pos_local.y)
@@ -477,7 +481,9 @@ renderkBufferBackwardCUDA(
 	const bool lidar_mode,
 	const float el_min_rad,
 	const float w_per_rad_az,
-	const float h_per_rad_el)
+	const float h_per_rad_el,
+	const float r_near,
+	const float r_far)
 {
 	// We rasterize again. Compute necessary block info.
 	auto block = cg::this_thread_block();
@@ -927,19 +933,19 @@ renderkBufferBackwardCUDA(
 		// dL_dAA(BB,CC) may introduce more numerical errors.
 		const float3 rscale_4_sign = {rscale_sign_blend.x * rscale_o_blend.x, rscale_sign_blend.y * rscale_o_blend.y, rscale_sign_blend.z * rscale_o_blend.z};
 		dL_dscale_221.x += dL_da * (-rscale_4_sign.x * cos2_sin2.x * scale_o_blend.z)
-					  + dL_dr0_2 * (rscale_o_blend.x * rscale_o_blend.x * cos2_sin2.x * rcos_s_sin_s_2_2);
-					//   + dL_dAA * (-rscale_4_sign.x * cam_ray_local.x * cam_ray_local.x)
-					//   + dL_dBB * (-2 * rscale_4_sign.x * cam_ray_local.x * cam_pos_local.x)
-					//   + dL_dCC * (-rscale_4_sign.x * cam_pos_local.x * cam_pos_local.x);
-					  
+					  + dL_dr0_2 * (rscale_o_blend.x * rscale_o_blend.x * cos2_sin2.x * rcos_s_sin_s_2_2)
+					  + dL_dAA * (-rscale_4_sign.x * cam_ray_local.x * cam_ray_local.x)
+					  + dL_dBB * (-2 * rscale_4_sign.x * cam_ray_local.x * cam_pos_local.x)
+					  + dL_dCC * (-rscale_4_sign.x * cam_pos_local.x * cam_pos_local.x);
+
 		dL_dscale_221.y += dL_da * (-rscale_4_sign.y * cos2_sin2.y * scale_o_blend.z)
-					  + dL_dr0_2 * (rscale_o_blend.y * rscale_o_blend.y * cos2_sin2.y * rcos_s_sin_s_2_2);
-					//   + dL_dAA * (-rscale_4_sign.y * cam_ray_local.y * cam_ray_local.y)
-					//   + dL_dBB * (-2 * rscale_4_sign.y * cam_ray_local.y * cam_pos_local.y)
-					//   + dL_dCC * (-rscale_4_sign.y * cam_pos_local.y * cam_pos_local.y);
-		dL_dscale_221.z += dL_da * (rscale_sign_blend.x * cos2_sin2.x + rscale_sign_blend.y * cos2_sin2.y);
-					//   + dL_dBB * (cam_ray_local.z * rscale_4_sign.z)
-					//   + dL_dCC * (cam_pos_local.z * rscale_4_sign.z);
+					  + dL_dr0_2 * (rscale_o_blend.y * rscale_o_blend.y * cos2_sin2.y * rcos_s_sin_s_2_2)
+					  + dL_dAA * (-rscale_4_sign.y * cam_ray_local.y * cam_ray_local.y)
+					  + dL_dBB * (-2 * rscale_4_sign.y * cam_ray_local.y * cam_pos_local.y)
+					  + dL_dCC * (-rscale_4_sign.y * cam_pos_local.y * cam_pos_local.y);
+		dL_dscale_221.z += dL_da * (rscale_sign_blend.x * cos2_sin2.x + rscale_sign_blend.y * cos2_sin2.y)
+					  + dL_dBB * (cam_ray_local.z * rscale_4_sign.z)
+					  + dL_dCC * (cam_pos_local.z * rscale_4_sign.z);
 					 
 		// from normal regularization loss
 		if (return_normal){
@@ -1105,6 +1111,8 @@ renderkBufferBackwardCUDA(
 					sign = (float)i * (float)AA_sign;
 					root = -BB * r2AA + sign * discriminant_sq_r2AA;
 				}
+				if (lidar_mode && (root < r_near || root > r_far))
+					continue;
 				p = {cam_pos_local.x + root * cam_ray_local.x, cam_pos_local.y + root * cam_ray_local.y};
 				p_norm_2 = p.x * p.x + p.y * p.y + 1e-7;
 				p_norm = __fsqrt_rn(p_norm_2);
