@@ -2,9 +2,10 @@
 Local 2nd-order surface fitting on k-NN patches.
 
 `points` are used as neighbourhood anchors only.  The fitted QGS centre is the
-surface point under the unweighted neighbour mean in the local PCA chart, so the
-head starts from a local-tangent, linear-term-free quadratic instead of from a
-potentially distant paraboloid vertex.
+surface point under the unweighted neighbour mean in the local PCA chart.  A
+general quadratic is first used to estimate the local tangent frame; the final
+initial surface is then fit directly in QGS form, `z = a*x^2 + b*y^2`, against
+the neighbouring LiDAR samples in that local frame.
 """
 
 from __future__ import annotations
@@ -36,12 +37,13 @@ def _solve_weighted_ls_normal_eq(
     reg: float = 1e-4,
 ) -> Tensor:
     """Solve a regularised weighted LS normal equation in batch form."""
+    n_params = Phi.shape[-1]
     w_sqrt = weight.clamp(min=0.0).sqrt().unsqueeze(-1)
     Phi_w = Phi * w_sqrt
     z_w = z * w_sqrt.squeeze(-1)
     Phi_t = Phi_w.transpose(-1, -2)
     A = Phi_t @ Phi_w
-    I = torch.eye(6, dtype=Phi.dtype, device=Phi.device).unsqueeze(0)
+    I = torch.eye(n_params, dtype=Phi.dtype, device=Phi.device).unsqueeze(0)
     A = A + reg * I
     b = Phi_t @ z_w.unsqueeze(-1)
     return torch.linalg.solve(A, b).squeeze(-1)
@@ -154,13 +156,7 @@ def fit_local_quadrics(
     e_c = theta[:, 4]
     f_c = theta[:, 5]
 
-    z_pred = (Phi * theta.unsqueeze(1)).sum(dim=-1)
     weight_sum = weights.sum(dim=1).clamp(min=_EPS)
-    residuals = (z_pred - z_vals) ** 2
-    mean_res = (residuals * weights).sum(dim=1) / weight_sum
-    z_mean_valid = (z_vals * weights).sum(dim=1) / weight_sum
-    z_var = (((z_vals - z_mean_valid.unsqueeze(1)) ** 2) * weights).sum(dim=1) / weight_sum
-    fit_residual = mean_res / (z_var + _EPS)
 
     mu = pbar + R_pca[:, :, 2] * f_c.unsqueeze(1)
     normal_local = torch.stack([-d_c, -e_c, torch.ones_like(d_c)], dim=-1)
@@ -205,6 +201,9 @@ def fit_local_quadrics(
     e1_raw = torch.nn.functional.normalize(e1_raw, dim=-1, eps=_EPS)
     e2_raw = torch.nn.functional.normalize(e2_raw, dim=-1, eps=_EPS)
 
+    # Tangent extent of the observed local patch.  These RMS projections measure
+    # how far the 16-neighbour patch spreads along each tangent axis; they are
+    # used as the preferred size of the Gaussian footprint, not as curvature.
     q_mu = (nbr_flat - mu.unsqueeze(1)) * valid_f.unsqueeze(-1)
     proj1 = (q_mu * e1_raw.unsqueeze(1)).sum(dim=-1)
     proj2 = (q_mu * e2_raw.unsqueeze(1)).sum(dim=-1)
@@ -217,7 +216,7 @@ def fit_local_quadrics(
     kappa1_raw = h_vals[:, 0]
     kappa2_raw = h_vals[:, 1]
 
-    # Canonical tangent order: always expose the larger tangent support as |s1|.
+    # Canonical tangent order: expose the wider tangent extent as |s1|.
     swap_axes = s1_raw_abs < s2_raw_abs
     e1 = torch.where(swap_axes.unsqueeze(1), e2_raw, e1_raw)
     e2 = torch.where(swap_axes.unsqueeze(1), -e1_raw, e2_raw)
@@ -232,24 +231,107 @@ def fit_local_quadrics(
         R_canonical[neg_det, :, 1] = -R_canonical[neg_det, :, 1]
         e2 = R_canonical[:, :, 1]
 
-    abs_k1 = kappa1_init.abs()
-    abs_k2 = kappa2_init.abs()
-    dominant_kappa = torch.where(abs_k1 >= abs_k2, kappa1_init, kappa2_init)
-    dominant_sign = _nonzero_sign(dominant_kappa)
-    near_flat = (abs_k1 < float(quadric_eps_kappa)) & (abs_k2 < float(quadric_eps_kappa))
-    dominant_sign = torch.where(near_flat, torch.ones_like(dominant_sign), dominant_sign)
-    sign1 = torch.where(abs_k1 < float(quadric_eps_kappa), dominant_sign, _nonzero_sign(kappa1_init))
-    sign2 = torch.where(abs_k2 < float(quadric_eps_kappa), dominant_sign, _nonzero_sign(kappa2_init))
+    # Final constrained QGS patch fit.  The general quadratic above only
+    # estimates centre/frame; the initial QGS coefficients are fitted directly
+    # to neighbour samples in the final local frame:
+    #
+    #   w ~= a*u^2 + b*v^2
+    #
+    # where (u, v) are tangent-plane coordinates and w is height along the
+    # local normal.  This is the actual local patch surface used for QGS init.
+    q_qgs = torch.bmm(nbr_flat - mu.unsqueeze(1), R_canonical)
+    u = q_qgs[:, :, 0]
+    v = q_qgs[:, :, 1]
+    w = q_qgs[:, :, 2]
+    Phi_qgs = torch.stack([u * u, v * v], dim=-1)
+    qgs_theta = _solve_weighted_ls_normal_eq(Phi_qgs, w, weights, reg=ls_reg)
+    qgs_a = qgs_theta[:, 0].clamp(
+        min=-0.5 * float(quadric_kappa_max),
+        max=0.5 * float(quadric_kappa_max),
+    )
+    qgs_b = qgs_theta[:, 1].clamp(
+        min=-0.5 * float(quadric_kappa_max),
+        max=0.5 * float(quadric_kappa_max),
+    )
 
-    s1_safe = s1_abs.clamp(min=float(quadric_eps_s))
-    s2_safe = s2_abs.clamp(min=float(quadric_eps_s))
-    q1 = 2.0 * sign1 / (s1_safe * s1_safe)
-    q2 = 2.0 * sign2 / (s2_safe * s2_safe)
-    s3_ls = (q1 * kappa1_init + q2 * kappa2_init) / (q1 * q1 + q2 * q2 + _EPS)
+    z_qgs_pred = (Phi_qgs * torch.stack([qgs_a, qgs_b], dim=-1).unsqueeze(1)).sum(dim=-1)
+    qgs_residuals = (z_qgs_pred - w) ** 2
+    mean_res = (qgs_residuals * weights).sum(dim=1) / weight_sum
+    z_mean_valid = (w * weights).sum(dim=1) / weight_sum
+    z_var = (((w - z_mean_valid.unsqueeze(1)) ** 2) * weights).sum(dim=1) / weight_sum
+    fit_residual = mean_res / (z_var + _EPS)
+
+    kappa1_init = 2.0 * qgs_a
+    kappa2_init = 2.0 * qgs_b
+    coeff_eps = 0.5 * float(quadric_eps_kappa)
+    abs_a = qgs_a.abs()
+    abs_b = qgs_b.abs()
+    axis1_curved = abs_a >= coeff_eps
+    axis2_curved = abs_b >= coeff_eps
+    near_flat = ~axis1_curved & ~axis2_curved
+
+    # Renderer convention:
+    #
+    #   w = s3 * (sign(s1)*u^2/|s1|^2 + sign(s2)*v^2/|s2|^2)
+    #
+    # so a = s3*sign(s1)/|s1|^2 and b = s3*sign(s2)/|s2|^2.
+    # The pair (a, b) alone does not uniquely determine (s1, s2, s3), so choose
+    # s3 that keeps |s1| and |s2| close to the observed tangent extents, then
+    # derive |s1| and |s2| so the curved axes reproduce the fitted coefficients.
+    support_s3_1 = abs_a * s1_abs.clamp(min=float(quadric_eps_s)).square()
+    support_s3_2 = abs_b * s2_abs.clamp(min=float(quadric_eps_s)).square()
+    both_curved_s3 = torch.sqrt(
+        support_s3_1.clamp(min=float(quadric_eps_s3))
+        * support_s3_2.clamp(min=float(quadric_eps_s3))
+    )
+    one_curved_s3 = torch.where(axis1_curved, support_s3_1, support_s3_2)
     s3_init = torch.where(
         near_flat,
-        torch.full_like(s3_ls, float(quadric_eps_s3)),
-        s3_ls.abs().clamp(min=float(quadric_eps_s3)),
+        torch.full_like(both_curved_s3, float(quadric_eps_s3)),
+        torch.where(
+            axis1_curved & axis2_curved,
+            both_curved_s3,
+            one_curved_s3,
+        ).abs().clamp(min=float(quadric_eps_s3)),
+    )
+
+    s1_abs = torch.where(
+        axis1_curved,
+        torch.sqrt(s3_init / abs_a.clamp(min=coeff_eps)),
+        s1_abs,
+    ).clamp(min=float(quadric_eps_s))
+    s2_abs = torch.where(
+        axis2_curved,
+        torch.sqrt(s3_init / abs_b.clamp(min=coeff_eps)),
+        s2_abs,
+    ).clamp(min=float(quadric_eps_s))
+
+    sign1 = torch.where(axis1_curved, _nonzero_sign(qgs_a), torch.ones_like(qgs_a))
+    sign2 = torch.where(axis2_curved, _nonzero_sign(qgs_b), torch.ones_like(qgs_b))
+
+    # Keep the downstream canonical invariant |s1| >= |s2|.  Swapping tangent
+    # axes does not change the represented QGS patch; it only renames u/v.
+    swap_scale = s1_abs < s2_abs
+    R_swapped = torch.stack(
+        [R_canonical[:, :, 1], -R_canonical[:, :, 0], R_canonical[:, :, 2]],
+        dim=-1,
+    )
+    R_canonical = torch.where(
+        swap_scale.view(BN, 1, 1).expand_as(R_canonical),
+        R_swapped,
+        R_canonical,
+    )
+    s1_abs, s2_abs = (
+        torch.where(swap_scale, s2_abs, s1_abs),
+        torch.where(swap_scale, s1_abs, s2_abs),
+    )
+    sign1, sign2 = (
+        torch.where(swap_scale, sign2, sign1),
+        torch.where(swap_scale, sign1, sign2),
+    )
+    kappa1_init, kappa2_init = (
+        torch.where(swap_scale, kappa2_init, kappa1_init),
+        torch.where(swap_scale, kappa1_init, kappa2_init),
     )
     s1_init = sign1 * s1_abs
     s2_init = sign2 * s2_abs

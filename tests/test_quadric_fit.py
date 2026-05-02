@@ -58,6 +58,15 @@ def _make_paraboloid_patch(
     return query, neighbors, k_eff
 
 
+def _qgs_coeff_from_scale(s: torch.Tensor) -> torch.Tensor:
+    s1 = s[..., 0]
+    s2 = s[..., 1]
+    s3 = s[..., 2].abs()
+    a = s3 * s1.sign() / s1.abs().clamp(min=1e-8).square()
+    b = s3 * s2.sign() / s2.abs().clamp(min=1e-8).square()
+    return torch.stack([a, b], dim=-1)
+
+
 # ---------------------------------------------------------------------------
 # Test 1: Synthetic paraboloid — recover curvature and frame
 # ---------------------------------------------------------------------------
@@ -73,23 +82,27 @@ class TestParaboloid:
         assert torch.isfinite(result["curvature_aniso"]).all()
 
     def test_s3_solves_signed_curvature_least_squares(self):
-        """s3_init should match the signed-QGS curvature LS solution."""
+        """s_init should reproduce the directly fitted QGS coefficients."""
         a, b = 0.5, 0.3
         query, neighbors, k_eff = _make_paraboloid_patch(a=a, b=b, grid_n=7)
 
         result = fit_local_quadrics(query, neighbors, k_eff, k_min=4, k_target=49)
 
         s = result["s_init"][0, 0]
-        kappa = torch.stack([result["kappa1_init"][0, 0], result["kappa2_init"][0, 0]])
         use_geom = result["use_geom_init"][0, 0].item()
 
         assert use_geom, "use_geom_init should be True for dense patch"
         assert (s[:2] > 0).all(), f"convex patch should use same positive signature, got {s}"
         assert s[2].item() > 0.0
 
-        q = 2.0 * s[:2].sign() / s[:2].abs().clamp(min=1e-3).pow(2)
-        expected_s3 = (q * kappa).sum() / (q * q).sum()
-        assert s[2].item() == pytest.approx(abs(expected_s3.item()), rel=1e-4, abs=1e-5)
+        coeff = _qgs_coeff_from_scale(s)
+        expected = torch.tensor([a, b], dtype=coeff.dtype)
+        assert torch.allclose(
+            coeff.sort().values,
+            expected.sort().values,
+            rtol=0.08,
+            atol=0.03,
+        ), f"QGS coefficients {coeff.tolist()} should match direct patch coeffs {expected.tolist()}"
 
     def test_center_is_surface_point_under_pbar(self):
         a, b = 0.5, 0.3
