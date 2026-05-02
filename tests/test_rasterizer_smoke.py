@@ -10,12 +10,159 @@ confirms our build is functional end-to-end before A3.2 starts swapping projecti
 from __future__ import annotations
 
 import math
+import sys
+from pathlib import Path
 
 import pytest
 import torch
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT / "renderer" / "lidar_qgs_rasterizer"))
+
 # Skip whole module if no CUDA — rasterizer is GPU-only
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+
+
+def _quat_mul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    aw, ax, ay, az = a.unbind(dim=-1)
+    bw, bx, by, bz = b.unbind(dim=-1)
+    return torch.stack(
+        [
+            aw * bw - ax * bx - ay * by - az * bz,
+            aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw,
+        ],
+        dim=-1,
+    )
+
+
+def _axis_angle_quat(axis: int, angle: float, *, device: torch.device | str) -> torch.Tensor:
+    q = torch.zeros(4, device=device, dtype=torch.float32)
+    q[0] = math.cos(0.5 * angle)
+    q[axis + 1] = math.sin(0.5 * angle)
+    return q
+
+
+def _apply_local_tangent_delta(rotations: torch.Tensor, gaussian_idx: int, axis: int, angle: float) -> torch.Tensor:
+    out = rotations.clone()
+    dq = _axis_angle_quat(axis, angle, device=rotations.device)
+    out[gaussian_idx] = _quat_mul(out[gaussian_idx], dq)
+    out[gaussian_idx] = out[gaussian_idx] / out[gaussian_idx].norm().clamp(min=1e-8)
+    return out
+
+
+def _compute_view2gaussian_ref(means3D: torch.Tensor, rotations: torch.Tensor) -> torch.Tensor:
+    q = rotations / rotations.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+    r, x, y, z = q.unbind(dim=-1)
+    R = torch.stack(
+        [
+            1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - r * z), 2.0 * (x * z + r * y),
+            2.0 * (x * y + r * z), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - r * x),
+            2.0 * (x * z - r * y), 2.0 * (y * z + r * x), 1.0 - 2.0 * (x * x + y * y),
+        ],
+        dim=-1,
+    ).reshape(-1, 3, 3)
+    R_t = R.transpose(-1, -2)
+    t = -(R_t @ means3D.unsqueeze(-1)).squeeze(-1)
+    out = torch.zeros(means3D.shape[0], 4, 4, device=means3D.device, dtype=means3D.dtype)
+    out[:, :3, :3] = R_t
+    out[:, 3, :3] = t
+    out[:, 3, 3] = 1.0
+    return out
+
+
+def _lidar_scene(
+    means3D: torch.Tensor,
+    *,
+    image_width: int = 64,
+    image_height: int = 16,
+    scale: float = 0.18,
+    opacity: float = 0.75,
+    el_min: float = math.radians(-30.0),
+    el_max: float = math.radians(10.0),
+    r_near: float = 0.2,
+    r_far: float = 100.0,
+):
+    from diff_quadratic_rasterization import LIDAR_LATENT_DIM, LiDARRasterizer, make_lidar_settings
+
+    device = means3D.device
+    N = means3D.shape[0]
+    means2D = torch.zeros_like(means3D, requires_grad=means3D.requires_grad)
+    scales = torch.full((N, 3), scale, device=device, dtype=torch.float32)
+    rotations = torch.zeros(N, 4, device=device, dtype=torch.float32)
+    rotations[:, 0] = 1.0
+    opacities = torch.full((N, 1), opacity, device=device, dtype=torch.float32)
+    intensity = torch.full((N,), 0.5, device=device, dtype=torch.float32)
+    latent = torch.zeros((N, LIDAR_LATENT_DIM), device=device, dtype=torch.float32)
+
+    viewmatrix = torch.eye(4, device=device, dtype=torch.float32)
+    campos = torch.zeros(3, device=device, dtype=torch.float32)
+    settings = make_lidar_settings(
+        image_height=image_height,
+        image_width=image_width,
+        el_min_rad=el_min,
+        el_max_rad=el_max,
+        viewmatrix=viewmatrix,
+        campos=campos,
+        r_near=r_near,
+        r_far=r_far,
+    )
+    out = LiDARRasterizer(settings)(
+        means3D=means3D,
+        means2D=means2D,
+        opacities=opacities,
+        scales=scales,
+        rotations=rotations,
+        intensity=intensity,
+        latent=latent,
+    )
+    return out
+
+
+def _lidar_scene_custom(
+    means3D: torch.Tensor,
+    scales: torch.Tensor,
+    opacities: torch.Tensor,
+    intensity: torch.Tensor,
+    latent: torch.Tensor,
+    *,
+    rotations: torch.Tensor | None = None,
+    image_width: int = 64,
+    image_height: int = 16,
+    el_min: float = math.radians(-30.0),
+    el_max: float = math.radians(10.0),
+    r_near: float = 0.2,
+    r_far: float = 100.0,
+):
+    from diff_quadratic_rasterization import LiDARRasterizer, make_lidar_settings
+
+    device = means3D.device
+    if rotations is None:
+        rotations = torch.zeros(means3D.shape[0], 4, device=device, dtype=torch.float32)
+        rotations[:, 0] = 1.0
+
+    viewmatrix = torch.eye(4, device=device, dtype=torch.float32)
+    campos = torch.zeros(3, device=device, dtype=torch.float32)
+    settings = make_lidar_settings(
+        image_height=image_height,
+        image_width=image_width,
+        el_min_rad=el_min,
+        el_max_rad=el_max,
+        viewmatrix=viewmatrix,
+        campos=campos,
+        r_near=r_near,
+        r_far=r_far,
+    )
+    return LiDARRasterizer(settings)(
+        means3D=means3D,
+        means2D=torch.zeros_like(means3D),
+        opacities=opacities,
+        scales=scales,
+        rotations=rotations,
+        intensity=intensity,
+        latent=latent,
+    )
 
 
 @cuda
@@ -464,6 +611,182 @@ def test_lidar_rasterizer_named_layout():
     assert torch.isfinite(out.middepth).all().item()
 
 
+def test_lidar_channel_layout_constants_are_exported():
+    """Python constants must stay in lockstep with channel_layout.h."""
+    import diff_quadratic_rasterization as dq
+
+    assert dq.NORMAL_OFFSET == dq.NUM_CHANNELS
+    assert dq.DEPTH_OFFSET == dq.NUM_CHANNELS + 3
+    assert dq.ALPHA_OFFSET == dq.NUM_CHANNELS + 4
+    assert dq.MIDDEPTH_OFFSET == dq.NUM_CHANNELS + 6
+    assert dq.CURVATURE_OFFSET == dq.NUM_CHANNELS + 8
+    assert dq.OUTPUT_CHANNELS == dq.NUM_CHANNELS + 10
+    assert dq.LIDAR_INTENSITY_OFFSET == 0
+    assert dq.LIDAR_LATENT_OFFSET == 1
+    assert dq.LIDAR_LATENT_DIM == dq.NUM_CHANNELS - 1
+
+
+@cuda
+def test_lidar_range_fov_empty_and_multihit_cases():
+    """Lock down the synthetic edge cases called out in the renderer plan."""
+    device = "cuda"
+
+    # Empty scenes should return all-zero maps and no primitive buffers.
+    empty = _lidar_scene(torch.empty((0, 3), device=device, dtype=torch.float32))
+    assert empty.raw.shape[1:] == (16, 64)
+    assert empty.radii.numel() == 0
+    assert empty.alpha_accum.abs().sum().item() == 0.0
+    assert empty.range.abs().sum().item() == 0.0
+
+    # Candidate culling is conservative: a primitive whose center is outside
+    # the range gate can still touch tiles if its support ball overlaps the
+    # range interval. Exact near/far rejection happens on solved hit roots.
+    gated = _lidar_scene(torch.tensor([
+        [0.0, 0.10, 0.0],   # too near
+        [0.0, 5.00, 0.0],   # valid
+        [0.0, 9.50, 0.0],   # too far for this setting
+    ], device=device, dtype=torch.float32), scale=0.45, r_near=0.2, r_far=8.0)
+    assert gated.radii.tolist()[0] > 0
+    assert gated.radii.tolist()[1] > 0
+    assert gated.radii.tolist()[2] == 0
+    hit = gated.alpha_accum > 1e-4
+    assert hit.any().item()
+    physical_range = gated.range[hit] / gated.alpha_accum[hit].clamp(min=1e-4)
+    assert (physical_range >= 0.2 - 1e-4).all().item()
+    assert (physical_range <= 8.0 + 1e-4).all().item()
+
+    # Vertical FOV edge: just inside the top boundary survives. Slightly outside
+    # can also survive candidate culling if the support overlaps the FOV; clearly
+    # outside the support envelope is culled.
+    el_top = math.radians(10.0)
+    r = 5.0
+    inside_z = math.tan(el_top - math.radians(0.25)) * r
+    near_outside_z = math.tan(el_top + math.radians(0.25)) * r
+    far_outside_z = math.tan(el_top + math.radians(8.0)) * r
+    fov = _lidar_scene(torch.tensor([
+        [0.0, r, inside_z],
+        [0.0, r, near_outside_z],
+        [0.0, r, far_outside_z],
+    ], device=device, dtype=torch.float32))
+    assert fov.radii.tolist()[0] > 0
+    assert fov.radii.tolist()[1] > 0
+    assert fov.radii.tolist()[2] == 0
+
+    # One-hit vs multi-hit: the same central ray with two depths should render
+    # an expected range between the two physical roots, not NaN/Inf or zero.
+    one = _lidar_scene(
+        torch.tensor([[0.0, 5.0, 0.0]], device=device, dtype=torch.float32),
+        scale=0.45,
+    )
+    multi = _lidar_scene(torch.tensor([
+        [0.0, 5.0, 0.0],
+        [0.0, 6.5, 0.0],
+    ], device=device, dtype=torch.float32), scale=0.45)
+    one_hit = one.alpha_accum > 1e-3
+    multi_hit = multi.alpha_accum > 1e-3
+    assert one_hit.any().item()
+    assert multi_hit.any().item()
+    one_phys = one.range[one_hit] / one.alpha_accum[one_hit].clamp(min=1e-3)
+    multi_phys = multi.range[multi_hit] / multi.alpha_accum[multi_hit].clamp(min=1e-3)
+    assert torch.isfinite(one_phys).all().item()
+    assert torch.isfinite(multi_phys).all().item()
+    assert one_phys.median().item() > 4.0
+    assert one_phys.median().item() < 6.0
+    assert multi_phys.median().item() > 4.0
+    assert multi_phys.median().item() < 7.0
+
+
+@cuda
+def test_lidar_cuda_matches_python_oracle_for_single_pixel_contract():
+    """Compare CUDA output against the slow Python QGS contract on one LiDAR ray."""
+    from diff_quadratic_rasterization import LIDAR_LATENT_DIM
+    from python_ref.qgs_ref import pixel_center_ray, render_single_pixel
+
+    device = "cuda"
+    dtype = torch.float32
+    W, H = 1, 1
+    el_min, el_max = -0.1, 0.1
+
+    means = torch.tensor([[0.0, 4.0, 0.0], [0.0, 6.0, 0.0]], device=device, dtype=dtype)
+    scales = torch.ones((2, 3), device=device, dtype=dtype)
+    opacities = torch.tensor([[0.30], [0.40]], device=device, dtype=dtype)
+    rotations = torch.tensor([[1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]], device=device, dtype=dtype)
+    intensity = torch.tensor([0.25, 0.75], device=device, dtype=dtype)
+    latent = torch.zeros((2, LIDAR_LATENT_DIM), device=device, dtype=dtype)
+    latent[0, 0] = 0.2
+    latent[1, 0] = 0.8
+
+    cuda_out = _lidar_scene_custom(
+        means,
+        scales,
+        opacities,
+        intensity,
+        latent,
+        rotations=rotations,
+        image_width=W,
+        image_height=H,
+        el_min=el_min,
+        el_max=el_max,
+    )
+    ray = pixel_center_ray(
+        torch.tensor(0.0, device=device, dtype=dtype),
+        torch.tensor(0.0, device=device, dtype=dtype),
+        image_width=W,
+        image_height=H,
+        el_min=el_min,
+        el_max=el_max,
+    )
+    oracle = render_single_pixel(ray, means, rotations, scales, opacities, intensity, latent)
+
+    assert torch.allclose(cuda_out.alpha_accum[0, 0], oracle["alpha_accum"], atol=2e-5)
+    assert torch.allclose(cuda_out.range[0, 0], oracle["range"], atol=2e-5)
+    assert torch.allclose(cuda_out.middepth[0, 0], oracle["middepth"], atol=2e-5)
+    assert torch.allclose(cuda_out.intensity[0, 0], oracle["intensity"], atol=2e-5)
+    assert torch.allclose(cuda_out.curvature[0, 0], oracle["curvature"], atol=2e-5)
+    assert torch.allclose(cuda_out.latent[0, 0, 0], oracle["latent"][0], atol=2e-5)
+
+
+@cuda
+def test_lidar_depth_sorting_is_independent_of_input_order():
+    """Pixel-resorted rendering must match depth-sorted compositing, not primitive input order."""
+    from diff_quadratic_rasterization import LIDAR_LATENT_DIM
+
+    device = "cuda"
+    dtype = torch.float32
+    W, H = 1, 1
+    el_min, el_max = -0.1, 0.1
+
+    means = torch.tensor([[0.0, 4.0, 0.0], [0.0, 6.0, 0.0], [0.0, 5.0, 0.0]], device=device, dtype=dtype)
+    scales = torch.ones((3, 3), device=device, dtype=dtype)
+    opacities = torch.tensor([[0.25], [0.35], [0.45]], device=device, dtype=dtype)
+    intensity = torch.tensor([0.1, 0.9, 0.5], device=device, dtype=dtype)
+    latent = torch.zeros((3, LIDAR_LATENT_DIM), device=device, dtype=dtype)
+    latent[:, 0] = torch.tensor([0.1, 0.9, 0.5], device=device, dtype=dtype)
+
+    forward = _lidar_scene_custom(
+        means, scales, opacities, intensity, latent,
+        image_width=W, image_height=H, el_min=el_min, el_max=el_max,
+    )
+
+    perm = torch.tensor([1, 2, 0], device=device)
+    shuffled = _lidar_scene_custom(
+        means[perm],
+        scales[perm],
+        opacities[perm],
+        intensity[perm],
+        latent[perm],
+        image_width=W,
+        image_height=H,
+        el_min=el_min,
+        el_max=el_max,
+    )
+
+    assert torch.allclose(forward.raw, shuffled.raw, atol=2e-5)
+    assert torch.allclose(forward.alpha_accum, shuffled.alpha_accum, atol=2e-5)
+    assert torch.allclose(forward.range, shuffled.range, atol=2e-5)
+    assert torch.allclose(forward.middepth, shuffled.middepth, atol=2e-5)
+
+
 @cuda
 def test_lidar_backward_runs_and_matches_finite_diff():
     """A3.x — LiDAR-mode backward.
@@ -612,4 +935,170 @@ def test_lidar_backward_runs_and_matches_finite_diff():
             f"sign disagreement on well-conditioned entries:\n"
             f"  autograd: {a.tolist()}\n"
             f"  fd      : {f.tolist()}"
+        )
+
+
+@cuda
+def test_lidar_backward_matches_finite_diff_for_shape_opacity_rotation():
+    """Exercise backward paths beyond means3D: scale, opacity, and rotation."""
+    from diff_quadratic_rasterization import (
+        ALPHA_OFFSET,
+        DEPTH_OFFSET,
+        LIDAR_LATENT_DIM,
+        LiDARRasterizer,
+        make_lidar_settings,
+    )
+
+    device = "cuda"
+    W, H = 40, 10
+    el_min = math.radians(-30.0)
+    el_max = math.radians(+10.0)
+
+    means3D_init = torch.tensor([
+        [0.2, 5.0, 0.1],
+        [1.0, 5.4, 0.2],
+    ], device=device, dtype=torch.float32)
+    scales_init = torch.tensor([
+        [0.28, 0.22, 0.12],
+        [0.24, 0.30, 0.10],
+    ], device=device, dtype=torch.float32)
+    opacities_init = torch.tensor([[0.62], [0.55]], device=device, dtype=torch.float32)
+    rotations_init = torch.tensor([
+        [0.9971888, 0.0, 0.0749297, 0.0],   # small y-axis tilt
+        [1.0, 0.0, 0.0, 0.0],
+    ], device=device, dtype=torch.float32)
+    rotations_init = rotations_init / rotations_init.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+    intensity = torch.full((2,), 0.5, device=device, dtype=torch.float32)
+    latent = torch.zeros((2, LIDAR_LATENT_DIM), device=device, dtype=torch.float32)
+
+    viewmatrix = torch.eye(4, device=device, dtype=torch.float32)
+    campos = torch.zeros(3, device=device, dtype=torch.float32)
+    settings = make_lidar_settings(
+        image_height=H,
+        image_width=W,
+        el_min_rad=el_min,
+        el_max_rad=el_max,
+        viewmatrix=viewmatrix,
+        campos=campos,
+    )
+
+    def render_loss(means3D, scales, opacities, rotations):
+        out = LiDARRasterizer(settings)(
+            means3D=means3D,
+            means2D=torch.zeros_like(means3D),
+            opacities=opacities,
+            scales=scales,
+            rotations=rotations,
+            intensity=intensity,
+            latent=latent,
+        )
+        return out.raw[DEPTH_OFFSET].sum() + 3.0 * out.raw[ALPHA_OFFSET].sum()
+
+    means3D = means3D_init.clone().requires_grad_(True)
+    scales = scales_init.clone().requires_grad_(True)
+    opacities = opacities_init.clone().requires_grad_(True)
+    rotations = rotations_init.clone().requires_grad_(True)
+
+    loss = render_loss(means3D, scales, opacities, rotations)
+    assert torch.isfinite(loss).item()
+    loss.backward()
+
+    for name, tensor in [("scales", scales), ("opacities", opacities), ("rotations", rotations)]:
+        assert tensor.grad is not None, f"{name} got no gradient"
+        assert torch.isfinite(tensor.grad).all().item(), f"{name}.grad has NaN/Inf"
+        assert tensor.grad.abs().sum().item() > 0.0, f"{name} gradient is identically zero"
+
+    checks = [
+        ("scale_x", scales, scales_init, (0, 0), 2e-3, scales.grad),
+        ("scale_z", scales, scales_init, (0, 2), 2e-3, scales.grad),
+        ("opacity", opacities, opacities_init, (0, 0), 1e-3, opacities.grad),
+    ]
+
+    for label, _tensor, base, idx, eps, grad in checks:
+        with torch.no_grad():
+            plus_means, minus_means = means3D_init, means3D_init
+            plus_scales, minus_scales = scales_init, scales_init
+            plus_opacities, minus_opacities = opacities_init, opacities_init
+            plus_rotations, minus_rotations = rotations_init, rotations_init
+
+            b_plus = base.clone()
+            b_minus = base.clone()
+            b_plus[idx] += eps
+            b_minus[idx] -= eps
+            if label.startswith("scale"):
+                plus_scales, minus_scales = b_plus, b_minus
+            elif label == "opacity":
+                plus_opacities, minus_opacities = b_plus, b_minus
+
+            lp = render_loss(plus_means, plus_scales, plus_opacities, plus_rotations)
+            lm = render_loss(minus_means, minus_scales, minus_opacities, minus_rotations)
+            fd = (lp - lm) / (2 * eps)
+
+        ag = grad[idx]
+        assert torch.isfinite(fd).item(), f"{label} finite diff is not finite"
+        assert fd.abs().item() > 1e-2, f"{label} finite diff too small to compare: {fd.item()}"
+        rel = (ag - fd).abs() / fd.abs().clamp(min=1e-3)
+        assert rel.item() < 0.35, (
+            f"{label} autograd vs FD disagreement: rel {rel.item():.3f}, "
+            f"autograd {ag.item():.6f}, fd {fd.item():.6f}"
+        )
+        assert ag.sign().item() == fd.sign().item(), (
+            f"{label} sign disagreement: autograd {ag.item():.6f}, fd {fd.item():.6f}"
+        )
+
+    rot_settings = make_lidar_settings(
+        image_height=16,
+        image_width=64,
+        el_min_rad=el_min,
+        el_max_rad=el_max,
+        viewmatrix=viewmatrix,
+        campos=campos,
+    )
+    rot_means = torch.tensor([[-1.0, 5.5, -0.2]], device=device, dtype=torch.float32)
+    rot_scales = torch.tensor([[1.0, 0.8, 0.1]], device=device, dtype=torch.float32)
+    rot_opacities = torch.tensor([[0.7]], device=device, dtype=torch.float32)
+    rot_init = torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=device, dtype=torch.float32)
+    rot_intensity = torch.full((1,), 0.5, device=device, dtype=torch.float32)
+    rot_latent = torch.zeros((1, LIDAR_LATENT_DIM), device=device, dtype=torch.float32)
+
+    def rotation_loss(rotations):
+        out = LiDARRasterizer(rot_settings)(
+            means3D=rot_means,
+            means2D=torch.zeros_like(rot_means),
+            opacities=rot_opacities,
+            scales=rot_scales,
+            rotations=rotations,
+            intensity=rot_intensity,
+            latent=rot_latent,
+        )
+        return out.raw[DEPTH_OFFSET].sum() + 3.0 * out.raw[ALPHA_OFFSET].sum()
+
+    rot = rot_init.clone().requires_grad_(True)
+    rot_loss = rotation_loss(rot)
+    assert torch.isfinite(rot_loss).item()
+    rot_loss.backward()
+
+    eps = 1e-3
+    for axis in range(3):
+        with torch.no_grad():
+            plus_rotations = _apply_local_tangent_delta(rot_init, 0, axis, eps)
+            minus_rotations = _apply_local_tangent_delta(rot_init, 0, axis, -eps)
+            lp = rotation_loss(plus_rotations)
+            lm = rotation_loss(minus_rotations)
+            fd = (lp - lm) / (2 * eps)
+
+        tangent = (
+            _apply_local_tangent_delta(rot_init, 0, axis, eps)[0]
+            - _apply_local_tangent_delta(rot_init, 0, axis, -eps)[0]
+        ) / (2 * eps)
+        ag = (rot.grad[0] * tangent).sum()
+        assert torch.isfinite(fd).item(), f"rotation axis {axis} finite diff is not finite"
+        assert fd.abs().item() > 1e-2, f"rotation axis {axis} finite diff too small: {fd.item()}"
+        rel = (ag - fd).abs() / fd.abs().clamp(min=1e-3)
+        assert rel.item() < 0.35, (
+            f"rotation axis {axis} tangent autograd vs FD disagreement: "
+            f"rel {rel.item():.3f}, autograd {ag.item():.6f}, fd {fd.item():.6f}"
+        )
+        assert ag.sign().item() == fd.sign().item(), (
+            f"rotation axis {axis} sign disagreement: autograd {ag.item():.6f}, fd {fd.item():.6f}"
         )

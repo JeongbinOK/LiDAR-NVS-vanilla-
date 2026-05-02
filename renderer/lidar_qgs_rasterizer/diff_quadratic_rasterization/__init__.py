@@ -160,7 +160,9 @@ class _RasterizeGaussians(torch.autograd.Function):
                 raster_settings.debug,
                 raster_settings.stop_z_gradient,
                 raster_settings.reciprocal_z,
-                raster_settings.lidar_mode)
+                raster_settings.lidar_mode,
+                raster_settings.r_near,
+                raster_settings.r_far)
 
         # Compute gradients for relevant tensors by invoking backward method
         if raster_settings.debug:
@@ -252,9 +254,16 @@ class GaussianRasterizer(nn.Module):
         if rotations is None:
             rotations = torch.Tensor([])
 
-        # TODO check and raise exception for precomputed view2gaussian
         if view2gaussian_precomp is None:
             view2gaussian_precomp = torch.Tensor([])
+        elif view2gaussian_precomp.numel() > 0:
+            N = means3D.shape[0]
+            shp = tuple(view2gaussian_precomp.shape)
+            if shp != (N, 4, 4) and shp != (N, 16):
+                raise ValueError(
+                    f"view2gaussian_precomp must be [N,4,4] or [N,16] "
+                    f"(row-major), got shape {shp} with N={N}"
+                )
             
         # Invoke C++/CUDA rasterization routine
         return rasterize_gaussians(
@@ -298,7 +307,7 @@ class LiDARRasterOutput(NamedTuple):
     intensity:   torch.Tensor              # [H, W]      alpha-blended scalar in [0,1]
     alpha_accum: torch.Tensor              # [H, W]      ∑ T_i α_i in [0,1]
     normal:      torch.Tensor              # [3, H, W]   sensor-frame xyz
-    curvature:   torch.Tensor              # [H, W]      alpha-blended |κ|
+    curvature:   torch.Tensor              # [H, W]      alpha-blended signed Gaussian curvature κ
     latent:      torch.Tensor              # [L, H, W]   alpha-blended latent (L=LIDAR_LATENT_DIM)
     drop_logit:  Optional[torch.Tensor]    # [H, W] or None — None until A3.4
     radii:       torch.Tensor              # [N]         per-Gaussian image radius
@@ -387,8 +396,8 @@ class LiDARRasterizer(nn.Module):
         means3D:    [N, 3]    primitive centres in world frame
         means2D:    [N, 3]    placeholder for image-space gradients (autograd only)
         opacities:  [N, 1]    α_i in (0, 1)
-        scales:     [N, 3]    signed s1/s2 surface signature plus positive s3
-                              curvature magnitude
+        scales:     [N, 3]    signed QGS surface scales; s1/s2 set tangent
+                              curvature signs and s3 is the height scale
         rotations:  [N, 4]    quaternions (w, x, y, z)
         intensity:  [N]       per-Gaussian scalar in [0, 1]
         latent:     [N, L]    per-Gaussian latent. L must equal LIDAR_LATENT_DIM.
@@ -423,9 +432,11 @@ class LiDARRasterizer(nn.Module):
             )
         if latent.shape[1] != LIDAR_LATENT_DIM:
             raise ValueError(
-                f"latent dim {latent.shape[1]} != LIDAR_LATENT_DIM={LIDAR_LATENT_DIM}. "
-                f"Truncate or zero-pad upstream, or rebuild the rasterizer with a "
-                f"larger NUM_CHANNELS (see auxiliary.h)."
+                f"latent dim {latent.shape[1]} != LIDAR_LATENT_DIM={LIDAR_LATENT_DIM} "
+                f"(current build). Either truncate/zero-pad upstream, or rebuild "
+                f"the rasterizer with the desired dim:\n"
+                f"    LIDAR_LATENT_DIM={latent.shape[1]} pip install -e "
+                f"renderer/lidar_qgs_rasterizer --force-reinstall --no-deps"
             )
         return torch.cat([intensity.unsqueeze(-1), latent], dim=-1).contiguous()
 

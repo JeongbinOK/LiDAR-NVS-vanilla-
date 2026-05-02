@@ -197,6 +197,15 @@ class TestFrustum:
 # ---------------------------------------------------------------------------
 
 class TestAabbSpherical:
+    def _assert_angles_inside(self, out, az, el):
+        if out["wrapped"].item():
+            az_ok = (az >= out["az_min"].item() - 1e-6) | (az <= out["az_max"].item() + 1e-6)
+        else:
+            az_ok = (az >= out["az_min"].item() - 1e-6) & (az <= out["az_max"].item() + 1e-6)
+        el_ok = (el >= out["el_min"].item() - 1e-6) & (el <= out["el_max"].item() + 1e-6)
+        assert az_ok.all(), (az[~az_ok][:8], out)
+        assert el_ok.all(), (el[~el_ok][:8], out)
+
     def test_small_ball_no_wrap(self):
         """Ball of R=0.1 at 5m forward → small extent, no wrap."""
         p = torch.tensor([[0.0, 5.0, 0.0]])
@@ -237,23 +246,20 @@ class TestAabbSpherical:
         assert out["wrapped"].item()
         assert out["az_min"].item() > out["az_max"].item()
 
-    def test_R_equals_r_at_equator_gives_pi_over_2_extent(self):
-        """R_eff = r at equator → theta_half = π/2 → az ∈ [-π/2, π/2], el clamps to ±π/2."""
+    def test_R_equals_r_at_equator_gives_full_azimuth_superset(self):
+        """R_eff = r at equator includes both poles, so a conservative azimuth AABB is full circle."""
         p = torch.tensor([[0.0, 1.0, 0.0]])
         R_eff = torch.tensor([1.0])
         out = aabb_spherical(p, R_eff)
-        assert torch.isclose(out["az_min"], torch.tensor(-HALF_PI), atol=1e-5)
-        assert torch.isclose(out["az_max"], torch.tensor(HALF_PI),  atol=1e-5)
+        assert torch.isclose(out["az_min"], torch.tensor(-PI), atol=1e-6)
+        assert torch.isclose(out["az_max"], torch.tensor(PI),  atol=1e-6)
         # Elevation extent is symmetric ±π/2 around 0 → fully clamped
         assert torch.isclose(out["el_min"], torch.tensor(-HALF_PI), atol=1e-6)
         assert torch.isclose(out["el_max"], torch.tensor(HALF_PI),  atol=1e-6)
         assert not out["wrapped"].item()
 
-    def test_full_circle_when_az_half_saturates(self):
-        """Near-pole + R≈r drives az_half = theta_half/cos(el) ≥ π → full azimuth circle, no wrap."""
-        # el ≈ 80° → cos_el ≈ 0.174. Need theta_half ≥ π·cos_el ≈ 0.546 rad.
-        # asin(R/r) = 0.546 → R/r ≥ 0.519. Use R/r = 0.6.
-        # Build a point with explicit el = 80°.
+    def test_full_circle_when_cap_reaches_pole(self):
+        """A cap that reaches a pole must cover all azimuths."""
         el_target = math.radians(80.0)
         r = 5.0
         x = 0.0
@@ -265,6 +271,38 @@ class TestAabbSpherical:
         assert torch.isclose(out["az_min"], torch.tensor(-PI), atol=1e-6), out["az_min"]
         assert torch.isclose(out["az_max"], torch.tensor(PI),  atol=1e-6), out["az_max"]
         assert not out["wrapped"].item()
+
+    def test_az_extent_uses_exact_spherical_cap_formula_inside_lidar_fov(self):
+        """Within the [-30°, 10°] LiDAR FOV, the exact cap formula is still wider than the small-angle approximation."""
+        el_target = math.radians(-29.0)
+        r = 5.0
+        p = torch.tensor([[0.0, r * math.cos(el_target), r * math.sin(el_target)]])
+        R_eff = torch.tensor([0.4 * r])
+        out = aabb_spherical(p, R_eff)
+
+        sin_half = 0.4
+        theta_half = math.asin(sin_half)
+        exact_az_half = math.asin(sin_half / math.cos(el_target))
+        old_small_angle = theta_half / math.cos(el_target)
+        assert exact_az_half > old_small_angle
+        assert torch.isclose(out["az_min"], torch.tensor(-exact_az_half), atol=1e-6)
+        assert torch.isclose(out["az_max"], torch.tensor(exact_az_half), atol=1e-6)
+
+    def test_aabb_contains_sampled_ball_points_inside_lidar_fov(self):
+        """The angular box must be a superset of projected points from the 3D candidate ball."""
+        torch.manual_seed(3)
+        el_target = math.radians(-28.0)
+        r = 6.0
+        center = torch.tensor([[0.0, r * math.cos(el_target), r * math.sin(el_target)]])
+        R_eff = torch.tensor([0.35 * r])
+        out = aabb_spherical(center, R_eff)
+
+        samples = torch.randn(20000, 3)
+        samples = samples / samples.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        radius = torch.rand(20000, 1).pow(1.0 / 3.0) * R_eff.item()
+        points = center + samples * radius
+        projected = project_to_sphere(points)
+        self._assert_angles_inside(out, projected[:, 1], projected[:, 2])
 
     def test_elevation_clamp_high(self):
         """Centre near zenith → el_max clamps at +π/2."""

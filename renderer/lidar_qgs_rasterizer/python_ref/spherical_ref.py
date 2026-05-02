@@ -88,12 +88,16 @@ def aabb_spherical(p: torch.Tensor, R_eff: torch.Tensor):
     el_max = (el_c + theta_half).clamp(max=HALF_PI)
 
     cos_el = torch.cos(el_c).abs().clamp(min=SPH_EPS)
-    az_half = (theta_half / cos_el).clamp(max=PI)
+    full_circle = sin_half >= cos_el
+    az_half = torch.where(
+        full_circle,
+        torch.full_like(theta_half, PI),
+        torch.asin((sin_half / cos_el).clamp(max=1.0)),
+    )
 
     az_min = az_c - az_half
     az_max = az_c + az_half
 
-    full_circle = (az_half >= PI)
     wrapped = torch.zeros_like(r, dtype=torch.bool)
 
     # Wrap az_min < -π
