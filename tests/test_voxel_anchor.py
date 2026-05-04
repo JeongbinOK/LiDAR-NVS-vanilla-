@@ -4,7 +4,11 @@ import torch
 
 from models.geometry.cartesian_voxel import CartesianVoxelizer
 from models.geometry.spherical_voxel import SphericalVoxelizer
-from models.geometry.voxel_anchor import VoxelAnchorBuilder, build_anchor_token
+from models.geometry.voxel_anchor import (
+    VoxelAnchorBuilder,
+    _masked_neighbor_intensity_stats,
+    build_anchor_token,
+)
 
 
 def test_spherical_query_voxel_min_points_is_separate_from_anchor_k_min():
@@ -84,3 +88,22 @@ def test_anchor_token_with_normal_keeps_25d_width_for_empty_output():
     out = builder(torch.zeros(0, 3), torch.zeros(0), torch.zeros(0))
 
     assert out.token.shape == (0, 25)
+
+def test_anchor_intensity_stats_use_masked_knn_support():
+    intensity = torch.tensor([0.1, 0.3, 0.9])
+    idx = torch.tensor([
+        [0, 1, -1],
+        [2, 0, 1],
+    ])
+    mask = idx >= 0
+
+    mean, std = _masked_neighbor_intensity_stats(intensity, idx, mask)
+
+    expected_mean0 = torch.tensor(0.2)
+    expected_std0 = torch.tensor(0.1)
+    expected_mean1 = torch.tensor((0.9 + 0.1 + 0.3) / 3.0)
+    expected_std1 = torch.stack([
+        (intensity[[2, 0, 1]] - expected_mean1).pow(2).mean().sqrt()
+    ])[0]
+    assert torch.allclose(mean, torch.stack([expected_mean0, expected_mean1]))
+    assert torch.allclose(std, torch.stack([expected_std0, expected_std1]), atol=1e-6)

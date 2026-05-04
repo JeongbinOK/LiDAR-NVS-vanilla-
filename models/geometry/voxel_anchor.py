@@ -167,9 +167,28 @@ def build_anchor_token(
     return token
 
 
+def _masked_neighbor_intensity_stats(
+    candidate_intensity: Tensor,
+    idx: Tensor,
+    mask: Tensor,
+) -> tuple[Tensor, Tensor]:
+    """Mean/std over the same k-NN support used to initialise each QGS."""
+    nbr_i = candidate_intensity[idx.clamp(min=0)]
+    mask_f = mask.to(dtype=nbr_i.dtype)
+    count = mask_f.sum(dim=1).clamp(min=1.0)
+    mean_i = (nbr_i * mask_f).sum(dim=1) / count
+    mean_i2 = ((nbr_i * nbr_i) * mask_f).sum(dim=1) / count
+    std_i = (mean_i2 - mean_i * mean_i).clamp(min=0.0).sqrt()
+    has_support = mask.any(dim=1)
+    mean_i = torch.where(has_support, mean_i, torch.zeros_like(mean_i))
+    std_i = torch.where(has_support, std_i, torch.zeros_like(std_i))
+    return mean_i, std_i
+
+
 def _quad_fit_and_token(
     vox: SphericalVoxelOutput,
     candidates_xyz: Tensor,
+    candidates_intensity: Tensor,
     *,
     k_min: int,
     k_target: int,
@@ -195,6 +214,11 @@ def _quad_fit_and_token(
     )
     idx_knn = knn["idx"].clamp(min=0)
     nbrs = candidates_xyz[idx_knn]                  # [M, K, 3]
+    knn_i_mean, knn_i_std = _masked_neighbor_intensity_stats(
+        candidates_intensity,
+        knn["idx"],
+        knn["mask"],
+    )
     k_eff = knn["k_eff"]
     k_eff_mask = k_eff >= k_min
 
@@ -253,8 +277,8 @@ def _quad_fit_and_token(
     tangent_aniso = tangent_aniso.index_select(0, keep)
     curvature_aniso = curvature_aniso.index_select(0, keep)
     n_points = vox.n_points.index_select(0, keep)
-    i_mean = vox.i_mean.index_select(0, keep)
-    i_std = vox.i_std.index_select(0, keep)
+    i_mean = knn_i_mean.index_select(0, keep)
+    i_std = knn_i_std.index_select(0, keep)
     src_ratio = vox.src_ratio.index_select(0, keep)
     diagnostics["use_geom_init_pass"] = int(use_geom.sum().item())
 
@@ -354,6 +378,7 @@ class VoxelAnchorBuilder:
         return _quad_fit_and_token(
             vox,
             candidates_xyz=xyz,
+            candidates_intensity=intensity,
             k_min=self.k_min,
             k_target=self.k_target,
             residual_threshold=self.residual_threshold,
@@ -461,6 +486,7 @@ class DynamicVoxelAnchorBuilder:
             out = _quad_fit_and_token(
                 vox,
                 candidates_xyz=xyz,
+                candidates_intensity=intensity,
                 k_min=self.k_min,
                 k_target=self.k_target,
                 residual_threshold=self.residual_threshold,
