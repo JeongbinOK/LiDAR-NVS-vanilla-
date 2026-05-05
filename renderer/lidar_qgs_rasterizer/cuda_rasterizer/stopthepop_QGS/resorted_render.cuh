@@ -900,13 +900,15 @@ renderkBufferBackwardCUDA(
 			dL_dAA = 0.0f;
 			if (fabs(BB) >= 1e-8)
 			{
-				dL_dBB = dL_dt * (CC * __frcp_rn(BB * BB));
-				dL_dCC = dL_dt * (-__frcp_rn(BB));
+				const float BB_safe = copysignf(fmaxf(fabsf(BB), 1e-8f), BB);
+				dL_dBB = dL_dt * (CC * __frcp_rn(BB_safe * BB_safe));
+				dL_dCC = dL_dt * (-__frcp_rn(BB_safe));
 			}
 		}
 		else
 		{
-			rdiscriminant_sq = __frcp_rn(__fsqrt_rn(discriminant));
+			const float discriminant_safe = fmaxf(discriminant, 1e-10f);
+			rdiscriminant_sq = __frcp_rn(__fsqrt_rn(discriminant_safe));
 			dL_dAA = dL_dt * r2AA * 2 * (- depth - CC * sign * rdiscriminant_sq);
 			dL_dBB = dL_dt * (BB * sign * rdiscriminant_sq - 1) * r2AA;
 			dL_dCC = dL_dt * (-sign * rdiscriminant_sq);
@@ -967,7 +969,7 @@ renderkBufferBackwardCUDA(
 		float dL_dview2gaussian_j[16] = {
 			 dL_drg.x * ray_point.x, dL_drg.y * ray_point.x, dL_drg.z * ray_point.x, 0,
 			 dL_drg.x * ray_point.y, dL_drg.y * ray_point.y, dL_drg.z * ray_point.y, 0,
-			 dL_drg.x, dL_drg.y, dL_drg.z, 0,
+			 dL_drg.x * ray_point.z, dL_drg.y * ray_point.z, dL_drg.z * ray_point.z, 0,
 			 dL_dog.x, dL_dog.y, dL_dog.z, 0
 		};
 		if (return_normal){

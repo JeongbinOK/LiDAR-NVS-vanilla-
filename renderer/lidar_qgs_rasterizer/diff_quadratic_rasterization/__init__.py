@@ -441,6 +441,48 @@ class LiDARRasterizer(nn.Module):
         return torch.cat([intensity.unsqueeze(-1), latent], dim=-1).contiguous()
 
     @staticmethod
+    def _compute_view2gaussian(
+        means3D: torch.Tensor,
+        rotations: torch.Tensor,
+        viewmatrix: torch.Tensor,
+    ) -> torch.Tensor:
+        """Differentiable view-to-Gaussian transform matching CUDA layout."""
+        q = rotations / rotations.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        r, x, y, z = q.unbind(dim=-1)
+        R = torch.stack(
+            [
+                1.0 - 2.0 * (y * y + z * z),
+                2.0 * (x * y - r * z),
+                2.0 * (x * z + r * y),
+                2.0 * (x * y + r * z),
+                1.0 - 2.0 * (x * x + z * z),
+                2.0 * (y * z - r * x),
+                2.0 * (x * z - r * y),
+                2.0 * (y * z + r * x),
+                1.0 - 2.0 * (x * x + y * y),
+            ],
+            dim=-1,
+        ).reshape(-1, 3, 3)
+
+        N = means3D.shape[0]
+        G2W = torch.eye(4, device=means3D.device, dtype=means3D.dtype).expand(N, 4, 4).clone()
+        G2W[:, :3, :3] = R
+        G2W[:, 3, :3] = means3D
+
+        G2V = viewmatrix.to(device=means3D.device, dtype=means3D.dtype).unsqueeze(0) @ G2W
+        R_g2v = G2V[:, :3, :3]
+        R_t = R_g2v.transpose(1, 2)
+        t = G2V[:, 3, :3]
+
+        out = torch.zeros((N, 4, 4), device=means3D.device, dtype=means3D.dtype)
+        # CUDA transform helpers index the flat buffer as a column-major 3x4
+        # matrix. Row-major [N,4,4] storage therefore needs R, not R^T, here.
+        out[:, :3, :3] = R_g2v
+        out[:, 3, :3] = -(R_t @ t.unsqueeze(-1)).squeeze(-1)
+        out[:, 3, 3] = 1.0
+        return out.contiguous()
+
+    @staticmethod
     def _unpack(
         rendered: torch.Tensor,
         radii: torch.Tensor,
@@ -480,15 +522,20 @@ class LiDARRasterizer(nn.Module):
         latent: torch.Tensor,
     ) -> LiDARRasterOutput:
         colors_precomp = self._pack_features(intensity, latent)
+        view2gaussian_precomp = self._compute_view2gaussian(
+            means3D,
+            rotations,
+            self.raster_settings.viewmatrix,
+        )
         rendered, radii, aabb, n_touched = rasterize_gaussians(
-            means3D=means3D,
+            means3D=means3D.detach(),
             means2D=means2D,
             sh=torch.empty(0, device=means3D.device),
             colors_precomp=colors_precomp,
             opacities=opacities,
             scales=scales,
-            rotations=rotations,
-            view2gaussian_precomp=torch.empty(0, device=means3D.device),
+            rotations=rotations.detach(),
+            view2gaussian_precomp=view2gaussian_precomp,
             raster_settings=self.raster_settings,
         )
         return self._unpack(rendered, radii, aabb, n_touched)
