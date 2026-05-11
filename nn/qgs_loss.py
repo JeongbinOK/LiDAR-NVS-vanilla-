@@ -36,7 +36,7 @@ class QGSLoss(nn.Module):
         w_raydrop: float = 0.1,
         w_distortion: float = 0.05,
         w_normal: float = 0.05,
-        alpha_eps: float = 1e-3,
+        alpha_eps: float = 0.5,
         raydrop_eps: float = 1e-4,
     ) -> None:
         super().__init__()
@@ -60,6 +60,8 @@ class QGSLoss(nn.Module):
             drop_prob = drop_prob[0]
         valid_f = valid_mask.to(dtype=rendered.range.dtype)
         n_valid = valid_f.sum().clamp(min=1.0)
+        pred_hit_mask = rendered.alpha_accum > self.alpha_eps
+        coverage = (pred_hit_mask & valid_mask).float().sum() / n_valid
 
         depth_gt = target["range_image"]
         intensity_gt = target["intensity_image"]
@@ -163,7 +165,7 @@ class QGSLoss(nn.Module):
             "distortion": distortion_loss.detach(),
             "normal": normal_loss.detach(),
             "n_valid": n_valid.detach(),
-            "valid_ratio": valid_f.mean().detach(),
+            "coverage": coverage.detach(),
             "raydrop_hit": raydrop_loss_hit.detach(),
             "raydrop_miss": raydrop_loss_miss.detach(),
             "drop_prob_hit_mean": drop_prob_hit_mean.detach(),

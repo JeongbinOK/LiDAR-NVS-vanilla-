@@ -624,7 +624,7 @@ def process_pair(model, loss_fn, ray_dir, batch, idx, device, cfg, profile: dict
         "distortion": 0.5 * (loss0["distortion"] + loss1["distortion"]),
         "normal": 0.5 * (loss0["normal"] + loss1["normal"]),
         "n_valid": 0.5 * (loss0["n_valid"] + loss1["n_valid"]),
-        "valid_ratio": 0.5 * (loss0["valid_ratio"] + loss1["valid_ratio"]),
+        "coverage": 0.5 * (loss0["coverage"] + loss1["coverage"]),
         "raydrop_hit": 0.5 * (loss0["raydrop_hit"] + loss1["raydrop_hit"]),
         "raydrop_miss": 0.5 * (loss0["raydrop_miss"] + loss1["raydrop_miss"]),
         "drop_prob_hit_mean": 0.5 * (loss0["drop_prob_hit_mean"] + loss1["drop_prob_hit_mean"]),
@@ -934,7 +934,7 @@ def train(cfg: QGSConfig, overfit_frames: int = 0, resume: str = ""):
             f"raydrop={avg['raydrop']:.3f} "
             f"dist={avg.get('distortion', 0.0):.3f} "
             f"nrm={avg.get('normal', 0.0):.3f} "
-            f"valid={avg.get('valid_ratio', 0.0):.3f} "
+            f"cov={avg.get('coverage', 0.0):.3f} "
             f"dC={avg.get('diag_delta_c', 0.0):.4f} "
             f"tilt={avg.get('diag_tilt_deg', 0.0):.2f}° spin={avg.get('diag_spin_deg', 0.0):.2f}° "
             f"dMu={avg.get('diag_delta_mu', 0.0):.4f}(sgn={avg.get('diag_delta_mu_sign', 0.0):+.3f}) "
