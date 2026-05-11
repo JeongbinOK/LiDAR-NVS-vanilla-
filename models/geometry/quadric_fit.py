@@ -188,8 +188,7 @@ def fit_local_quadrics(
     I_inv_sqrt = i_vecs @ torch.diag_embed(i_vals.clamp(min=_EPS).rsqrt()) @ i_vecs.transpose(-1, -2)
     shape_sym = I_inv_sqrt @ II_second @ I_inv_sqrt
     shape_sym = 0.5 * (shape_sym + shape_sym.transpose(-1, -2))
-    h_vals, h_vecs = _safe_eig_sym(shape_sym)
-    h_vals = h_vals.clamp(min=-float(quadric_kappa_max), max=float(quadric_kappa_max))
+    _, h_vecs = _safe_eig_sym(shape_sym)
 
     param_dirs = I_inv_sqrt @ h_vecs
     v1 = param_dirs[:, :, 0]
@@ -198,38 +197,22 @@ def fit_local_quadrics(
     tangent2_local = torch.stack([v2[:, 0], v2[:, 1], g1 * v2[:, 0] + g2 * v2[:, 1]], dim=-1)
     e1_raw = torch.bmm(R_pca, tangent1_local.unsqueeze(-1)).squeeze(-1)
     e2_raw = torch.bmm(R_pca, tangent2_local.unsqueeze(-1)).squeeze(-1)
+
+    # Preserve the two shape-operator principal directions while making the
+    # renderer frame explicitly orthonormal in world space.
+    e1_raw = e1_raw - (e1_raw * normal).sum(dim=-1, keepdim=True) * normal
     e1_raw = torch.nn.functional.normalize(e1_raw, dim=-1, eps=_EPS)
+    e2_tangent = e2_raw - (e2_raw * normal).sum(dim=-1, keepdim=True) * normal
+    e2_tangent = e2_tangent - (e2_tangent * e1_raw).sum(dim=-1, keepdim=True) * e1_raw
+    e2_fallback = torch.cross(normal, e1_raw, dim=1)
+    e2_norm = e2_tangent.norm(dim=-1, keepdim=True)
+    e2_raw = torch.where(e2_norm > _EPS, e2_tangent / e2_norm.clamp(min=_EPS), e2_fallback)
     e2_raw = torch.nn.functional.normalize(e2_raw, dim=-1, eps=_EPS)
 
-    # Tangent extent of the observed local patch.  These RMS projections measure
-    # how far the 16-neighbour patch spreads along each tangent axis; they are
-    # used as the preferred size of the Gaussian footprint, not as curvature.
-    q_mu = (nbr_flat - mu.unsqueeze(1)) * valid_f.unsqueeze(-1)
-    proj1 = (q_mu * e1_raw.unsqueeze(1)).sum(dim=-1)
-    proj2 = (q_mu * e2_raw.unsqueeze(1)).sum(dim=-1)
-    rms1 = ((proj1 ** 2) * valid_f).sum(dim=1) / n_valid
-    rms2 = ((proj2 ** 2) * valid_f).sum(dim=1) / n_valid
-    s1_raw_abs = float(quadric_gamma) * rms1.clamp(min=0.0).sqrt()
-    s2_raw_abs = float(quadric_gamma) * rms2.clamp(min=0.0).sqrt()
-    s1_raw_abs = s1_raw_abs.clamp(min=float(quadric_eps_lambda))
-    s2_raw_abs = s2_raw_abs.clamp(min=float(quadric_eps_lambda))
-    kappa1_raw = h_vals[:, 0]
-    kappa2_raw = h_vals[:, 1]
-
-    # Canonical tangent order: expose the wider tangent extent as |s1|.
-    swap_axes = s1_raw_abs < s2_raw_abs
-    e1 = torch.where(swap_axes.unsqueeze(1), e2_raw, e1_raw)
-    e2 = torch.where(swap_axes.unsqueeze(1), -e1_raw, e2_raw)
-    s1_abs = torch.where(swap_axes, s2_raw_abs, s1_raw_abs)
-    s2_abs = torch.where(swap_axes, s1_raw_abs, s2_raw_abs)
-    kappa1_init = torch.where(swap_axes, kappa2_raw, kappa1_raw)
-    kappa2_init = torch.where(swap_axes, kappa1_raw, kappa2_raw)
-
-    R_canonical = torch.stack([e1, e2, normal], dim=-1)
+    R_canonical = torch.stack([e1_raw, e2_raw, normal], dim=-1)
     neg_det = torch.linalg.det(R_canonical) < 0
     if neg_det.any():
         R_canonical[neg_det, :, 1] = -R_canonical[neg_det, :, 1]
-        e2 = R_canonical[:, :, 1]
 
     # Final constrained QGS patch fit.  The general quadratic above only
     # estimates centre/frame; the initial QGS coefficients are fitted directly
@@ -260,6 +243,40 @@ def fit_local_quadrics(
     z_mean_valid = (w * weights).sum(dim=1) / weight_sum
     z_var = (((w - z_mean_valid.unsqueeze(1)) ** 2) * weights).sum(dim=1) / weight_sum
     fit_residual = mean_res / (z_var + _EPS)
+
+    # Tangent extent of the observed local patch in the same final QGS local
+    # coordinates used by the direct LS fit.  These RMS extents are the preferred
+    # Gaussian footprint size, not curvature coefficients.
+    rms1 = ((u ** 2) * valid_f).sum(dim=1) / n_valid
+    rms2 = ((v ** 2) * valid_f).sum(dim=1) / n_valid
+    s1_abs = (float(quadric_gamma) * rms1.clamp(min=0.0).sqrt()).clamp(
+        min=float(quadric_eps_lambda)
+    )
+    s2_abs = (float(quadric_gamma) * rms2.clamp(min=0.0).sqrt()).clamp(
+        min=float(quadric_eps_lambda)
+    )
+
+    # Canonical tangent order: expose the wider final-frame tangent extent as
+    # |s1|.  Swapping u/v leaves the fitted surface unchanged if a/b and R move
+    # together.
+    swap_axes = s1_abs < s2_abs
+    R_swapped = torch.stack(
+        [R_canonical[:, :, 1], -R_canonical[:, :, 0], R_canonical[:, :, 2]],
+        dim=-1,
+    )
+    R_canonical = torch.where(
+        swap_axes.view(BN, 1, 1).expand_as(R_canonical),
+        R_swapped,
+        R_canonical,
+    )
+    s1_abs, s2_abs = (
+        torch.where(swap_axes, s2_abs, s1_abs),
+        torch.where(swap_axes, s1_abs, s2_abs),
+    )
+    qgs_a, qgs_b = (
+        torch.where(swap_axes, qgs_b, qgs_a),
+        torch.where(swap_axes, qgs_a, qgs_b),
+    )
 
     kappa1_init = 2.0 * qgs_a
     kappa2_init = 2.0 * qgs_b
