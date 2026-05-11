@@ -4,7 +4,8 @@ Pipeline (plan §-0):
                  voxelize  →  k-NN  →  quad_fit  →  2-stage filter  →  22-ch token
 
 Static branch (`VoxelAnchorBuilder`):
-    LiDAR_0-origin spherical voxel, candidates = whole static cloud.
+    Per-frame-origin spherical voxel queries merged in frame-0 coordinates,
+    candidates = whole static cloud in frame-0 coordinates.
 
 Dynamic branch (`DynamicVoxelAnchorBuilder`):
     Per-instance bbox-local cartesian voxel (size = max(bbox_dim) / 8),
@@ -14,6 +15,7 @@ Dynamic branch (`DynamicVoxelAnchorBuilder`):
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass
 from typing import Callable
 
@@ -32,6 +34,21 @@ _TOKEN_LOG_SCALE_SPAN = 4.0
 _TOKEN_KAPPA_SCALE = 5.0
 _TOKEN_QUALITY_SCALE = 2.0
 _TOKEN_ANISO_SCALE = 2.0
+
+
+def _profile_sync(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def _profile_mark(profile: dict | None, name: str, start: float, device: torch.device) -> float:
+    if profile is None:
+        return time.perf_counter()
+    _profile_sync(device)
+    now = time.perf_counter()
+    timings = profile.setdefault("timings_ms", {})
+    timings[name] = timings.get(name, 0.0) + (now - start) * 1000.0
+    return now
 
 
 @dataclass(frozen=True)
@@ -197,12 +214,22 @@ def _quad_fit_and_token(
     planarity_threshold: float,
     token_variant: str,
     knn_chunk_size: int,
+    knn_method: str,
     r_max_fn: Callable[[Tensor], Tensor],
+    quadric_gamma: float = 1.0,
+    quadric_kappa_max: float = 5.0,
+    quadric_eps_lambda: float = 0.01,
+    quadric_eps_kappa: float = 1e-3,
+    quadric_eps_s: float = 1e-3,
+    quadric_eps_s3: float = 1e-4,
+    profile: dict | None = None,
+    profile_prefix: str = "anchor",
 ) -> VoxelAnchorOutput:
     """k-NN + quad_fit + 2-stage filter + 22-ch token build."""
     device = candidates_xyz.device
     dtype = candidates_xyz.dtype
     token_width = 25 if token_variant == "with_normal" else 22
+    t_prof = time.perf_counter()
 
     knn = hybrid_radius_knn(
         points=vox.query_xyz,
@@ -211,7 +238,9 @@ def _quad_fit_and_token(
         r_max_fn=r_max_fn,
         k_min=k_min,
         chunk_size=knn_chunk_size,
+        method=knn_method,
     )
+    t_prof = _profile_mark(profile, f"{profile_prefix}_knn", t_prof, device)
     idx_knn = knn["idx"].clamp(min=0)
     nbrs = candidates_xyz[idx_knn]                  # [M, K, 3]
     knn_i_mean, knn_i_std = _masked_neighbor_intensity_stats(
@@ -221,6 +250,7 @@ def _quad_fit_and_token(
     )
     k_eff = knn["k_eff"]
     k_eff_mask = k_eff >= k_min
+    t_prof = _profile_mark(profile, f"{profile_prefix}_neighbor_gather", t_prof, device)
 
     geom = fit_local_quadrics(
         points=vox.query_xyz.unsqueeze(0),
@@ -228,7 +258,14 @@ def _quad_fit_and_token(
         k_eff=k_eff.unsqueeze(0),
         k_min=k_min,
         k_target=k_target,
+        quadric_gamma=quadric_gamma,
+        quadric_kappa_max=quadric_kappa_max,
+        quadric_eps_lambda=quadric_eps_lambda,
+        quadric_eps_kappa=quadric_eps_kappa,
+        quadric_eps_s=quadric_eps_s,
+        quadric_eps_s3=quadric_eps_s3,
     )
+    t_prof = _profile_mark(profile, f"{profile_prefix}_quad_fit", t_prof, device)
     c_init = geom["c_init"][0]
     R_init = geom["R_init"][0]
     s_init = geom["s_init"][0]
@@ -259,6 +296,7 @@ def _quad_fit_and_token(
         "token_variant": token_variant,
         "fallback_reason": None,
     }
+    t_prof = _profile_mark(profile, f"{profile_prefix}_filter", t_prof, device)
     keep = pass_mask.nonzero(as_tuple=False).squeeze(-1)
     if keep.numel() == 0:
         diagnostics["fallback_reason"] = (
@@ -295,6 +333,7 @@ def _quad_fit_and_token(
         i_std=i_std,
         token_variant=token_variant,
     )
+    _profile_mark(profile, f"{profile_prefix}_token", t_prof, device)
 
     return VoxelAnchorOutput(
         c_init=c_init,
@@ -335,9 +374,16 @@ class VoxelAnchorBuilder:
         planarity_threshold: float = 0.2,
         token_variant: str = "full",
         knn_chunk_size: int = 256,
+        knn_method: str = "voxel_chunk",
         knn_r_min: float = 0.5,
         knn_r_max: float = 8.0,
         query_voxel_min_points: int = 1,
+        quadric_gamma: float = 1.0,
+        quadric_kappa_max: float = 5.0,
+        quadric_eps_lambda: float = 0.01,
+        quadric_eps_kappa: float = 1e-3,
+        quadric_eps_s: float = 1e-3,
+        quadric_eps_s3: float = 1e-4,
     ) -> None:
         self.voxelizer = SphericalVoxelizer(
             dphi_deg=dphi_deg,
@@ -353,11 +399,18 @@ class VoxelAnchorBuilder:
         self.planarity_threshold = float(planarity_threshold)
         self.token_variant = str(token_variant)
         self.knn_chunk_size = int(knn_chunk_size)
+        self.knn_method = str(knn_method)
         self._dphi_rad = math.radians(float(dphi_deg))
         self._dtheta_rad = math.radians(float(dtheta_deg))
         self._dr = float(dr_m)
         self._r_min = float(knn_r_min)
         self._r_max = float(knn_r_max)
+        self.quadric_gamma = float(quadric_gamma)
+        self.quadric_kappa_max = float(quadric_kappa_max)
+        self.quadric_eps_lambda = float(quadric_eps_lambda)
+        self.quadric_eps_kappa = float(quadric_eps_kappa)
+        self.quadric_eps_s = float(quadric_eps_s)
+        self.quadric_eps_s3 = float(quadric_eps_s3)
 
     def _voxel_r_max(self, q: Tensor) -> Tensor:
         r = q.norm(dim=-1)
@@ -367,12 +420,89 @@ class VoxelAnchorBuilder:
         diag = torch.sqrt(dphi_r * dphi_r + dtheta_r * dtheta_r + dr * dr)
         return diag.clamp(min=self._r_min, max=self._r_max)
 
+    def _dual_frame_vox(
+        self,
+        xyz: Tensor,
+        intensity: Tensor,
+        src: Tensor,
+        pose_frame1_in_frame0: Tensor,
+    ) -> tuple[SphericalVoxelOutput, Tensor]:
+        """Voxelize each frame in its own sensor space, merge query sets.
+
+        Frame0 points are voxelized from the frame0 origin (as before).
+        Frame1 points are transformed to frame1 sensor space, voxelized from
+        the frame1 origin, then their query positions are transformed back to
+        frame0 before merging. The r_max for each query is computed in its
+        native sensor frame (frame0 distance for query_0, frame1 distance for
+        query_1) before any coordinate transformation, so the kNN search radius
+        correctly reflects the spherical voxel footprint at the point of origin.
+
+        Returns:
+            merged_vox: SphericalVoxelOutput with query_xyz in frame0 space.
+            r_max: [M0+M1] pre-computed per-query kNN radius (native distances).
+        """
+        device = xyz.device
+        dtype = xyz.dtype
+
+        mask0 = src < 0.5
+        mask1 = src >= 0.5
+        xyz0, i0, src0 = xyz[mask0], intensity[mask0], src[mask0]
+        xyz1, i1 = xyz[mask1], intensity[mask1]
+        src1 = torch.ones(xyz1.shape[0], device=device, dtype=dtype)
+
+        # Frame0: voxelize in frame0 sensor space, compute r_max from frame0 distances.
+        vox0 = self.voxelizer(xyz0, intensity=i0, src=src0)
+        r_max_0 = self._voxel_r_max(vox0.query_xyz)   # norm = frame0 distance ✓
+
+        # Frame1: transform points to frame1 sensor space, voxelize there.
+        # Compute r_max BEFORE transforming queries to frame0, so norm() gives
+        # frame1 distance (= correct spherical voxel footprint at frame1 origin).
+        R_f1_to_f0 = pose_frame1_in_frame0[:3, :3].to(dtype=dtype)
+        t_f1_to_f0 = pose_frame1_in_frame0[:3, 3].to(dtype=dtype)
+        R_f0_to_f1 = R_f1_to_f0.T
+        t_f0_to_f1 = -(R_f0_to_f1 @ t_f1_to_f0)
+        xyz1_in_f1 = (R_f0_to_f1 @ xyz1.to(dtype=dtype).T).T + t_f0_to_f1
+        vox1 = self.voxelizer(xyz1_in_f1, intensity=i1, src=src1)
+        r_max_1 = self._voxel_r_max(vox1.query_xyz)   # norm = frame1 distance ✓
+        q1_in_f0 = (R_f1_to_f0 @ vox1.query_xyz.T).T + t_f1_to_f0
+
+        # Merge: concatenate query fields; point_voxel is not used downstream.
+        merged_vox = SphericalVoxelOutput(
+            query_xyz=torch.cat([vox0.query_xyz, q1_in_f0], dim=0),
+            n_points=torch.cat([vox0.n_points, vox1.n_points], dim=0),
+            i_mean=torch.cat([vox0.i_mean, vox1.i_mean], dim=0),
+            i_std=torch.cat([vox0.i_std, vox1.i_std], dim=0),
+            src_ratio=torch.cat([vox0.src_ratio, vox1.src_ratio], dim=0),
+            point_voxel=torch.full((xyz.shape[0],), -1, device=device, dtype=torch.long),
+            voxel_hash=torch.cat([vox0.voxel_hash, vox1.voxel_hash], dim=0),
+        )
+        r_max = torch.cat([r_max_0, r_max_1], dim=0)
+        return merged_vox, r_max
+
     @torch.no_grad()
-    def __call__(self, xyz: Tensor, intensity: Tensor, src: Tensor) -> VoxelAnchorOutput:
+    def __call__(
+        self,
+        xyz: Tensor,
+        intensity: Tensor,
+        src: Tensor,
+        *,
+        pose_frame1_in_frame0: Tensor | None = None,
+        profile: dict | None = None,
+        profile_prefix: str = "static_anchor",
+    ) -> VoxelAnchorOutput:
         token_width = 25 if self.token_variant == "with_normal" else 22
         if xyz.shape[0] == 0:
             return _make_empty(xyz.device, xyz.dtype, token_width=token_width)
-        vox = self.voxelizer(xyz, intensity=intensity, src=src)
+        t_prof = time.perf_counter()
+        if pose_frame1_in_frame0 is not None:
+            vox, r_max_precomp = self._dual_frame_vox(xyz, intensity, src, pose_frame1_in_frame0)
+            # Wrap pre-computed r_max (native per-frame distances) so _quad_fit_and_token
+            # gets the correct kNN radius without recomputing from frame0 positions.
+            r_max_fn = lambda _q, _r=r_max_precomp: _r
+        else:
+            vox = self.voxelizer(xyz, intensity=intensity, src=src)
+            r_max_fn = self._voxel_r_max
+        t_prof = _profile_mark(profile, f"{profile_prefix}_voxelize", t_prof, xyz.device)
         if vox.query_xyz.shape[0] == 0:
             return _make_empty(xyz.device, xyz.dtype, {"query_voxels": 0, "k_eff_pass": 0, "residual_pass": 0, "final_anchors": 0, "fallback_reason": "no_query_voxels"}, token_width=token_width)
         return _quad_fit_and_token(
@@ -386,7 +516,16 @@ class VoxelAnchorBuilder:
             planarity_threshold=self.planarity_threshold,
             token_variant=self.token_variant,
             knn_chunk_size=self.knn_chunk_size,
-            r_max_fn=self._voxel_r_max,
+            knn_method=self.knn_method,
+            r_max_fn=r_max_fn,
+            quadric_gamma=self.quadric_gamma,
+            quadric_kappa_max=self.quadric_kappa_max,
+            quadric_eps_lambda=self.quadric_eps_lambda,
+            quadric_eps_kappa=self.quadric_eps_kappa,
+            quadric_eps_s=self.quadric_eps_s,
+            quadric_eps_s3=self.quadric_eps_s3,
+            profile=profile,
+            profile_prefix=profile_prefix,
         )
 
 
@@ -414,8 +553,15 @@ class DynamicVoxelAnchorBuilder:
         planarity_threshold: float = 0.2,
         token_variant: str = "full",
         knn_chunk_size: int = 256,
+        knn_method: str = "voxel_chunk",
         r_max_pad_factor: float = 2.0,
         query_voxel_min_points: int = 1,
+        quadric_gamma: float = 1.0,
+        quadric_kappa_max: float = 5.0,
+        quadric_eps_lambda: float = 0.01,
+        quadric_eps_kappa: float = 1e-3,
+        quadric_eps_s: float = 1e-3,
+        quadric_eps_s3: float = 1e-4,
     ) -> None:
         self.bbox_voxel_divisor = int(bbox_voxel_divisor)
         self.bbox_voxel_min = float(bbox_voxel_min)
@@ -428,7 +574,14 @@ class DynamicVoxelAnchorBuilder:
         self.planarity_threshold = float(planarity_threshold)
         self.token_variant = str(token_variant)
         self.knn_chunk_size = int(knn_chunk_size)
+        self.knn_method = str(knn_method)
         self.r_max_pad_factor = float(r_max_pad_factor)
+        self.quadric_gamma = float(quadric_gamma)
+        self.quadric_kappa_max = float(quadric_kappa_max)
+        self.quadric_eps_lambda = float(quadric_eps_lambda)
+        self.quadric_eps_kappa = float(quadric_eps_kappa)
+        self.quadric_eps_s = float(quadric_eps_s)
+        self.quadric_eps_s3 = float(quadric_eps_s3)
 
     def _voxel_size_for_bbox(self, box: Tensor) -> float:
         """voxel_size = max(w, l, h) / divisor, clamped to a positive floor."""
@@ -436,7 +589,13 @@ class DynamicVoxelAnchorBuilder:
         return max(max_dim / self.bbox_voxel_divisor, self.bbox_voxel_min)
 
     @torch.no_grad()
-    def __call__(self, instances: list[dict]) -> list[tuple[int, VoxelAnchorOutput]]:
+    def __call__(
+        self,
+        instances: list[dict],
+        *,
+        profile: dict | None = None,
+        profile_prefix: str = "dynamic_anchor",
+    ) -> list[tuple[int, VoxelAnchorOutput]]:
         """Build anchors for every dynamic instance.
 
         Args:
@@ -454,7 +613,7 @@ class DynamicVoxelAnchorBuilder:
             iid = int(inst["instance_id"])
             xyz = inst["canonical_xyz"]
             intensity = inst["canonical_intensity"]
-            time = inst["canonical_time"]
+            src_time = inst["canonical_time"]
             box0 = inst["box_0"]
             device = xyz.device
             dtype = xyz.dtype
@@ -463,13 +622,15 @@ class DynamicVoxelAnchorBuilder:
                 results.append((iid, _make_empty(device, dtype, {"query_voxels": 0, "k_eff_pass": 0, "residual_pass": 0, "final_anchors": 0, "fallback_reason": "no_instance_points"}, token_width=token_width)))
                 continue
 
+            t_prof = time.perf_counter()
             voxel_size = self._voxel_size_for_bbox(box0)
             voxelizer = CartesianVoxelizer(
                 voxel_size=voxel_size,
                 query_voxel_min_points=self.query_voxel_min_points,
                 max_extent=self.bbox_voxel_max_extent,
             )
-            vox = voxelizer(xyz, intensity=intensity, src=time)
+            vox = voxelizer(xyz, intensity=intensity, src=src_time)
+            t_prof = _profile_mark(profile, f"{profile_prefix}_voxelize", t_prof, device)
             if vox.query_xyz.shape[0] == 0:
                 results.append((iid, _make_empty(device, dtype, {"query_voxels": 0, "k_eff_pass": 0, "residual_pass": 0, "final_anchors": 0, "fallback_reason": "no_query_voxels"}, token_width=token_width)))
                 continue
@@ -494,7 +655,16 @@ class DynamicVoxelAnchorBuilder:
                 planarity_threshold=self.planarity_threshold,
                 token_variant=self.token_variant,
                 knn_chunk_size=self.knn_chunk_size,
+                knn_method=self.knn_method,
                 r_max_fn=_const_r_max,
+                quadric_gamma=self.quadric_gamma,
+                quadric_kappa_max=self.quadric_kappa_max,
+                quadric_eps_lambda=self.quadric_eps_lambda,
+                quadric_eps_kappa=self.quadric_eps_kappa,
+                quadric_eps_s=self.quadric_eps_s,
+                quadric_eps_s3=self.quadric_eps_s3,
+                profile=profile,
+                profile_prefix=profile_prefix,
             )
             results.append((iid, out))
         return results

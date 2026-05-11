@@ -37,7 +37,7 @@ class QGSLoss(nn.Module):
         w_distortion: float = 0.05,
         w_normal: float = 0.05,
         alpha_eps: float = 1e-3,
-        raydrop_eps: float = 1e-6,
+        raydrop_eps: float = 1e-4,
     ) -> None:
         super().__init__()
         self.w_depth = float(w_depth)
@@ -75,13 +75,38 @@ class QGSLoss(nn.Module):
             else rendered.range.new_zeros(())
         )
 
-        if drop_prob is None:
-            drop_prob = 1.0 - rendered.alpha_accum.clamp(0.0, 1.0)
         drop_target = (~valid_mask).to(dtype=rendered.range.dtype)
         raydrop_loss = F.binary_cross_entropy(
             drop_prob.clamp(self.raydrop_eps, 1.0 - self.raydrop_eps),
             drop_target,
         )
+        if valid_mask.any():
+            raydrop_loss_hit = F.binary_cross_entropy(
+                drop_prob[valid_mask].clamp(self.raydrop_eps, 1.0 - self.raydrop_eps),
+                drop_target[valid_mask],
+            )
+            drop_prob_hit_mean = drop_prob[valid_mask].mean()
+            alpha_hit_mean = rendered.alpha_accum[valid_mask].mean()
+            intensity_gt_mean = intensity_gt[valid_mask].mean()
+            intensity_pred_mean = intensity_pred[valid_mask].mean()
+        else:
+            raydrop_loss_hit = rendered.range.new_zeros(())
+            drop_prob_hit_mean = rendered.range.new_zeros(())
+            alpha_hit_mean = rendered.range.new_zeros(())
+            intensity_gt_mean = rendered.range.new_zeros(())
+            intensity_pred_mean = rendered.range.new_zeros(())
+        miss_mask = ~valid_mask
+        if miss_mask.any():
+            raydrop_loss_miss = F.binary_cross_entropy(
+                drop_prob[miss_mask].clamp(self.raydrop_eps, 1.0 - self.raydrop_eps),
+                drop_target[miss_mask],
+            )
+            drop_prob_miss_mean = drop_prob[miss_mask].mean()
+            alpha_miss_mean = rendered.alpha_accum[miss_mask].mean()
+        else:
+            raydrop_loss_miss = rendered.range.new_zeros(())
+            drop_prob_miss_mean = rendered.range.new_zeros(())
+            alpha_miss_mean = rendered.range.new_zeros(())
 
         # Depth distortion: CUDA-computed ∑ᵢ∑ⱼ wᵢwⱼ|rᵢ−rⱼ| per pixel.
         # Keep compatibility with lightweight stubs that do not expose `raw`.
@@ -119,7 +144,7 @@ class QGSLoss(nn.Module):
             if mask.any():
                 dot_sum = (pred_n_sum * ref_n).sum(dim=0)
                 residual = (rendered.alpha_accum - dot_sum).clamp_min(0.0)
-                lam = 1.0 - torch.sigmoid(torch.log(kappa_map.abs().clamp(min=1e-6)))
+                lam = 1.0 - torch.sigmoid(torch.log(kappa_map.abs().clamp(min=1e-4)))
                 normal_loss = (lam[mask] * residual[mask]).mean()
 
         total = (
@@ -139,4 +164,12 @@ class QGSLoss(nn.Module):
             "normal": normal_loss.detach(),
             "n_valid": n_valid.detach(),
             "valid_ratio": valid_f.mean().detach(),
+            "raydrop_hit": raydrop_loss_hit.detach(),
+            "raydrop_miss": raydrop_loss_miss.detach(),
+            "drop_prob_hit_mean": drop_prob_hit_mean.detach(),
+            "drop_prob_miss_mean": drop_prob_miss_mean.detach(),
+            "alpha_hit_mean": alpha_hit_mean.detach(),
+            "alpha_miss_mean": alpha_miss_mean.detach(),
+            "intensity_gt_mean": intensity_gt_mean.detach(),
+            "intensity_pred_mean": intensity_pred_mean.detach(),
         }

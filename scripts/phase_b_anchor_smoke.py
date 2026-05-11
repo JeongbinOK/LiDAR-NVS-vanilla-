@@ -66,7 +66,12 @@ def main():
           f"tracked_dynamic={scene['untracked_stats']['n_tracked_instances']}")
 
     builder = VoxelAnchorBuilder()
-    out = builder(xyz_all, i_all, src_all)
+    out = builder(
+        xyz_all,
+        i_all,
+        src_all,
+        pose_frame1_in_frame0=T_1to0.to(device),
+    )
     M_prime = out.token.shape[0]
 
     print(f"\nAnchor output: M' = {M_prime}")

@@ -6,7 +6,11 @@ import torch
 
 from config import QGSConfig
 from nn.eval_utils import (
+    _box1_to_frame0_pose,
+    _box_to_pose,
     _context_diagnostics,
+    _make_dynamic_anchor_builder,
+    _make_static_anchor_builder,
     _summarize_context_groups,
     gaussian_slice_stats,
     load_cfg_from_checkpoint,
@@ -38,12 +42,31 @@ def test_gaussian_slice_stats_counts_visibility_and_drop():
     assert stats["n_dropped_raster"] == 2
 
 
+def test_frame1_dynamic_box_pose_is_lifted_into_frame0_scene():
+    rel_input_1_pose = torch.eye(4)
+    rel_input_1_pose[:3, 3] = torch.tensor([10.0, -1.0, 0.5])
+    box1 = torch.tensor([1.0, 2.0, 0.25, 4.0, 2.0, 1.0, 0.0])
+    local_point = torch.tensor([0.5, -0.25, 0.75])
+
+    pose_frame0 = _box1_to_frame0_pose(box1, rel_input_1_pose)
+    pose_frame1 = _box_to_pose(box1)
+    inv_pose = torch.linalg.inv(rel_input_1_pose)
+    point_frame0 = pose_frame0[:3, :3] @ local_point + pose_frame0[:3, 3]
+    point_frame1 = pose_frame1[:3, :3] @ local_point + pose_frame1[:3, 3]
+
+    assert torch.allclose(
+        point_frame0,
+        rel_input_1_pose[:3, :3] @ point_frame1 + rel_input_1_pose[:3, 3],
+    )
+    assert torch.allclose(
+        inv_pose[:3, :3] @ point_frame0 + inv_pose[:3, 3],
+        point_frame1,
+    )
+
+
 def test_context_diagnostics_counts_init_and_subfloor_points():
     primitives = {
         "aux": {
-            "g_rot": torch.tensor([[0.2, 0.7, 1.0]]),
-            "g_center": torch.tensor([[0.25, 0.75, 1.0]]),
-            "g_scale": torch.tensor([[0.3, 0.8, 1.0]]),
             "omega_local": torch.zeros(1, 3, 3),
             "delta_c": torch.zeros(1, 3, 3),
             "delta_mu": torch.zeros(1, 3),
@@ -116,6 +139,28 @@ def test_context_group_summary_accumulates_static_and_dynamic_totals():
     assert groups["dynamic"]["input_points"] == 7
     assert groups["dynamic"]["points_with_init"] == 4
     assert groups["dynamic"]["points_without_init"] == 1
+
+
+def test_eval_anchor_builders_use_configured_quadric_params():
+    cfg = QGSConfig(
+        quadric_gamma=1.73,
+        quadric_kappa_max=7.0,
+        quadric_eps_lambda=0.02,
+        quadric_eps_kappa=0.004,
+        quadric_eps_s=0.005,
+        quadric_eps_s3=0.006,
+    )
+
+    static_builder = _make_static_anchor_builder(cfg)
+    dynamic_builder = _make_dynamic_anchor_builder(cfg)
+
+    for builder in (static_builder, dynamic_builder):
+        assert builder.quadric_gamma == 1.73
+        assert builder.quadric_kappa_max == 7.0
+        assert builder.quadric_eps_lambda == 0.02
+        assert builder.quadric_eps_kappa == 0.004
+        assert builder.quadric_eps_s == 0.005
+        assert builder.quadric_eps_s3 == 0.006
 
 
 def test_load_cfg_from_checkpoint_preserves_legacy_ptv3_stem_width(tmp_path):

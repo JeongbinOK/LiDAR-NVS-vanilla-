@@ -75,15 +75,13 @@ def compute_view2gaussian(
     if viewmatrix is None:
         viewmatrix = torch.eye(4, dtype=mean.dtype, device=mean.device)
     R = quaternion_to_matrix(rotation)
-    G2W = torch.eye(4, dtype=mean.dtype, device=mean.device)
-    G2W[:3, :3] = R
-    G2W[3, :3] = mean
-    G2V = viewmatrix @ G2W
-    R_t = G2V[:3, :3].transpose(0, 1)
-    t = G2V[3, :3]
+    R_view = viewmatrix[:3, :3].to(dtype=mean.dtype, device=mean.device)
+    t_view = viewmatrix[:3, 3].to(dtype=mean.dtype, device=mean.device)
+    R_g2v = R_view @ R
+    centre_view = R_view @ mean + t_view
     out = torch.eye(4, dtype=mean.dtype, device=mean.device)
-    out[:3, :3] = R_t
-    out[3, :3] = -(R_t @ t)
+    out[:3, :3] = R_g2v
+    out[3, :3] = -(R_g2v.transpose(0, 1) @ centre_view)
     return out
 
 

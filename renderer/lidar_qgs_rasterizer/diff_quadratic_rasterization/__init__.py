@@ -17,7 +17,7 @@ from . import _C
 
 # LiDAR channel layout constants (mirrored from cuda_rasterizer/channel_layout.h
 # via ext.cpp). Importable as `from diff_quadratic_rasterization import LIDAR_*`.
-# Current values (A3.4): NUM_CHANNELS=17 → OUTPUT_CHANNELS=27, LIDAR_LATENT_DIM=16.
+# Current values: NUM_CHANNELS=18 → OUTPUT_CHANNELS=28, LIDAR_LATENT_DIM=16, LIDAR_RAYDROP_OFFSET=17.
 OUTPUT_CHANNELS        = int(_C.OUTPUT_CHANNELS)
 NUM_CHANNELS           = int(_C.NUM_CHANNELS)
 NORMAL_OFFSET          = int(_C.NORMAL_OFFSET)
@@ -28,6 +28,7 @@ MIDDEPTH_OFFSET        = int(getattr(_C, "MIDDEPTH_OFFSET", NUM_CHANNELS + 6))
 LIDAR_INTENSITY_OFFSET = int(_C.LIDAR_INTENSITY_OFFSET)
 LIDAR_LATENT_OFFSET    = int(_C.LIDAR_LATENT_OFFSET)
 LIDAR_LATENT_DIM       = int(_C.LIDAR_LATENT_DIM)
+LIDAR_RAYDROP_OFFSET   = int(_C.LIDAR_RAYDROP_OFFSET)
 
 def cpu_deep_copy_tuple(input_tuple):
     copied_tensors = [item.cpu().clone() if isinstance(item, torch.Tensor) else item for item in input_tuple]
@@ -297,10 +298,6 @@ class GaussianRasterizer(nn.Module):
 class LiDARRasterOutput(NamedTuple):
     """Named view over the flat rasterizer output. All tensors live on the same
     device as the rasterizer call. Shapes are stated in the field comments.
-
-    Channels not yet produced by the CUDA kernel (drop_logit, full feat_agg
-    when LIDAR_LATENT_DIM is too small) are exposed as `None`; the consumer
-    (drop MLP in A3.4) is responsible for synthesising them.
     """
     range:       torch.Tensor              # [H, W]      intersection root r (m)
     middepth:    torch.Tensor              # [H, W]      median depth root r (m)
@@ -309,7 +306,7 @@ class LiDARRasterOutput(NamedTuple):
     normal:      torch.Tensor              # [3, H, W]   sensor-frame xyz
     curvature:   torch.Tensor              # [H, W]      alpha-blended signed Gaussian curvature κ
     latent:      torch.Tensor              # [L, H, W]   alpha-blended latent (L=LIDAR_LATENT_DIM)
-    drop_logit:  Optional[torch.Tensor]    # [H, W] or None — None until A3.4
+    raydrop:     torch.Tensor              # [H, W]      T_N-based rendered raydrop in [0,1]
     radii:       torch.Tensor              # [N]         per-Gaussian image radius
     aabb:        torch.Tensor              # rect bbox per Gaussian (passthrough)
     n_touched:   torch.Tensor              # [N]         tile-touch count (passthrough)
@@ -336,7 +333,9 @@ def make_lidar_settings(
 ) -> GaussianRasterizationSettings:
     """Build a GaussianRasterizationSettings configured for panoramic LiDAR.
 
-    `viewmatrix` brings world points into sensor frame (x=right, y=forward, z=up).
+    `viewmatrix` is the public row-major world-to-sensor transform
+    (x=right, y=forward, z=up). `LiDARRasterizer.forward` converts it to the
+    transposed CUDA layout only at the kernel boundary.
     `cam_intr` is repurposed as [el_min_rad, el_max_rad, w_per_rad_az, h_per_rad_el]
     on the CPU (the upstream convention, see rasterizer_impl.cu host-side unpack).
     """
@@ -358,6 +357,7 @@ def make_lidar_settings(
     )
     if bg is None:
         bg = torch.zeros(NUM_CHANNELS, device=device, dtype=torch.float32)
+        bg[LIDAR_RAYDROP_OFFSET] = 1.0  # miss pixels: T_N * 1.0 → rendered_raydrop → 1
 
     # projmatrix is unused in LiDAR mode but the NamedTuple requires a tensor.
     eye4 = torch.eye(4, device=device, dtype=torch.float32)
@@ -415,21 +415,23 @@ class LiDARRasterizer(nn.Module):
         self.raster_settings = raster_settings
 
     @staticmethod
-    def _pack_features(intensity: torch.Tensor, latent: torch.Tensor) -> torch.Tensor:
-        """Pack (intensity[N], latent[N, L]) into colors_precomp[N, NUM_CHANNELS].
+    def _pack_features(
+        intensity: torch.Tensor,
+        latent: torch.Tensor,
+        raydrop: torch.Tensor,
+    ) -> torch.Tensor:
+        """Pack (intensity[N], latent[N,L], raydrop[N]) into colors_precomp[N, NUM_CHANNELS].
 
-        Layout in the colors slot must match auxiliary.h:
-            channel 0      : intensity
-            channel 1..L   : latent[..., 0..L-1]
-        Where L = LIDAR_LATENT_DIM = NUM_CHANNELS - 1.
+        Layout in the colors slot must match channel_layout.h:
+            channel 0          : intensity
+            channels 1..L      : latent[..., 0..L-1]
+            channel NUM_CH-1   : raydrop  (L = LIDAR_LATENT_DIM = NUM_CHANNELS - 2)
         """
         if intensity.dim() != 1:
             raise ValueError(f"intensity must be [N], got {tuple(intensity.shape)}")
-        if latent.dim() != 2 or latent.shape[0] != intensity.shape[0]:
-            raise ValueError(
-                f"latent must be [N, L], got {tuple(latent.shape)} "
-                f"with N={intensity.shape[0]}"
-            )
+        N = intensity.shape[0]
+        if latent.dim() != 2 or latent.shape[0] != N:
+            raise ValueError(f"latent must be [N, L], got {tuple(latent.shape)} with N={N}")
         if latent.shape[1] != LIDAR_LATENT_DIM:
             raise ValueError(
                 f"latent dim {latent.shape[1]} != LIDAR_LATENT_DIM={LIDAR_LATENT_DIM} "
@@ -438,7 +440,9 @@ class LiDARRasterizer(nn.Module):
                 f"    LIDAR_LATENT_DIM={latent.shape[1]} pip install -e "
                 f"renderer/lidar_qgs_rasterizer --force-reinstall --no-deps"
             )
-        return torch.cat([intensity.unsqueeze(-1), latent], dim=-1).contiguous()
+        if raydrop.dim() != 1 or raydrop.shape[0] != N:
+            raise ValueError(f"raydrop must be [N], got {tuple(raydrop.shape)} with N={N}")
+        return torch.cat([intensity.unsqueeze(-1), latent, raydrop.unsqueeze(-1)], dim=-1).contiguous()
 
     @staticmethod
     def _compute_view2gaussian(
@@ -464,16 +468,15 @@ class LiDARRasterizer(nn.Module):
             dim=-1,
         ).reshape(-1, 3, 3)
 
-        N = means3D.shape[0]
-        G2W = torch.eye(4, device=means3D.device, dtype=means3D.dtype).expand(N, 4, 4).clone()
-        G2W[:, :3, :3] = R
-        G2W[:, 3, :3] = means3D
+        view = viewmatrix.to(device=means3D.device, dtype=means3D.dtype)
+        R_view = view[:3, :3]
+        t_view = view[:3, 3]
 
-        G2V = viewmatrix.to(device=means3D.device, dtype=means3D.dtype).unsqueeze(0) @ G2W
-        R_g2v = G2V[:, :3, :3]
+        R_g2v = R_view.unsqueeze(0) @ R
         R_t = R_g2v.transpose(1, 2)
-        t = G2V[:, 3, :3]
+        t = (R_view @ means3D.T).T + t_view
 
+        N = means3D.shape[0]
         out = torch.zeros((N, 4, 4), device=means3D.device, dtype=means3D.dtype)
         # CUDA transform helpers index the flat buffer as a column-major 3x4
         # matrix. Row-major [N,4,4] storage therefore needs R, not R^T, here.
@@ -504,7 +507,7 @@ class LiDARRasterizer(nn.Module):
             normal      = rendered[NORMAL_OFFSET:NORMAL_OFFSET + 3],
             curvature   = rendered[CURVATURE_OFFSET],
             latent      = rendered[LIDAR_LATENT_OFFSET:latent_end],
-            drop_logit  = None,
+            raydrop     = rendered[LIDAR_RAYDROP_OFFSET],
             radii       = radii,
             aabb        = aabb,
             n_touched   = n_touched,
@@ -520,12 +523,20 @@ class LiDARRasterizer(nn.Module):
         rotations: torch.Tensor,
         intensity: torch.Tensor,
         latent: torch.Tensor,
+        raydrop: torch.Tensor,
     ) -> LiDARRasterOutput:
-        colors_precomp = self._pack_features(intensity, latent)
+        colors_precomp = self._pack_features(intensity, latent, raydrop)
         view2gaussian_precomp = self._compute_view2gaussian(
             means3D,
             rotations,
             self.raster_settings.viewmatrix,
+        )
+        # The public Python API uses ordinary row-major world-to-sensor
+        # transforms. The CUDA kernels inherit the upstream transposed matrix
+        # layout, while the Torch-side view2gaussian construction above needs the
+        # public transform. Split the two representations here.
+        cuda_settings = self.raster_settings._replace(
+            viewmatrix=self.raster_settings.viewmatrix.T.contiguous()
         )
         rendered, radii, aabb, n_touched = rasterize_gaussians(
             means3D=means3D.detach(),
@@ -536,6 +547,6 @@ class LiDARRasterizer(nn.Module):
             scales=scales,
             rotations=rotations.detach(),
             view2gaussian_precomp=view2gaussian_precomp,
-            raster_settings=self.raster_settings,
+            raster_settings=cuda_settings,
         )
         return self._unpack(rendered, radii, aabb, n_touched)

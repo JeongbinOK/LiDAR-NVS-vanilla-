@@ -28,7 +28,7 @@ cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
 def test_make_lidar_ray_grid_unit_vectors():
-    from models.head import make_lidar_ray_grid
+    from nn.render_utils import make_lidar_ray_grid
 
     H, W = 8, 32
     el_min = math.radians(-30.0)
@@ -45,7 +45,7 @@ def test_make_lidar_ray_grid_unit_vectors():
 
 def test_make_lidar_ray_grid_matches_kernel_formula():
     """Hand-compute one pixel's ray direction and compare against the helper."""
-    from models.head import make_lidar_ray_grid
+    from nn.render_utils import make_lidar_ray_grid
 
     H, W = 16, 64
     el_min, el_max = math.radians(-30.0), math.radians(+10.0)
@@ -65,6 +65,7 @@ def test_make_lidar_ray_grid_matches_kernel_formula():
     assert torch.allclose(ray[:, v, u], expected, atol=1e-6)
 
 
+@pytest.mark.skip(reason="DropHead removed; replaced by per-Gaussian raydrop")
 def test_drop_head_geometric_miss_invariant():
     """Pixels with α_accum = 0 must yield p_drop = 1 exactly."""
     from models.head import DropHead
@@ -87,6 +88,7 @@ def test_drop_head_geometric_miss_invariant():
     )
 
 
+@pytest.mark.skip(reason="DropHead removed; replaced by per-Gaussian raydrop")
 def test_drop_head_output_range_and_shape():
     """Random input → p_drop ∈ [0, 1] and shape matches alpha_accum."""
     from models.head import DropHead
@@ -111,6 +113,7 @@ def test_drop_head_output_range_and_shape():
     assert (p_drop >= 0.0).all() and (p_drop <= 1.0 + 1e-6).all()
 
 
+@pytest.mark.skip(reason="DropHead removed; replaced by per-Gaussian raydrop")
 def test_drop_head_input_validation():
     from models.head import DropHead
 
@@ -126,6 +129,7 @@ def test_drop_head_input_validation():
         )
 
 
+@pytest.mark.skip(reason="DropHead removed; replaced by per-Gaussian raydrop")
 def test_drop_head_gradient_flows_to_mlp():
     """A trivial loss on p_drop must produce non-zero MLP gradients."""
     from models.head import DropHead
@@ -150,6 +154,7 @@ def test_drop_head_gradient_flows_to_mlp():
     assert any(g.abs().sum() > 0 for g in grads), "no MLP grads — head is dead"
 
 
+@pytest.mark.skip(reason="DropHead removed; replaced by per-Gaussian raydrop")
 def test_drop_head_mlp_features_are_raw_premultiplied_values():
     from models.head import DropHead
 
@@ -190,6 +195,7 @@ def test_drop_head_mlp_features_are_raw_premultiplied_values():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skip(reason="DropHead removed; replaced by per-Gaussian raydrop")
 @cuda
 def test_drop_head_with_lidar_rasterizer():
     """Wire LiDARRasterizer output into DropHead and check the composition."""

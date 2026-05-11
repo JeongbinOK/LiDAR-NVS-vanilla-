@@ -4,8 +4,7 @@ from types import SimpleNamespace
 
 import torch
 
-from models.head import make_lidar_ray_grid
-from nn.render_utils import build_gt_normal_map
+from nn.render_utils import build_gt_normal_map, make_lidar_ray_grid
 from nn.qgs_loss import QGSLoss
 
 

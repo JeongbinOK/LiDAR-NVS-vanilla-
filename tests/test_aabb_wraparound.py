@@ -60,6 +60,7 @@ def _run_lidar(
     opacities = torch.full((N, 1), 0.75, device=device, dtype=torch.float32)
     intensity = torch.full((N,), 0.5, device=device, dtype=torch.float32)
     latent = torch.zeros((N, LIDAR_LATENT_DIM), device=device, dtype=torch.float32)
+    raydrop = torch.zeros(N, device=device, dtype=torch.float32)
 
     settings = make_lidar_settings(
         image_height=image_height,
@@ -73,7 +74,7 @@ def _run_lidar(
     out = LiDARRasterizer(settings)(
         means3D=means3D, means2D=means2D, opacities=opacities,
         scales=scales, rotations=rotations,
-        intensity=intensity, latent=latent,
+        intensity=intensity, latent=latent, raydrop=raydrop,
     )
     return out.aabb, out.radii
 

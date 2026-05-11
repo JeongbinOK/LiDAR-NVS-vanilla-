@@ -105,7 +105,12 @@ def main():
             static_xyz = torch.cat([static_xyz] + [d["fallback_xyz"] for d in fallback_instances], dim=0)
             static_int = torch.cat([static_int] + [d["fallback_intensity"] for d in fallback_instances], dim=0)
             static_time = torch.cat([static_time] + [d["fallback_time"] for d in fallback_instances], dim=0)
-        static_out = static_builder(static_xyz, static_int, static_time)
+        static_out = static_builder(
+            static_xyz,
+            static_int,
+            static_time,
+            pose_frame1_in_frame0=T_1to0.to(device),
+        )
         Ms = static_out.token.shape[0]
         fallback_pts = static_xyz.shape[0] - base_static_pts
         print(f"  Static: base={base_static_pts} pts + fallback={fallback_pts} pts "

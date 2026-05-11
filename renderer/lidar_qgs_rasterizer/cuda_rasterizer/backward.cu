@@ -658,7 +658,7 @@ renderCUDA(
 				a = GetParabolaA(cos2_sin2, rscale_sign_j, scale_j);
 				s = QuadraticCurveGeodesicDistanceOriginal(p_norm, a);
 				s_2 = s * s;
-				r0_2 = __fdividef(1.0f, (cos2_sin2.x * rscale_o_j.x + cos2_sin2.y * rscale_o_j.y));
+				r0_2 = __fdividef(1.0f, fmaxf(cos2_sin2.x * rscale_o_j.x + cos2_sin2.y * rscale_o_j.y, 1e-20f));
 
 				if (s_2 <= r0_2 * sigma * sigma){
 					intersect = true;
@@ -681,6 +681,9 @@ renderCUDA(
 				continue;
 
 			T = __fdividef(T, 1.f - alpha);
+			// Cap T to prevent overflow when many high-alpha Gaussians stack
+			// (19+ with alpha=0.99 → T = 100^19 = FLT_MAX → inf → dL_dG = inf).
+			T = fminf(T, 1e15f);
 			const float weight = alpha * T;
  
 			// Propagate gradients to per-Gaussian colors and keep
@@ -835,8 +838,10 @@ renderCUDA(
 			atomicAdd(&(dL_dopacity[global_id]), G * dL_dalpha);
 
 			const float dL_dG = rscale_o_j.w * dL_dalpha;
-			const float dL_ds = dL_dG * __fdividef(-G * s, r0_2);
-			const float dL_dr0_2 = dL_dG * (G * __fdividef(-power, r0_2));
+			// Guard both dL_ds and dL_dr0_2 when G=0 (underflow): dL_dG may be inf from
+			// T overflow, and inf * (-G * ..) = inf * 0 = NaN (IEEE-754).
+			const float dL_ds = (G > 0.0f) ? dL_dG * __fdividef(-G * s, r0_2) : 0.0f;
+			const float dL_dr0_2 = (G > 0.0f) ? dL_dG * (G * __fdividef(-power, r0_2)) : 0.0f;
 			const float u = 2 * a * p_norm;
 			float dL_du = 0.0f;
 			float dL_da = 0.0f;

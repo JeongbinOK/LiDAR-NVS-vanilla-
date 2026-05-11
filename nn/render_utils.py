@@ -253,6 +253,45 @@ def build_gt_normal_map(
 
 
 # ---------------------------------------------------------------------------
+# Ray grid helper (moved from models/head/drop_head.py)
+# ---------------------------------------------------------------------------
+
+def make_lidar_ray_grid(
+    height: int,
+    width: int,
+    el_min_rad: float,
+    el_max_rad: float,
+    *,
+    device: torch.device | str = "cpu",
+    dtype: torch.dtype = torch.float32,
+) -> Tensor:
+    """Per-pixel unit ray direction in sensor frame.
+
+    Mirrors the spherical projection used by the CUDA LiDAR-mode kernel
+    (cuda_rasterizer/forward.cu, lidar_mode branch):
+        az = (u + 0.5) / w_per_rad_az - π
+        el = (v + 0.5) / h_per_rad_el + el_min
+        d  = (sin(az)cos(el), cos(az)cos(el), sin(el))
+
+    Returns a [3, H, W] tensor.
+    """
+    w_per_rad_az = width / (2.0 * math.pi)
+    h_per_rad_el = height / (el_max_rad - el_min_rad)
+    u = torch.arange(width, device=device, dtype=dtype) + 0.5
+    v = torch.arange(height, device=device, dtype=dtype) + 0.5
+    az = u / w_per_rad_az - math.pi
+    el = v / h_per_rad_el + el_min_rad
+    cos_el = torch.cos(el)
+    sin_el = torch.sin(el)
+    sin_az = torch.sin(az)
+    cos_az = torch.cos(az)
+    dx = sin_az[None, :] * cos_el[:, None]
+    dy = cos_az[None, :] * cos_el[:, None]
+    dz = sin_el[:, None].expand(height, width)
+    return torch.stack([dx, dy, dz], dim=0)
+
+
+# ---------------------------------------------------------------------------
 # Render wrapper
 # ---------------------------------------------------------------------------
 
@@ -280,6 +319,7 @@ def render_primitives(
             'opacities' [N, 1]   in (0, 1)
             'intensity' [N]      in [0, 1]
             'latent'    [N, L]   L == LIDAR_LATENT_DIM
+            'raydrop'   [N]      per-Gaussian raydrop in [0, 0.5]
         height/width: spherical image dimensions.
         el_min_rad/el_max_rad: vertical FOV.
         viewmatrix: [4,4]  world → sensor. Defaults to identity (sensor frame).
@@ -317,4 +357,5 @@ def render_primitives(
         rotations=primitives["rotations"],
         intensity=primitives["intensity"],
         latent=primitives["latent"],
+        raydrop=primitives["raydrop"],
     )

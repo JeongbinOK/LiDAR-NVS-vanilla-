@@ -11,7 +11,6 @@ from pathlib import Path
 import torch
 
 from config import QGSConfig
-from models.head import DropHead
 from nn.eval_utils import (
     evaluate_pair_sample,
     load_cfg_from_checkpoint,
@@ -65,11 +64,14 @@ def main():
     parser.add_argument("--out-dir", default="")
     parser.add_argument("--data-root", default="")
     parser.add_argument("--hit-threshold", type=float, default=0.5)
+    parser.add_argument("--lidar-sigma", type=float, default=None)
     parser.add_argument("--save-pointclouds", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
 
     cfg = load_cfg_from_checkpoint(args.checkpoint)
     cfg.device = args.device
+    if args.lidar_sigma is not None:
+        cfg.lidar_sigma = args.lidar_sigma
     if args.data_root:
         cfg.data_root = args.data_root
     target_split = cfg.train_split if args.split == "train" else cfg.eval_split
@@ -92,7 +94,6 @@ def main():
         pair_indices = list(range(min(args.num_pairs, len(dataset))))
 
     model = QGSModel(cfg).to(args.device)
-    drop_head = DropHead(latent_dim=cfg.lidar_latent_dim).to(args.device)
     loss_fn = QGSLoss(
         w_depth=cfg.loss_w_range,
         w_intensity=cfg.loss_w_intensity,
@@ -102,10 +103,7 @@ def main():
 
     ckpt = torch.load(args.checkpoint, map_location=args.device, weights_only=False)
     model.load_state_dict(ckpt["model_state_dict"], strict=False)
-    if "drop_head_state_dict" in ckpt:
-        drop_head.load_state_dict(ckpt["drop_head_state_dict"], strict=False)
     model.eval()
-    drop_head.eval()
 
     ckpt_dir = Path(os.path.abspath(args.checkpoint)).parent
     if args.out_dir:
@@ -120,7 +118,6 @@ def main():
             sample = dataset[pair_idx]
             result = evaluate_pair_sample(
                 model,
-                drop_head,
                 loss_fn,
                 sample,
                 device=args.device,

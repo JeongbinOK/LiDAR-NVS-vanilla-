@@ -56,6 +56,7 @@ class _StubHead(nn.Module):
         geom_init: dict,
         is_dynamic_flag: torch.Tensor,
         intensity_input: torch.Tensor | None = None,
+        init_summary: torch.Tensor | None = None,
     ) -> dict:
         batch_size, num_points, _ = features.shape
         device = features.device
@@ -65,12 +66,10 @@ class _StubHead(nn.Module):
             "R": geom_init["R_init"],
             "s": geom_init["s_init"],
             "alpha": torch.full((batch_size, num_points), 0.5, device=device, dtype=dtype),
+            "raydrop": torch.zeros(batch_size, num_points, device=device, dtype=dtype),
             "intensity": intensity_input,
             "latent": torch.zeros(batch_size, num_points, self.latent_dim, device=device, dtype=dtype),
             "aux": {
-                "g_rot": torch.zeros(batch_size, num_points, device=device, dtype=dtype),
-                "g_center": torch.zeros(batch_size, num_points, device=device, dtype=dtype),
-                "g_scale": torch.zeros(batch_size, num_points, device=device, dtype=dtype),
                 "omega_local": torch.zeros(batch_size, num_points, 3, device=device, dtype=dtype),
                 "delta_c": torch.zeros(batch_size, num_points, 3, device=device, dtype=dtype),
                 "delta_mu": torch.zeros(batch_size, num_points, device=device, dtype=dtype),
@@ -256,8 +255,8 @@ def test_qgs_model_forward_anchor_contexts_batched_preserves_empty_slots(monkeyp
     assert outs[1] is None
     assert outs[2] is not None
     assert recorder.seen_offsets.tolist() == [2, 3]
-    assert outs[0]["aux"]["g_rot"].shape == (1, 2)
-    assert outs[2]["aux"]["g_rot"].shape == (1, 1)
+    assert outs[0]["aux"]["omega_local"].shape == (1, 2, 3)
+    assert outs[2]["aux"]["omega_local"].shape == (1, 1, 3)
 
 
 def test_ptv3_backbone_forwards_condition_with_native_8ch_input():

@@ -423,6 +423,87 @@ class TestKnnRadius:
         k_eff = result["k_eff"][0].item()
         assert k_eff == 1, f"Expected 1 neighbor, got {k_eff}"
 
+    def test_voxel_local_matches_bruteforce_knn(self):
+        """Voxel-local search should preserve exact radius k-NN results."""
+        gen = torch.Generator().manual_seed(7)
+        candidates = torch.rand((80, 3), generator=gen) * 6.0 - 3.0
+        points = torch.rand((12, 3), generator=gen) * 4.0 - 2.0
+
+        def r_max_fn(p):
+            return torch.full((p.shape[0],), 1.25)
+
+        brute = hybrid_radius_knn(
+            points,
+            candidates,
+            k_target=5,
+            r_max_fn=r_max_fn,
+            method="bruteforce",
+        )
+        local = hybrid_radius_knn(
+            points,
+            candidates,
+            k_target=5,
+            r_max_fn=r_max_fn,
+            method="voxel_local",
+            voxel_size=0.75,
+        )
+
+        assert torch.equal(local["k_eff"], brute["k_eff"])
+        assert torch.equal(local["mask"], brute["mask"])
+        assert torch.allclose(local["dist"], brute["dist"], atol=1e-6)
+
+    def test_voxel_chunk_matches_bruteforce_knn(self):
+        """Chunked voxel search should preserve exact radius k-NN results."""
+        gen = torch.Generator().manual_seed(11)
+        candidates = torch.rand((96, 3), generator=gen) * 8.0 - 4.0
+        points = torch.rand((16, 3), generator=gen) * 5.0 - 2.5
+
+        def r_max_fn(p):
+            return torch.full((p.shape[0],), 1.5)
+
+        brute = hybrid_radius_knn(
+            points,
+            candidates,
+            k_target=6,
+            r_max_fn=r_max_fn,
+            method="bruteforce",
+        )
+        chunked = hybrid_radius_knn(
+            points,
+            candidates,
+            k_target=6,
+            r_max_fn=r_max_fn,
+            method="voxel_chunk",
+            voxel_size=0.8,
+            chunk_size=4,
+        )
+
+        assert torch.equal(chunked["k_eff"], brute["k_eff"])
+        assert torch.equal(chunked["mask"], brute["mask"])
+        assert torch.allclose(chunked["dist"], brute["dist"], atol=1e-6)
+
+    def test_voxel_methods_use_points_inside_neighbor_voxels_not_voxel_centres(self):
+        """Adjacent voxel points close to the query must remain valid candidates."""
+        points = torch.tensor([[0.99, 0.0, 0.0]])
+        candidates = torch.tensor([
+            [1.01, 0.0, 0.0],  # adjacent voxel but raw point is very close
+            [1.20, 0.0, 0.0],
+        ])
+
+        for method in ("voxel_local", "voxel_chunk"):
+            result = hybrid_radius_knn(
+                points,
+                candidates,
+                k_target=2,
+                r_max_fn=lambda p: torch.full((p.shape[0],), 0.05),
+                method=method,
+                voxel_size=1.0,
+                chunk_size=1,
+            )
+
+            assert result["k_eff"].tolist() == [1]
+            assert result["idx"][0, 0].item() == 0
+
     def test_gather_neighbors(self):
         """gather_neighbors should fill padded slots with zeros."""
         candidates = torch.tensor([

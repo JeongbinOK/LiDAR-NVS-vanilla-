@@ -12,9 +12,8 @@ import torch
 from config import QGSConfig
 from models.geometry import decompose_scene
 from models.geometry.voxel_anchor import DynamicVoxelAnchorBuilder, VoxelAnchorBuilder
-from models.head import make_lidar_ray_grid
 from nn.qgs_loss import QGSLoss
-from nn.render_utils import quat_to_rotmat, render_primitives, rotmat_to_quat, build_target_lidar_image
+from nn.render_utils import make_lidar_ray_grid, quat_to_rotmat, render_primitives, rotmat_to_quat, build_target_lidar_image
 
 
 def load_cfg_from_checkpoint(checkpoint_path: str) -> QGSConfig:
@@ -124,6 +123,11 @@ def _box_to_pose(box: torch.Tensor) -> torch.Tensor:
     return pose
 
 
+def _box1_to_frame0_pose(box: torch.Tensor, rel_input_1_pose: torch.Tensor) -> torch.Tensor:
+    rel = rel_input_1_pose.to(device=box.device, dtype=box.dtype)
+    return rel @ _box_to_pose(box)
+
+
 def transform_primitives(primitives: dict, T: torch.Tensor) -> dict:
     R = quat_to_rotmat(primitives["rotations"])
     R_out = T[:3, :3] @ R
@@ -217,9 +221,6 @@ def _context_diagnostics(
 ) -> dict:
     aux = primitives["aux"]
     geom = primitives["geom_init"]
-    g_rot = aux["g_rot"][0]
-    g_center = aux["g_center"][0]
-    g_scale = aux["g_scale"][0]
     omega_local = aux["omega_local"][0]
     delta_c = aux["delta_c"][0]
     delta_mu = aux["delta_mu"][0]
@@ -251,12 +252,6 @@ def _context_diagnostics(
         "n_points_subfloor": n_points_without_init,
         "k_eff_mean": _safe_mean(k_eff),
         "k_eff_p95": _safe_quantile(k_eff, 0.95),
-        "g_rot_mean": _safe_mean(g_rot),
-        "g_rot_p95": _safe_quantile(g_rot, 0.95),
-        "g_center_mean": _safe_mean(g_center),
-        "g_center_p95": _safe_quantile(g_center, 0.95),
-        "g_scale_mean": _safe_mean(g_scale),
-        "g_scale_p95": _safe_quantile(g_scale, 0.95),
         "omega_abs_max_deg": _safe_max(omega_deg),
         "omega_tilt_abs_max_deg": _safe_max(omega_deg[..., :2]),
         "omega_spin_abs_max_deg": _safe_max(omega_deg[..., 2]),
@@ -301,12 +296,6 @@ def _skipped_context_diagnostics(
         "n_points_subfloor": None,
         "k_eff_mean": None,
         "k_eff_p95": None,
-        "g_rot_mean": None,
-        "g_rot_p95": None,
-        "g_center_mean": None,
-        "g_center_p95": None,
-        "g_scale_mean": None,
-        "g_scale_p95": None,
         "omega_abs_max_deg": None,
         "omega_tilt_abs_max_deg": None,
         "omega_spin_abs_max_deg": None,
@@ -367,6 +356,12 @@ def _make_static_anchor_builder(cfg: QGSConfig) -> VoxelAnchorBuilder:
         planarity_threshold=cfg.anchor_planarity_threshold,
         token_variant=cfg.anchor_token_variant,
         knn_chunk_size=min(cfg.knn_chunk_size, 256),
+        quadric_gamma=cfg.quadric_gamma,
+        quadric_kappa_max=cfg.quadric_kappa_max,
+        quadric_eps_lambda=cfg.quadric_eps_lambda,
+        quadric_eps_kappa=cfg.quadric_eps_kappa,
+        quadric_eps_s=cfg.quadric_eps_s,
+        quadric_eps_s3=cfg.quadric_eps_s3,
     )
 
 
@@ -379,6 +374,12 @@ def _make_dynamic_anchor_builder(cfg: QGSConfig) -> DynamicVoxelAnchorBuilder:
         planarity_threshold=cfg.anchor_planarity_threshold,
         token_variant=cfg.anchor_token_variant,
         knn_chunk_size=min(cfg.knn_chunk_size, 256),
+        quadric_gamma=cfg.quadric_gamma,
+        quadric_kappa_max=cfg.quadric_kappa_max,
+        quadric_eps_lambda=cfg.quadric_eps_lambda,
+        quadric_eps_kappa=cfg.quadric_eps_kappa,
+        quadric_eps_s=cfg.quadric_eps_s,
+        quadric_eps_s3=cfg.quadric_eps_s3,
     )
 
 
@@ -565,7 +566,6 @@ def write_ply(path: Path, xyz: torch.Tensor, intensity: torch.Tensor | None = No
 
 def evaluate_pair_sample(
     model,
-    drop_head,
     loss_fn: QGSLoss,
     sample: dict,
     *,
@@ -711,7 +711,10 @@ def evaluate_pair_sample(
             if dyn.get("box_1") is not None:
                 frame1_contexts.append({
                     "name": f"dynamic_{dyn_idx}",
-                    "primitives": transform_primitives(dyn_prims, _box_to_pose(dyn["box_1"].to(device))),
+                    "primitives": transform_primitives(
+                        dyn_prims,
+                        _box1_to_frame0_pose(dyn["box_1"].to(device), rel_input_1_pose),
+                    ),
                     "context": dyn_diag,
                 })
     elif cfg.primitive_mode == "voxel_anchor":
@@ -771,14 +774,22 @@ def evaluate_pair_sample(
             if dyn.get("box_1") is not None:
                 frame1_contexts.append({
                     "name": f"dynamic_{dyn_idx}",
-                    "primitives": transform_primitives(dyn_prims, _box_to_pose(dyn["box_1"].to(device))),
+                    "primitives": transform_primitives(
+                        dyn_prims,
+                        _box1_to_frame0_pose(dyn["box_1"].to(device), rel_input_1_pose),
+                    ),
                     "context": dyn_diag,
                 })
 
         static_xyz = torch.cat(static_xyz_parts, dim=0)
         static_i = torch.cat(static_i_parts, dim=0)
         static_t = torch.cat(static_t_parts, dim=0)
-        static_anchor_out = _make_static_anchor_builder(cfg)(static_xyz, static_i, static_t)
+        static_anchor_out = _make_static_anchor_builder(cfg)(
+            static_xyz,
+            static_i,
+            static_t,
+            pose_frame1_in_frame0=rel_input_1_pose,
+        )
         anchor_summary["query_voxels"] += int(static_anchor_out.diagnostics.get("query_voxels", 0))
         static_prims = model.forward_anchor_context(
             static_anchor_out,
@@ -880,39 +891,20 @@ def evaluate_pair_sample(
     )
     _record_memory("render_frame1", device_t, memory_records)
 
-    _reset_cuda_peak(device_t)
-    _, drop0 = drop_head(
-        rendered0.latent.unsqueeze(0),
-        rendered0.range.unsqueeze(0),
-        rendered0.normal.unsqueeze(0),
-        rendered0.curvature.unsqueeze(0),
-        rendered0.alpha_accum.unsqueeze(0),
-        ray_grid,
-    )
-    _, drop1 = drop_head(
-        rendered1.latent.unsqueeze(0),
-        rendered1.range.unsqueeze(0),
-        rendered1.normal.unsqueeze(0),
-        rendered1.curvature.unsqueeze(0),
-        rendered1.alpha_accum.unsqueeze(0),
-        ray_grid,
-    )
-    _record_memory("drop_head", device_t, memory_records)
-
-    loss0 = loss_fn(rendered0, target0, drop0)
-    loss1 = loss_fn(rendered1, target1, drop1)
+    loss0 = loss_fn(rendered0, target0, rendered0.raydrop)
+    loss1 = loss_fn(rendered1, target1, rendered1.raydrop)
     total_loss = loss0["total"] + loss1["total"]
 
     frame0_data = {
         "rendered": rendered0,
         "target": target0,
-        "drop": drop0[0],
+        "drop": rendered0.raydrop,
         "loss": loss0,
     }
     frame1_data = {
         "rendered": rendered1,
         "target": target1,
-        "drop": drop1[0],
+        "drop": rendered1.raydrop,
         "loss": loss1,
     }
 

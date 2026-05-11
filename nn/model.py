@@ -71,7 +71,6 @@ class QGSModel(nn.Module):
             feature_dim=D,
             latent_dim=latent_dim,
             hidden_dim=getattr(cfg, "head_hidden_dim", 128),
-            gated=getattr(cfg, "use_gated_head", True),
             alpha_bias_init=getattr(cfg, "head_alpha_bias_init", 2.2),
             intensity_residual=getattr(cfg, "head_intensity_residual", True),
             center_bound=getattr(cfg, "head_center_bound", 0.3),
@@ -142,6 +141,7 @@ class QGSModel(nn.Module):
             "scales": head_out["s"][0],
             "rotations": rotations,
             "opacities": head_out["alpha"][0].unsqueeze(-1),
+            "raydrop": head_out["raydrop"][0],
             "intensity": head_out["intensity"][0],
             "latent": head_out["latent"][0],
             "features": features,
@@ -160,6 +160,43 @@ class QGSModel(nn.Module):
             else:
                 sliced[key] = value
         return sliced
+
+    def _build_init_summary(self, geom_init: dict, k_eff: Tensor) -> Tensor:
+        """Build the 13D per-anchor init-quality summary consumed by QGSHead."""
+        s_init = geom_init["s_init"]
+        fit_quality = (geom_init["fit_quality"] / 2.0).clamp(0.0, 2.0)
+        aniso = torch.stack(
+            [
+                geom_init["tangent_aniso"],
+                geom_init["curvature_aniso"],
+            ],
+            dim=-1,
+        )
+        aniso = (aniso / 2.0).clamp(0.0, 2.0)
+        log_abs_s = (torch.log(s_init.abs().clamp(min=1e-6)) / 4.0).clamp(-2.0, 2.0)
+        kappa = torch.stack(
+            [
+                geom_init["kappa1_init"],
+                geom_init["kappa2_init"],
+            ],
+            dim=-1,
+        )
+        kappa = (kappa / 5.0).clamp(-2.0, 2.0)
+        use_geom = geom_init["use_geom_init"].to(dtype=s_init.dtype).unsqueeze(-1)
+        if k_eff.dim() == 1:
+            k_eff = k_eff.unsqueeze(0)
+        k_eff_norm = (k_eff.to(device=s_init.device, dtype=s_init.dtype) / max(self.knn_k_target, 1)).clamp(0.0, 1.0)
+        return torch.cat(
+            [
+                fit_quality,
+                aniso,
+                log_abs_s,
+                kappa,
+                use_geom,
+                k_eff_norm.unsqueeze(-1),
+            ],
+            dim=-1,
+        )
 
     # ------------------------------------------------------------------
     def _build_point_features(
@@ -247,7 +284,7 @@ class QGSModel(nn.Module):
             'intensity' [N]      in (0, 1).
             'latent'    [N, L]   per-Gaussian latent for the drop head.
             'features'  [N, D]   raw backbone features (diagnostic).
-            'aux'       dict     QGSHead aux dict (gate, residuals).
+            'aux'       dict     QGSHead aux dict (residual diagnostics).
             'geom_init' dict     output of `fit_local_quadrics` (diagnostic).
             'k_eff'     [N]      effective neighbour count.
         """
@@ -357,6 +394,7 @@ class QGSModel(nn.Module):
             geom_init,
             is_dynamic,
             intensity_input=intensity_norm.unsqueeze(0),            # [1, N]
+            init_summary=self._build_init_summary(geom_init, knn["k_eff"]),
         )
         _record_stage("head")
 
@@ -405,6 +443,7 @@ class QGSModel(nn.Module):
             geom_init,
             is_dynamic,
             intensity_input=anchor_out.i_mean.unsqueeze(0),
+            init_summary=self._build_init_summary(geom_init, anchor_out.k_eff),
         )
         return self._pack_primitives(
             head_out,
@@ -476,12 +515,14 @@ class QGSModel(nn.Module):
             geom_init,
             is_dynamic,
             intensity_input=i_mean.unsqueeze(0),
+            init_summary=self._build_init_summary(geom_init, k_eff),
         )
 
         center_splits = torch.split(head_out["center"][0], sizes, dim=0)
         scale_splits = torch.split(head_out["s"][0], sizes, dim=0)
         rot_splits = torch.split(rotmat_to_quat(head_out["R"][0]), sizes, dim=0)
         alpha_splits = torch.split(head_out["alpha"][0].unsqueeze(-1), sizes, dim=0)
+        raydrop_splits = torch.split(head_out["raydrop"][0], sizes, dim=0)
         int_splits = torch.split(head_out["intensity"][0], sizes, dim=0)
         latent_splits = torch.split(head_out["latent"][0], sizes, dim=0)
         feat_splits = torch.split(features, sizes, dim=0)
@@ -498,6 +539,7 @@ class QGSModel(nn.Module):
                 "scales": scale_splits[local_idx],
                 "rotations": rot_splits[local_idx],
                 "opacities": alpha_splits[local_idx],
+                "raydrop": raydrop_splits[local_idx],
                 "intensity": int_splits[local_idx],
                 "latent": latent_splits[local_idx],
                 "features": feat_splits[local_idx],
@@ -640,41 +682,48 @@ class QGSModel(nn.Module):
             geom_init,
             cat_flag.unsqueeze(0),
             intensity_input=cat_int.unsqueeze(0),
+            init_summary=self._build_init_summary(geom_init, cat_keff),
         )
 
         center_all = head_out["center"][0]
         s_all      = head_out["s"][0]
         R_all      = head_out["R"][0]
         rot_all    = rotmat_to_quat(R_all)
-        alpha_all  = head_out["alpha"][0].unsqueeze(-1)
-        int_all    = head_out["intensity"][0]
-        latent_all = head_out["latent"][0]
+        alpha_all    = head_out["alpha"][0].unsqueeze(-1)
+        raydrop_all  = head_out["raydrop"][0]
+        int_all      = head_out["intensity"][0]
+        latent_all   = head_out["latent"][0]
 
         # 6. Split back to per-instance primitives
-        splits_center = torch.split(center_all, sub_sizes, dim=0)
-        splits_s      = torch.split(s_all, sub_sizes, dim=0)
-        splits_rot    = torch.split(rot_all, sub_sizes, dim=0)
-        splits_alpha  = torch.split(alpha_all, sub_sizes, dim=0)
-        splits_int    = torch.split(int_all, sub_sizes, dim=0)
-        splits_latent = torch.split(latent_all, sub_sizes, dim=0)
-        splits_feat   = torch.split(features, sub_sizes, dim=0)
-        splits_keff   = torch.split(cat_keff, sub_sizes, dim=0)
+        splits_center  = torch.split(center_all, sub_sizes, dim=0)
+        splits_s       = torch.split(s_all, sub_sizes, dim=0)
+        splits_rot     = torch.split(rot_all, sub_sizes, dim=0)
+        splits_alpha   = torch.split(alpha_all, sub_sizes, dim=0)
+        splits_raydrop = torch.split(raydrop_all, sub_sizes, dim=0)
+        splits_int     = torch.split(int_all, sub_sizes, dim=0)
+        splits_latent  = torch.split(latent_all, sub_sizes, dim=0)
+        splits_feat    = torch.split(features, sub_sizes, dim=0)
+        splits_keff    = torch.split(cat_keff, sub_sizes, dim=0)
 
         results: list[dict | None] = [None] * K
+        start = 0
         for local_idx, orig_idx in enumerate(valid_indices):
+            end = start + sub_sizes[local_idx]
             results[orig_idx] = {
                 "means3D":   splits_center[local_idx],
                 "scales":    splits_s[local_idx],
                 "rotations": splits_rot[local_idx],
                 "opacities": splits_alpha[local_idx],
+                "raydrop":   splits_raydrop[local_idx],
                 "intensity": splits_int[local_idx],
                 "latent":    splits_latent[local_idx],
                 "features":  splits_feat[local_idx],
-                "aux":       head_out["aux"],
-                "geom_init": geom_init,
+                "aux":       self._slice_aux(head_out["aux"], start, end),
+                "geom_init": self._slice_aux(geom_init, start, end),
                 "k_eff":     splits_keff[local_idx],
                 "diagnostics": {"memory_stages": []},
             }
+            start = end
         return results
 
     def forward(

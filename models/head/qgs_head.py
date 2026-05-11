@@ -15,6 +15,7 @@ import torch.nn as nn
 from torch import Tensor
 
 _EPS = 1e-8
+_INIT_SUMMARY_DIM = 13
 
 
 def _make_mlp(in_dim: int, hidden_dim: int, out_dim: int, depth: int = 2) -> nn.Sequential:
@@ -78,49 +79,47 @@ def _nonzero_sign(x: Tensor) -> Tensor:
 
 
 class GeometryHead(nn.Module):
-    """Predict local centre / rotation / ordered-scale residuals and gates."""
+    """Predict local centre / rotation / ordered-scale residuals."""
 
     def __init__(
         self,
         feature_dim: int,
+        init_feature_dim: int,
         hidden_dim: int,
-        *,
-        gated: bool = True,
-        gate_bias_init: float = -2.0,
     ) -> None:
         super().__init__()
-        self.gated = bool(gated)
-        self.mlp = _make_mlp(feature_dim + 1, hidden_dim, 9, depth=2)
-        if self.gated:
-            self.gate = _make_mlp(6, max(hidden_dim // 2, 16), 3, depth=1)
-            nn.init.constant_(self.gate[-1].bias, gate_bias_init)
+        self.mlp = _make_mlp(feature_dim + init_feature_dim + 1, hidden_dim, 9, depth=2)
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
 
     def forward(
         self,
         features: Tensor,
-        gate_input: Tensor,
+        init_features: Tensor,
         is_dynamic_flag: Tensor,
-        use_geom_init: Tensor,
-        ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    ) -> Tensor:
         dyn = is_dynamic_flag.unsqueeze(-1)
-        raw = self.mlp(torch.cat([features, dyn], dim=-1))
+        return self.mlp(torch.cat([features, init_features, dyn], dim=-1))
 
-        if self.gated:
-            gates = torch.sigmoid(self.gate(gate_input))
-        else:
-            gates = torch.ones(
-                *features.shape[:-1],
-                3,
-                dtype=features.dtype,
-                device=features.device,
-            )
 
-        subfloor = ~use_geom_init
-        if subfloor.any():
-            gates = gates.clone()
-            gates[subfloor] = 1.0
+class InitEncoder(nn.Module):
+    """Project per-anchor init quality/shape summary before residual prediction."""
 
-        return raw, gates[..., 0], gates[..., 1], gates[..., 2]
+    def __init__(
+        self,
+        summary_dim: int,
+        hidden_dim: int,
+        out_dim: int,
+    ) -> None:
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(summary_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, out_dim),
+        )
+
+    def forward(self, init_summary: Tensor) -> Tensor:
+        return self.mlp(init_summary)
 
 
 class AlphaHead(nn.Module):
@@ -140,6 +139,31 @@ class AlphaHead(nn.Module):
         dyn = is_dynamic_flag.unsqueeze(-1)
         inp = torch.cat([features, geometry_summary, dyn], dim=-1)
         return self.mlp(inp).squeeze(-1)
+
+
+class RaydropHead(nn.Module):
+    """Predict per-Gaussian raydrop probability capped at 0.5.
+
+    Cap at 0.5 structurally blocks the miss-BCE cheat path where
+    Σ T_i α_i r_i → 1 with high alpha_accum; the only way rendered_raydrop
+    can reach 1.0 on miss pixels is via T_N → 1 (desired).
+    """
+
+    def __init__(self, feature_dim: int, hidden_dim: int) -> None:
+        super().__init__()
+        # geometry summary (6) + dynamic flag (1)
+        self.mlp = _make_mlp(feature_dim + 7, hidden_dim, 1, depth=2)
+        nn.init.constant_(self.mlp[-1].bias, -2.5)
+
+    def forward(
+        self,
+        features: Tensor,
+        geometry_summary: Tensor,
+        is_dynamic_flag: Tensor,
+    ) -> Tensor:
+        dyn = is_dynamic_flag.unsqueeze(-1)
+        inp = torch.cat([features, geometry_summary, dyn], dim=-1)
+        return 0.5 * torch.sigmoid(self.mlp(inp).squeeze(-1))
 
 
 class LatentHead(nn.Module):
@@ -184,8 +208,6 @@ class QGSHead(nn.Module):
         feature_dim: int,
         latent_dim: int = 16,
         hidden_dim: int = 128,
-        gated: bool = True,
-        gate_bias_init: float = -2.0,
         alpha_bias_init: float = 2.2,
         intensity_residual: bool = True,
         center_bound: float = 0.3,
@@ -195,8 +217,12 @@ class QGSHead(nn.Module):
         scale_log_gap_bound: float | None = None,
         s3_log_bound: float | None = None,
         s3_fallback_abs: float = 0.05,
+        init_summary_dim: int = _INIT_SUMMARY_DIM,
+        init_feature_dim: int = 32,
     ) -> None:
         super().__init__()
+        self.init_summary_dim = int(init_summary_dim)
+        self.init_feature_dim = int(init_feature_dim)
         self.alpha_bias_init = float(alpha_bias_init)
         self.intensity_residual = bool(intensity_residual)
         self.center_bound = float(center_bound)
@@ -212,13 +238,18 @@ class QGSHead(nn.Module):
         self.s3_fallback_abs = float(s3_fallback_abs)
         self.s12_fallback = 0.05
 
+        self.init_encoder = InitEncoder(
+            self.init_summary_dim,
+            hidden_dim,
+            self.init_feature_dim,
+        )
         self.geometry_head = GeometryHead(
             feature_dim,
+            self.init_feature_dim,
             hidden_dim,
-            gated=gated,
-            gate_bias_init=gate_bias_init,
         )
         self.alpha_head = AlphaHead(feature_dim, hidden_dim)
+        self.raydrop_head = RaydropHead(feature_dim, hidden_dim)
         self.latent_head = LatentHead(feature_dim, hidden_dim, latent_dim)
         self.intensity_head = IntensityHead(feature_dim, hidden_dim)
 
@@ -228,6 +259,7 @@ class QGSHead(nn.Module):
         geom_init: dict,
         is_dynamic_flag: Tensor,
         intensity_input: Tensor | None = None,
+        init_summary: Tensor | None = None,
     ) -> dict:
         c_init = geom_init["c_init"]
         R_init = geom_init["R_init"]
@@ -239,21 +271,19 @@ class QGSHead(nn.Module):
 
         if intensity_input is None:
             raise ValueError("QGSHead requires intensity_input for the intensity residual path")
+        if init_summary is None:
+            init_summary = features.new_zeros(*features.shape[:2], self.init_summary_dim)
+        if init_summary.shape[:2] != features.shape[:2] or init_summary.shape[-1] != self.init_summary_dim:
+            raise ValueError(
+                "init_summary must be [B, N, "
+                f"{self.init_summary_dim}], got {tuple(init_summary.shape)}"
+            )
+        init_features = self.init_encoder(init_summary.to(device=features.device, dtype=features.dtype))
 
-        gate_input = torch.cat(
-            [
-                fit_quality,
-                tangent_aniso.unsqueeze(-1),
-                curvature_aniso.unsqueeze(-1),
-            ],
-            dim=-1,
-        )
-
-        raw_geom, g_rot, g_center, g_scale = self.geometry_head(
+        raw_geom = self.geometry_head(
             features,
-            gate_input,
+            init_features,
             is_dynamic_flag,
-            use_geom_init,
         )
 
         raw_omega = raw_geom[..., :3]
@@ -265,10 +295,10 @@ class QGSHead(nn.Module):
         omega_bound = raw_geom.new_tensor(
             [self.rot_tilt_bound, self.rot_tilt_bound, self.rot_spin_bound]
         )
-        omega_local = g_rot.unsqueeze(-1) * torch.tanh(raw_omega) * omega_bound
+        omega_local = torch.tanh(raw_omega) * omega_bound
         R = R_init @ _exp_so3(omega_local)
 
-        delta_c = g_center.unsqueeze(-1) * torch.tanh(raw_delta_c) * self.center_bound
+        delta_c = torch.tanh(raw_delta_c) * self.center_bound
         center = c_init + delta_c
 
         s1_sign = torch.where(use_geom_init, _nonzero_sign(s_init[..., 0]), torch.ones_like(s_init[..., 0]))
@@ -287,8 +317,8 @@ class QGSHead(nn.Module):
         mu_init = 0.5 * (torch.log(s1_base) + torch.log(s2_base))
         gap_init = (torch.log(s1_base) - torch.log(s2_base)).clamp(min=0.0)
 
-        delta_mu = g_scale * torch.tanh(raw_mu) * self.scale_log_mean_bound
-        delta_gap = g_scale * torch.tanh(raw_gap) * self.scale_log_gap_bound
+        delta_mu = torch.tanh(raw_mu) * self.scale_log_mean_bound
+        delta_gap = torch.tanh(raw_gap) * self.scale_log_gap_bound
         mu = mu_init + delta_mu
         gap = torch.clamp(gap_init + delta_gap, min=0.0)
 
@@ -303,7 +333,7 @@ class QGSHead(nn.Module):
             s3_init.abs().clamp(min=_EPS),
             torch.full_like(s3_init, self.s3_fallback_abs),
         )
-        delta_log_abs_s3 = g_scale * torch.tanh(raw_s3) * self.s3_log_bound
+        delta_log_abs_s3 = torch.tanh(raw_s3) * self.s3_log_bound
         s3 = s3_abs_base * torch.exp(delta_log_abs_s3)
 
         normal = R[..., :, 2]
@@ -311,13 +341,14 @@ class QGSHead(nn.Module):
             [
                 torch.log(s1_abs.clamp(min=_EPS)).unsqueeze(-1),
                 torch.log(s2_abs.clamp(min=_EPS)).unsqueeze(-1),
-                s3.unsqueeze(-1),
+                torch.log(s3.clamp(min=_EPS)).unsqueeze(-1),
                 normal,
             ],
             dim=-1,
         )
         logit_alpha = self.alpha_head(features, geometry_summary, is_dynamic_flag)
         alpha = torch.sigmoid(logit_alpha + self.alpha_bias_init)
+        raydrop = self.raydrop_head(features, geometry_summary, is_dynamic_flag)
         latent = self.latent_head(features, is_dynamic_flag)
         delta_logit_intensity = self.intensity_head(
             features,
@@ -338,12 +369,10 @@ class QGSHead(nn.Module):
             "R": R,
             "s": torch.stack([s1, s2, s3], dim=-1),
             "alpha": alpha,
+            "raydrop": raydrop,
             "intensity": intensity,
             "latent": latent,
             "aux": {
-                "g_rot": g_rot,
-                "g_center": g_center,
-                "g_scale": g_scale,
                 "omega_local": omega_local,
                 "delta_c": delta_c,
                 "delta_mu": delta_mu,
@@ -353,6 +382,8 @@ class QGSHead(nn.Module):
                 "tangent_aniso": tangent_aniso,
                 "curvature_aniso": curvature_aniso,
                 "used_init": use_geom_init,
-                "gate_input": gate_input,
+                "fit_quality": fit_quality,
+                "init_summary": init_summary,
+                "init_features": init_features,
             },
         }

@@ -95,6 +95,7 @@ def _lidar_scene(
     opacities = torch.full((N, 1), opacity, device=device, dtype=torch.float32)
     intensity = torch.full((N,), 0.5, device=device, dtype=torch.float32)
     latent = torch.zeros((N, LIDAR_LATENT_DIM), device=device, dtype=torch.float32)
+    raydrop = torch.zeros(N, device=device, dtype=torch.float32)
 
     viewmatrix = torch.eye(4, device=device, dtype=torch.float32)
     campos = torch.zeros(3, device=device, dtype=torch.float32)
@@ -116,6 +117,7 @@ def _lidar_scene(
         rotations=rotations,
         intensity=intensity,
         latent=latent,
+        raydrop=raydrop,
     )
     return out
 
@@ -128,6 +130,7 @@ def _lidar_scene_custom(
     latent: torch.Tensor,
     *,
     rotations: torch.Tensor | None = None,
+    raydrop: torch.Tensor | None = None,
     image_width: int = 64,
     image_height: int = 16,
     el_min: float = math.radians(-30.0),
@@ -138,9 +141,12 @@ def _lidar_scene_custom(
     from diff_quadratic_rasterization import LiDARRasterizer, make_lidar_settings
 
     device = means3D.device
+    N = means3D.shape[0]
     if rotations is None:
-        rotations = torch.zeros(means3D.shape[0], 4, device=device, dtype=torch.float32)
+        rotations = torch.zeros(N, 4, device=device, dtype=torch.float32)
         rotations[:, 0] = 1.0
+    if raydrop is None:
+        raydrop = torch.zeros(N, device=device, dtype=torch.float32)
 
     viewmatrix = torch.eye(4, device=device, dtype=torch.float32)
     campos = torch.zeros(3, device=device, dtype=torch.float32)
@@ -162,6 +168,7 @@ def _lidar_scene_custom(
         rotations=rotations,
         intensity=intensity,
         latent=latent,
+        raydrop=raydrop,
     )
 
 
@@ -379,6 +386,77 @@ def test_lidar_forward_runs():
 
 
 @cuda
+def test_lidar_public_viewmatrix_applies_standard_world_to_sensor_pose():
+    """`render_primitives` accepts an ordinary row-major world-to-sensor pose."""
+    from diff_quadratic_rasterization import LIDAR_LATENT_DIM
+    from nn.render_utils import render_primitives
+
+    device = "cuda"
+    dtype = torch.float32
+    H, W = 32, 1024
+    el_min = math.radians(-30.0)
+    el_max = math.radians(+10.0)
+
+    theta = math.radians(22.0)
+    c, s = math.cos(theta), math.sin(theta)
+    R = torch.tensor(
+        [
+            [c, -s, 0.0],
+            [s, c, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        device=device,
+        dtype=dtype,
+    )
+    t = torch.tensor([1.3, -0.8, 0.2], device=device, dtype=dtype)
+    expected_sensor = torch.tensor([-5.0, 10.0, 0.4], device=device, dtype=dtype)
+    mean_world = R.T @ (expected_sensor - t)
+
+    viewmatrix = torch.eye(4, device=device, dtype=dtype)
+    viewmatrix[:3, :3] = R
+    viewmatrix[:3, 3] = t
+
+    primitives = {
+        "means3D": mean_world.view(1, 3),
+        "scales": torch.tensor([[4.0, 4.0, 2.0]], device=device, dtype=dtype),
+        "rotations": torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=device, dtype=dtype),
+        "opacities": torch.tensor([[0.99]], device=device, dtype=dtype),
+        "intensity": torch.tensor([1.0], device=device, dtype=dtype),
+        "latent": torch.zeros((1, LIDAR_LATENT_DIM), device=device, dtype=dtype),
+        "raydrop": torch.zeros(1, device=device, dtype=dtype),
+    }
+
+    out = render_primitives(
+        primitives,
+        height=H,
+        width=W,
+        el_min_rad=el_min,
+        el_max_rad=el_max,
+        r_near=0.2,
+        r_far=70.0,
+        sigma=3.0,
+        viewmatrix=viewmatrix,
+        campos=torch.zeros(3, device=device, dtype=dtype),
+    )
+
+    assert out.alpha_accum.max().item() > 0.25
+    peak = int(out.alpha_accum.argmax().item())
+    peak_v, peak_u = divmod(peak, W)
+
+    x, y, z = expected_sensor
+    expected_range = expected_sensor.norm()
+    expected_az = torch.atan2(x, y)
+    expected_el = torch.atan2(z, torch.sqrt(x * x + y * y))
+    expected_u = int(torch.round((expected_az + math.pi) * (W / (2.0 * math.pi)) - 0.5).item())
+    expected_v = int(torch.round((expected_el - el_min) * (H / (el_max - el_min)) - 0.5).item())
+
+    assert abs(peak_u - expected_u) <= 2
+    assert abs(peak_v - expected_v) <= 2
+    assert out.middepth[peak_v, peak_u].item() > expected_range.item() - 3.0
+    assert out.middepth[peak_v, peak_u].item() < expected_range.item() + 1.0
+
+
+@cuda
 def test_lidar_forward_wraparound():
     """A3.2.d — azimuth ±π wraparound emission.
 
@@ -531,6 +609,7 @@ def test_lidar_rasterizer_named_layout():
     latent = torch.empty((N, LIDAR_LATENT_DIM), device=device, dtype=torch.float32)
     for k in range(LIDAR_LATENT_DIM):
         latent[:, k] = 0.1 * (k + 1)
+    raydrop = torch.zeros(N, device=device, dtype=torch.float32)
 
     viewmatrix = torch.eye(4, device=device, dtype=torch.float32)
     campos = torch.zeros(3, device=device, dtype=torch.float32)
@@ -550,6 +629,7 @@ def test_lidar_rasterizer_named_layout():
         rotations=rotations,
         intensity=intensity,
         latent=latent,
+        raydrop=raydrop,
     )
 
     # ---- Structural checks ------------------------------------------------
@@ -562,7 +642,7 @@ def test_lidar_rasterizer_named_layout():
     assert out.normal.shape      == (3, H, W)
     assert out.curvature.shape   == (H, W)
     assert out.latent.shape      == (LIDAR_LATENT_DIM, H, W)
-    assert out.drop_logit is None, "drop_logit must remain None until A3.4 wires the MLP"
+    assert out.raydrop.shape     == (H, W)
     assert out.radii.shape == (N,)
     assert (out.radii > 0).any().item(), "no LiDAR primitive visible"
 
@@ -623,7 +703,8 @@ def test_lidar_channel_layout_constants_are_exported():
     assert dq.OUTPUT_CHANNELS == dq.NUM_CHANNELS + 10
     assert dq.LIDAR_INTENSITY_OFFSET == 0
     assert dq.LIDAR_LATENT_OFFSET == 1
-    assert dq.LIDAR_LATENT_DIM == dq.NUM_CHANNELS - 1
+    assert dq.LIDAR_LATENT_DIM == dq.NUM_CHANNELS - 2
+    assert dq.LIDAR_RAYDROP_OFFSET == dq.NUM_CHANNELS - 1
 
 
 @cuda
@@ -844,6 +925,8 @@ def test_lidar_backward_runs_and_matches_finite_diff():
         viewmatrix=viewmatrix, campos=campos,
     )
 
+    raydrop_init = torch.zeros(3, device=device, dtype=torch.float32)
+
     def render_loss(means3D, scales, opacities, intensity, latent):
         """Sum of the depth channel — a smooth scalar function of inputs."""
         out = LiDARRasterizer(settings)(
@@ -854,6 +937,7 @@ def test_lidar_backward_runs_and_matches_finite_diff():
             rotations=rotations,
             intensity=intensity,
             latent=latent,
+            raydrop=raydrop_init,
         )
         # Use the raw alpha-weighted depth channel: sum over hit pixels.
         return out.raw[DEPTH_OFFSET].sum()
@@ -970,6 +1054,7 @@ def test_lidar_backward_matches_finite_diff_for_shape_opacity_rotation():
     rotations_init = rotations_init / rotations_init.norm(dim=-1, keepdim=True).clamp(min=1e-8)
     intensity = torch.full((2,), 0.5, device=device, dtype=torch.float32)
     latent = torch.zeros((2, LIDAR_LATENT_DIM), device=device, dtype=torch.float32)
+    raydrop = torch.zeros(2, device=device, dtype=torch.float32)
 
     viewmatrix = torch.eye(4, device=device, dtype=torch.float32)
     campos = torch.zeros(3, device=device, dtype=torch.float32)
@@ -991,6 +1076,7 @@ def test_lidar_backward_matches_finite_diff_for_shape_opacity_rotation():
             rotations=rotations,
             intensity=intensity,
             latent=latent,
+            raydrop=raydrop,
         )
         return out.raw[DEPTH_OFFSET].sum() + 3.0 * out.raw[ALPHA_OFFSET].sum()
 
@@ -1060,6 +1146,7 @@ def test_lidar_backward_matches_finite_diff_for_shape_opacity_rotation():
     rot_init = torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=device, dtype=torch.float32)
     rot_intensity = torch.full((1,), 0.5, device=device, dtype=torch.float32)
     rot_latent = torch.zeros((1, LIDAR_LATENT_DIM), device=device, dtype=torch.float32)
+    rot_raydrop = torch.zeros(1, device=device, dtype=torch.float32)
 
     def rotation_loss(rotations):
         out = LiDARRasterizer(rot_settings)(
@@ -1070,6 +1157,7 @@ def test_lidar_backward_matches_finite_diff_for_shape_opacity_rotation():
             rotations=rotations,
             intensity=rot_intensity,
             latent=rot_latent,
+            raydrop=rot_raydrop,
         )
         return out.raw[DEPTH_OFFSET].sum() + 3.0 * out.raw[ALPHA_OFFSET].sum()
 

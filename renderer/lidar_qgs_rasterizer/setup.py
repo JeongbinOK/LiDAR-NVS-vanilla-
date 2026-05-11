@@ -17,12 +17,12 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _GLM_INC = os.path.join(_HERE, "third_party/glm/")
 
 # Build-time latent feature dimension for LiDAR mode.
-#   NUM_CHANNELS = 1 (intensity) + LIDAR_LATENT_DIM (latent)
+#   NUM_CHANNELS = 1 (intensity) + LIDAR_LATENT_DIM (latent) + 1 (raydrop)
 # Override per build:  LIDAR_LATENT_DIM=32 pip install -e renderer/lidar_qgs_rasterizer
 _latent_dim = int(os.environ.get("LIDAR_LATENT_DIM", "16"))
 if _latent_dim < 0:
     raise ValueError(f"LIDAR_LATENT_DIM must be >= 0, got {_latent_dim}")
-_num_channels = _latent_dim + 1
+_num_channels = _latent_dim + 2
 _channel_macro = [f"-DLIDAR_RASTER_NUM_CHANNELS={_num_channels}"]
 
 setup(

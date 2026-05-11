@@ -59,9 +59,8 @@ class QGSConfig:
 
     # QGS head
     head_hidden_dim: int = 128
-    use_gated_head: bool = True       # A2.2 flagship; False = A2.1 ablation
     lidar_latent_dim: int | None = None  # None resolves to compiled rasterizer LIDAR_LATENT_DIM
-    head_alpha_bias_init: float = 2.2     # sigmoid(2.2)≈0.90 — high initial coverage
+    head_alpha_bias_init: float = 0.0     # sigmoid(0.0)=0.50 — neutral initial coverage; 2.2 caused T overflow
     head_intensity_residual: bool = True  # intensity = sigmoid(logit + logit(input))
     head_center_bound: float = 0.3        # max analytic-center residual magnitude (m)
     rot_tilt_deg: float = 10.0
@@ -75,7 +74,7 @@ class QGSConfig:
     knn_k_target: int = 16
     knn_k_min: int = 8
     knn_chunk_size: int = 1024
-    quadric_gamma: float = 1.0
+    quadric_gamma: float = 1.73
     quadric_kappa_max: float = 5.0
     quadric_eps_lambda: float = 0.01
     quadric_eps_kappa: float = 1e-3
@@ -93,7 +92,7 @@ class QGSConfig:
     lidar_width: int = 1085  # 20Hz/46.08us -> ~1085 azimuth bins per revolution
     lidar_el_min_deg: float = -30.67   # nuScenes LIDAR_TOP
     lidar_el_max_deg: float = +10.67
-    lidar_sigma: float = 1.5
+    lidar_sigma: float = 3.0
     r_near: float = 0.2
     r_far: float = 70.0
 
@@ -130,6 +129,10 @@ class QGSConfig:
 
     # Device
     device: str = "cuda"
+
+    # Debug
+    debug_finite_check: bool = False  # log non-finite forward boundaries in process_pair
+    debug_anomaly_batch: int = -1     # run set_detect_anomaly on this batch_idx (-1 = off)
 
     def __post_init__(self) -> None:
         self.lidar_latent_dim = resolve_lidar_latent_dim(self.lidar_latent_dim)

@@ -8,6 +8,7 @@ Intermediate sweep supervision / arbitrary-time rendering is not wired here.
 """
 
 import argparse
+import contextlib
 import dataclasses
 import json
 import math
@@ -32,12 +33,12 @@ from dataset import NuScenesNVSDataset, nvs_collate_fn
 
 from models.geometry import decompose_scene
 from models.geometry.voxel_anchor import DynamicVoxelAnchorBuilder, VoxelAnchorBuilder
-from models.head import DropHead, make_lidar_ray_grid
 from nn.model import QGSModel
 from nn.qgs_loss import QGSLoss
 from nn.render_utils import (
     build_gt_normal_map,
     build_target_lidar_image,
+    make_lidar_ray_grid,
     quat_to_rotmat,
     render_primitives,
     rotmat_to_quat,
@@ -195,6 +196,12 @@ def _make_static_anchor_builder(cfg: QGSConfig) -> VoxelAnchorBuilder:
         planarity_threshold=cfg.anchor_planarity_threshold,
         token_variant=cfg.anchor_token_variant,
         knn_chunk_size=min(cfg.knn_chunk_size, 256),
+        quadric_gamma=cfg.quadric_gamma,
+        quadric_kappa_max=cfg.quadric_kappa_max,
+        quadric_eps_lambda=cfg.quadric_eps_lambda,
+        quadric_eps_kappa=cfg.quadric_eps_kappa,
+        quadric_eps_s=cfg.quadric_eps_s,
+        quadric_eps_s3=cfg.quadric_eps_s3,
     )
 
 
@@ -207,6 +214,12 @@ def _make_dynamic_anchor_builder(cfg: QGSConfig) -> DynamicVoxelAnchorBuilder:
         planarity_threshold=cfg.anchor_planarity_threshold,
         token_variant=cfg.anchor_token_variant,
         knn_chunk_size=min(cfg.knn_chunk_size, 256),
+        quadric_gamma=cfg.quadric_gamma,
+        quadric_kappa_max=cfg.quadric_kappa_max,
+        quadric_eps_lambda=cfg.quadric_eps_lambda,
+        quadric_eps_kappa=cfg.quadric_eps_kappa,
+        quadric_eps_s=cfg.quadric_eps_s,
+        quadric_eps_s3=cfg.quadric_eps_s3,
     )
 
 
@@ -235,6 +248,11 @@ def _box_to_pose(box: torch.Tensor) -> torch.Tensor:
     return pose
 
 
+def _box1_to_frame0_pose(box: torch.Tensor, rel_input_1_pose: torch.Tensor) -> torch.Tensor:
+    rel = rel_input_1_pose.to(device=box.device, dtype=box.dtype)
+    return rel @ _box_to_pose(box)
+
+
 def _concat_primitives(primitives: list[dict]) -> dict:
     if not primitives:
         return {}
@@ -251,7 +269,7 @@ def _concat_primitives(primitives: list[dict]) -> dict:
 
 @torch.no_grad()
 def _primitive_residual_stats(primitives: list[dict]) -> dict[str, torch.Tensor]:
-    """Aggregate QGSHead residual/gate magnitudes for train-time diagnostics."""
+    """Aggregate QGSHead residual magnitudes for train-time diagnostics."""
     rows = []
     weights = []
     for prim in primitives:
@@ -261,16 +279,18 @@ def _primitive_residual_stats(primitives: list[dict]) -> dict[str, torch.Tensor]
         n = int(prim["means3D"].shape[0])
         if n == 0:
             continue
-        omega_deg = aux["omega_local"][0].abs() * (180.0 / math.pi)
+        omega_local_deg = aux["omega_local"][0] * (180.0 / math.pi)  # [..., 3]
         row = {
-            "diag_g_rot": aux["g_rot"][0].mean(),
-            "diag_g_center": aux["g_center"][0].mean(),
-            "diag_g_scale": aux["g_scale"][0].mean(),
-            "diag_omega_deg": omega_deg.norm(dim=-1).mean(),
+            "diag_omega_deg": omega_local_deg.norm(dim=-1).mean(),
+            "diag_tilt_deg": omega_local_deg[..., :2].norm(dim=-1).mean(),   # M2: tilt (ω_x,ω_y)
+            "diag_spin_deg": omega_local_deg[..., 2].abs().mean(),           # M2: spin (ω_z, gauge)
             "diag_delta_c": aux["delta_c"][0].norm(dim=-1).mean(),
             "diag_delta_mu": aux["delta_mu"][0].abs().mean(),
+            "diag_delta_mu_sign": aux["delta_mu"][0].mean(),                 # M1: signed (A vs B)
             "diag_delta_gap": aux["delta_gap"][0].abs().mean(),
+            "diag_delta_gap_sign": aux["delta_gap"][0].mean(),               # M1: signed
             "diag_delta_s3": aux["delta_log_abs_s3"][0].abs().mean(),
+            "diag_delta_s3_sign": aux["delta_log_abs_s3"][0].mean(),         # M1: signed
             "diag_delta_int": aux["delta_logit_intensity"][0].abs().mean(),
         }
         rows.append(row)
@@ -290,8 +310,91 @@ def _primitive_residual_stats(primitives: list[dict]) -> dict[str, torch.Tensor]
     return stats
 
 
-def process_pair(model, loss_fn, drop_head, ray_dir, batch, idx, device, cfg):
+def _profile_sync(device: torch.device | str) -> None:
+    device = torch.device(device)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def _profile_mark(profile: dict | None, name: str, start: float, device: torch.device | str) -> float:
+    if profile is None:
+        return time.perf_counter()
+    _profile_sync(device)
+    now = time.perf_counter()
+    timings = profile.setdefault("timings_ms", {})
+    timings[name] = timings.get(name, 0.0) + (now - start) * 1000.0
+    return now
+
+
+def _profile_count(profile: dict | None, name: str, value: int | float) -> None:
+    if profile is None:
+        return
+    profile.setdefault("counts", {})[name] = int(value) if isinstance(value, int) else float(value)
+
+
+def _summarize_bad_gradients(
+    named_params: list[tuple[str, torch.nn.Parameter]],
+    *,
+    max_items: int = 64,
+) -> str:
+    """Return a compact summary of the first non-finite gradients."""
+    parts = []
+    for name, param in named_params:
+        grad = param.grad
+        if grad is None:
+            continue
+        finite_mask = torch.isfinite(grad)
+        if bool(finite_mask.all()):
+            continue
+        nan_count = int(torch.isnan(grad).sum().item())
+        inf_count = int(torch.isinf(grad).sum().item())
+        finite_abs_max = float(grad[finite_mask].abs().max().item()) if bool(finite_mask.any()) else float("nan")
+        parts.append(
+            f"{name}(nan={nan_count},inf={inf_count},finite_abs_max={finite_abs_max:.2e})"
+        )
+        if len(parts) >= max_items:
+            break
+    return "; ".join(parts) if parts else "unknown"
+
+
+def _check_finite_prims(prims_list: list, label: str) -> None:
+    """Print non-finite entries for all tensor fields across a list of primitive dicts."""
+    for i, prims in enumerate(prims_list):
+        if prims is None:
+            continue
+        for k, v in prims.items():
+            if not torch.is_tensor(v):
+                continue
+            fm = torch.isfinite(v)
+            if fm.all():
+                continue
+            nan_c = int(torch.isnan(v).sum())
+            inf_c = int(torch.isinf(v).sum())
+            fmax = float(v[fm].abs().max()) if fm.any() else float("nan")
+            print(f"  [non-finite] {label}[{i}].{k}: shape={tuple(v.shape)} "
+                  f"nan={nan_c} inf={inf_c} finite_abs_max={fmax:.2e}")
+
+
+def _check_finite_render(rendered, label: str) -> None:
+    """Print non-finite entries for key fields of a rendered output."""
+    for attr in ("range", "intensity", "alpha_accum", "normal", "curvature"):
+        v = getattr(rendered, attr, None)
+        if v is None or not torch.is_tensor(v):
+            continue
+        fm = torch.isfinite(v)
+        if fm.all():
+            continue
+        nan_c = int(torch.isnan(v).sum())
+        inf_c = int(torch.isinf(v).sum())
+        fmax = float(v[fm].abs().max()) if fm.any() else float("nan")
+        print(f"  [non-finite] {label}.{attr}: shape={tuple(v.shape)} "
+              f"nan={nan_c} inf={inf_c} finite_abs_max={fmax:.2e}")
+
+
+def process_pair(model, loss_fn, ray_dir, batch, idx, device, cfg, profile: dict | None = None):
     """Build a shared scene from a frame pair and render both keyframes."""
+    _profile_sync(device)
+    t_prof = time.perf_counter()
     p0 = _batch_item(batch, "input_0", idx).to(device)
     p1 = _batch_item(batch, "input_1", idx).to(device)
     rel_input_1_pose = _ensure_2d_pose(_batch_item(batch, "input_1_pose", idx)).to(device)
@@ -310,8 +413,11 @@ def process_pair(model, loss_fn, drop_head, ray_dir, batch, idx, device, cfg):
 
     xyz0, i0 = _filter_frame_points(xyz0, i0, cfg)
     xyz1, i1 = _filter_frame_points(xyz1, i1, cfg)
+    _profile_count(profile, "filtered_frame0_points", xyz0.shape[0])
+    _profile_count(profile, "filtered_frame1_points", xyz1.shape[0])
     if xyz0.shape[0] < cfg.knn_k_min or xyz1.shape[0] < cfg.knn_k_min:
         return None
+    t_prof = _profile_mark(profile, "load_filter", t_prof, device)
 
     if boxes_0.numel() and boxes_1.numel():
         scene = decompose_scene(
@@ -332,6 +438,9 @@ def process_pair(model, loss_fn, drop_head, ray_dir, batch, idx, device, cfg):
             "dynamic": [],
             "untracked_stats": {},
         }
+    _profile_count(profile, "static_points", scene["static_xyz"].shape[0])
+    _profile_count(profile, "dynamic_instances", len(scene["dynamic"]))
+    t_prof = _profile_mark(profile, "decompose_scene", t_prof, device)
 
     e_dir = rel_input_1_pose[:3, 3].to(dtype=xyz0.dtype, device=device)
     inv_pose = torch.linalg.inv(rel_input_1_pose)
@@ -375,17 +484,28 @@ def process_pair(model, loss_fn, drop_head, ray_dir, batch, idx, device, cfg):
             if dyn.get("box_0") is not None:
                 frame0_primitives.append(_transform_primitives(dyn_prims, _box_to_pose(dyn["box_0"].to(device))))
             if dyn.get("box_1") is not None:
-                frame1_primitives.append(_transform_primitives(dyn_prims, _box_to_pose(dyn["box_1"].to(device))))
+                frame1_primitives.append(_transform_primitives(
+                    dyn_prims,
+                    _box1_to_frame0_pose(dyn["box_1"].to(device), rel_input_1_pose),
+                ))
     elif cfg.primitive_mode == "voxel_anchor":
         dyn_anchor_outputs = []
         if dyn_list:
             dynamic_builder = _make_dynamic_anchor_builder(cfg)
-            dyn_anchor_pairs = dynamic_builder(dyn_list)
+            dyn_anchor_pairs = dynamic_builder(
+                dyn_list,
+                profile=profile,
+                profile_prefix="dynamic_anchor",
+            )
             dyn_anchor_outputs = [out for _, out in dyn_anchor_pairs]
+            _profile_count(profile, "dynamic_query_voxels", sum(out.diagnostics.get("query_voxels", 0) for out in dyn_anchor_outputs))
+            _profile_count(profile, "dynamic_final_anchors", sum(out.c_init.shape[0] for out in dyn_anchor_outputs))
+            t_prof = _profile_mark(profile, "dynamic_anchor_build", t_prof, device)
             dyn_prims_list = model.forward_anchor_contexts_batched(
                 dyn_anchor_outputs,
                 context_type="dynamic",
             )
+            t_prof = _profile_mark(profile, "dynamic_ptv3_head", t_prof, device)
         else:
             dyn_prims_list = []
 
@@ -402,17 +522,31 @@ def process_pair(model, loss_fn, drop_head, ray_dir, batch, idx, device, cfg):
             if dyn.get("box_0") is not None:
                 frame0_primitives.append(_transform_primitives(dyn_prims, _box_to_pose(dyn["box_0"].to(device))))
             if dyn.get("box_1") is not None:
-                frame1_primitives.append(_transform_primitives(dyn_prims, _box_to_pose(dyn["box_1"].to(device))))
+                frame1_primitives.append(_transform_primitives(
+                    dyn_prims,
+                    _box1_to_frame0_pose(dyn["box_1"].to(device), rel_input_1_pose),
+                ))
 
         static_xyz = torch.cat(static_xyz_parts, dim=0)
         static_i = torch.cat(static_i_parts, dim=0)
         static_t = torch.cat(static_t_parts, dim=0)
         src = static_t
-        static_anchor_out = _make_static_anchor_builder(cfg)(static_xyz, static_i, src)
+        static_anchor_out = _make_static_anchor_builder(cfg)(
+            static_xyz,
+            static_i,
+            src,
+            pose_frame1_in_frame0=rel_input_1_pose,
+            profile=profile,
+            profile_prefix="static_anchor",
+        )
+        _profile_count(profile, "static_query_voxels", static_anchor_out.diagnostics.get("query_voxels", 0))
+        _profile_count(profile, "static_final_anchors", static_anchor_out.c_init.shape[0])
+        t_prof = _profile_mark(profile, "static_anchor_build", t_prof, device)
         static_prims = model.forward_anchor_context(
             static_anchor_out,
             context_type="static",
         )
+        t_prof = _profile_mark(profile, "static_ptv3_head", t_prof, device)
         if static_prims is not None:
             diagnostic_primitives.append(static_prims)
             frame0_primitives.append(static_prims)
@@ -420,10 +554,15 @@ def process_pair(model, loss_fn, drop_head, ray_dir, batch, idx, device, cfg):
     else:
         raise ValueError(f"unsupported primitive_mode {cfg.primitive_mode!r}")
 
+    if cfg.debug_finite_check and diagnostic_primitives:
+        _check_finite_prims(diagnostic_primitives, "primitives")
+
     frame0 = _concat_primitives(frame0_primitives)
     frame1 = _concat_primitives(frame1_primitives)
     if not frame0 or not frame1:
         return None
+    _profile_count(profile, "frame0_primitives", frame0["means3D"].shape[0])
+    _profile_count(profile, "frame1_primitives", frame1["means3D"].shape[0])
 
     el_min_rad = math.radians(cfg.lidar_el_min_deg)
     el_max_rad = math.radians(cfg.lidar_el_max_deg)
@@ -446,6 +585,7 @@ def process_pair(model, loss_fn, drop_head, ray_dir, batch, idx, device, cfg):
     target1.update(build_gt_normal_map(
         target1["range_image"], target1["valid_mask"], ray_dir,
     ))
+    t_prof = _profile_mark(profile, "target_images", t_prof, device)
 
     rendered0 = render_primitives(
         frame0,
@@ -456,6 +596,9 @@ def process_pair(model, loss_fn, drop_head, ray_dir, batch, idx, device, cfg):
         viewmatrix=torch.eye(4, device=device, dtype=static_xyz.dtype),
         campos=torch.zeros(3, device=device, dtype=static_xyz.dtype),
     )
+    t_prof = _profile_mark(profile, "render_frame0", t_prof, device)
+    if cfg.debug_finite_check:
+        _check_finite_render(rendered0, "rendered0")
     rendered1 = render_primitives(
         frame1,
         height=cfg.lidar_height, width=cfg.lidar_width,
@@ -465,26 +608,13 @@ def process_pair(model, loss_fn, drop_head, ray_dir, batch, idx, device, cfg):
         viewmatrix=inv_pose,
         campos=rel_input_1_pose[:3, 3],
     )
+    t_prof = _profile_mark(profile, "render_frame1", t_prof, device)
+    if cfg.debug_finite_check:
+        _check_finite_render(rendered1, "rendered1")
 
-    drop0_logit, drop0 = drop_head(
-        rendered0.latent.unsqueeze(0),
-        rendered0.range.unsqueeze(0),
-        rendered0.normal.unsqueeze(0),
-        rendered0.curvature.unsqueeze(0),
-        rendered0.alpha_accum.unsqueeze(0),
-        ray_dir,
-    )
-    drop1_logit, drop1 = drop_head(
-        rendered1.latent.unsqueeze(0),
-        rendered1.range.unsqueeze(0),
-        rendered1.normal.unsqueeze(0),
-        rendered1.curvature.unsqueeze(0),
-        rendered1.alpha_accum.unsqueeze(0),
-        ray_dir,
-    )
-
-    loss0 = loss_fn(rendered0, target0, drop0, ray_dir)
-    loss1 = loss_fn(rendered1, target1, drop1, ray_dir)
+    loss0 = loss_fn(rendered0, target0, rendered0.raydrop, ray_dir)
+    loss1 = loss_fn(rendered1, target1, rendered1.raydrop, ray_dir)
+    t_prof = _profile_mark(profile, "loss", t_prof, device)
     total = loss0["total"] + loss1["total"]
     loss_dict = {
         "total": total,
@@ -495,6 +625,14 @@ def process_pair(model, loss_fn, drop_head, ray_dir, batch, idx, device, cfg):
         "normal": 0.5 * (loss0["normal"] + loss1["normal"]),
         "n_valid": 0.5 * (loss0["n_valid"] + loss1["n_valid"]),
         "valid_ratio": 0.5 * (loss0["valid_ratio"] + loss1["valid_ratio"]),
+        "raydrop_hit": 0.5 * (loss0["raydrop_hit"] + loss1["raydrop_hit"]),
+        "raydrop_miss": 0.5 * (loss0["raydrop_miss"] + loss1["raydrop_miss"]),
+        "drop_prob_hit_mean": 0.5 * (loss0["drop_prob_hit_mean"] + loss1["drop_prob_hit_mean"]),
+        "drop_prob_miss_mean": 0.5 * (loss0["drop_prob_miss_mean"] + loss1["drop_prob_miss_mean"]),
+        "alpha_hit_mean": 0.5 * (loss0["alpha_hit_mean"] + loss1["alpha_hit_mean"]),
+        "alpha_miss_mean": 0.5 * (loss0["alpha_miss_mean"] + loss1["alpha_miss_mean"]),
+        "intensity_gt_mean": 0.5 * (loss0["intensity_gt_mean"] + loss1["intensity_gt_mean"]),
+        "intensity_pred_mean": 0.5 * (loss0["intensity_pred_mean"] + loss1["intensity_pred_mean"]),
     }
     loss_dict.update(_primitive_residual_stats(diagnostic_primitives))
     return loss_dict
@@ -574,7 +712,6 @@ def train(cfg: QGSConfig, overfit_frames: int = 0, resume: str = ""):
         w_normal=getattr(cfg, "loss_w_normal", 0.05),
         alpha_eps=cfg.loss_alpha_eps,
     ).to(device)
-    drop_head = DropHead(latent_dim=cfg.lidar_latent_dim).to(device)
     ray_grid = make_lidar_ray_grid(
         cfg.lidar_height,
         cfg.lidar_width,
@@ -618,11 +755,10 @@ def train(cfg: QGSConfig, overfit_frames: int = 0, resume: str = ""):
     backbone_params = list(model.backbone.parameters())
     head_params     = [p for n, p in model.named_parameters()
                        if not n.startswith("backbone.")]
-    drop_head_params = list(drop_head.parameters())
     optimizer = torch.optim.AdamW(
         [
             {"params": backbone_params, "lr": lr_b, "name": "backbone"},
-            {"params": head_params + drop_head_params, "lr": lr_h, "name": "head"},
+            {"params": head_params, "lr": lr_h, "name": "head"},
         ],
         weight_decay=cfg.weight_decay,
     )
@@ -653,8 +789,6 @@ def train(cfg: QGSConfig, overfit_frames: int = 0, resume: str = ""):
     if resume:
         ckpt = torch.load(resume, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"])
-        if "drop_head_state_dict" in ckpt:
-            drop_head.load_state_dict(ckpt["drop_head_state_dict"])
         if "optimizer_state_dict" in ckpt:
             optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         if "scheduler_state_dict" in ckpt:
@@ -695,17 +829,23 @@ def train(cfg: QGSConfig, overfit_frames: int = 0, resume: str = ""):
             optimizer.zero_grad()
             valid_pairs = 0
 
-            for b in range(B):
-                out = process_pair(model, loss_fn, drop_head, ray_grid, batch, b, device, cfg)
-                if out is None:
-                    continue
-                if not torch.isfinite(out["total"]):
-                    pbar.write(f"  NaN/inf loss at batch {batch_idx} pair {valid_pairs}")
-                    continue
-                out["total"].backward()
-                valid_pairs += 1
-                batch_loss += out["total"].item()
-                batch_loss_dicts.append({k: float(v) for k, v in out.items()})
+            _anomaly_ctx = (
+                torch.autograd.detect_anomaly()
+                if cfg.debug_anomaly_batch >= 0 and batch_idx == cfg.debug_anomaly_batch
+                else contextlib.nullcontext()
+            )
+            with _anomaly_ctx:
+                for b in range(B):
+                    out = process_pair(model, loss_fn, ray_grid, batch, b, device, cfg)
+                    if out is None:
+                        continue
+                    if not torch.isfinite(out["total"]):
+                        pbar.write(f"  NaN/inf loss at batch {batch_idx} pair {valid_pairs}")
+                        continue
+                    out["total"].backward()
+                    valid_pairs += 1
+                    batch_loss += out["total"].item()
+                    batch_loss_dicts.append({k: float(v) for k, v in out.items()})
 
             if valid_pairs == 0:
                 pbar.write(f"  All pairs invalid at batch {batch_idx}")
@@ -714,21 +854,37 @@ def train(cfg: QGSConfig, overfit_frames: int = 0, resume: str = ""):
 
             batch_loss /= valid_pairs
             if valid_pairs > 1:
-                for p in list(model.parameters()) + list(drop_head.parameters()):
+                for p in model.parameters():
                     if p.grad is not None:
                         p.grad /= valid_pairs
 
-            all_params = list(model.parameters()) + list(drop_head.parameters())
+            all_params = list(model.parameters())
             has_bad_grad = any(
                 p.grad is not None and not torch.isfinite(p.grad).all()
                 for p in all_params
             )
             if has_bad_grad:
-                pbar.write(f"  Bad grad at batch {batch_idx}")
+                named_params = list(model.named_parameters())
+                bad_grad_summary = _summarize_bad_gradients(named_params)
+                avg_batch = {
+                    k: sum(d[k] for d in batch_loss_dicts) / len(batch_loss_dicts)
+                    for k in batch_loss_dicts[0]
+                }
+                pbar.write(
+                    "  Bad grad at batch "
+                    f"{batch_idx} "
+                    f"loss={avg_batch['total']:.4f} depth={avg_batch['depth']:.3f} "
+                    f"int={avg_batch['intensity']:.3f} drop={avg_batch['raydrop']:.3f} "
+                    f"drop_hit={avg_batch.get('raydrop_hit', 0.0):.3f} "
+                    f"drop_miss={avg_batch.get('raydrop_miss', 0.0):.3f} "
+                    f"alpha_hit={avg_batch.get('alpha_hit_mean', 0.0):.3f} "
+                    f"alpha_miss={avg_batch.get('alpha_miss_mean', 0.0):.3f} "
+                    f"bad={bad_grad_summary}"
+                )
                 optimizer.zero_grad()
                 continue
 
-            torch.nn.utils.clip_grad_norm_(all_params, max_norm=cfg.grad_clip)
+            torch.nn.utils.clip_grad_norm_(list(model.parameters()), max_norm=cfg.grad_clip)
 
             optimizer.step()
             scheduler.step()      # iter-based: warmup → cosine over total_iters
@@ -738,6 +894,16 @@ def train(cfg: QGSConfig, overfit_frames: int = 0, resume: str = ""):
                 for k in batch_loss_dicts[0]
             }
             epoch_losses.append(avg_batch)
+
+            # Intermediate diagnostic log every 500 batches
+            if (batch_idx + 1) % 500 == 0 and epoch_losses:
+                mid_avg = {
+                    k: sum(d[k] for d in epoch_losses) / len(epoch_losses)
+                    for k in epoch_losses[0]
+                }
+                with open(os.path.join(run_dir, "train_metrics.jsonl"), "a") as _f:
+                    _f.write(json.dumps({"epoch": epoch + 1, "batch": batch_idx + 1, **mid_avg}) + "\n")
+
             cur_lr_b = optimizer.param_groups[0]["lr"]
             cur_lr_h = optimizer.param_groups[1]["lr"]
             pbar.set_postfix(
@@ -770,14 +936,11 @@ def train(cfg: QGSConfig, overfit_frames: int = 0, resume: str = ""):
             f"nrm={avg.get('normal', 0.0):.3f} "
             f"valid={avg.get('valid_ratio', 0.0):.3f} "
             f"dC={avg.get('diag_delta_c', 0.0):.4f} "
-            f"dOmega={avg.get('diag_omega_deg', 0.0):.3f}deg "
-            f"dMu={avg.get('diag_delta_mu', 0.0):.4f} "
-            f"dGap={avg.get('diag_delta_gap', 0.0):.4f} "
-            f"dS3={avg.get('diag_delta_s3', 0.0):.4f} "
+            f"tilt={avg.get('diag_tilt_deg', 0.0):.2f}° spin={avg.get('diag_spin_deg', 0.0):.2f}° "
+            f"dMu={avg.get('diag_delta_mu', 0.0):.4f}(sgn={avg.get('diag_delta_mu_sign', 0.0):+.3f}) "
+            f"dGap={avg.get('diag_delta_gap', 0.0):.4f}(sgn={avg.get('diag_delta_gap_sign', 0.0):+.3f}) "
+            f"dS3={avg.get('diag_delta_s3', 0.0):.4f}(sgn={avg.get('diag_delta_s3_sign', 0.0):+.3f}) "
             f"dI={avg.get('diag_delta_int', 0.0):.4f} "
-            f"g={avg.get('diag_g_rot', 0.0):.3f}/"
-            f"{avg.get('diag_g_center', 0.0):.3f}/"
-            f"{avg.get('diag_g_scale', 0.0):.3f} "
             f"{dt:.1f}s"
         )
         tqdm.write(log)
@@ -793,7 +956,6 @@ def train(cfg: QGSConfig, overfit_frames: int = 0, resume: str = ""):
             torch.save({
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
-                "drop_head_state_dict": drop_head.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
                 "loss": best_loss,
@@ -805,7 +967,6 @@ def train(cfg: QGSConfig, overfit_frames: int = 0, resume: str = ""):
             torch.save({
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
-                "drop_head_state_dict": drop_head.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
                 "loss": avg["total"],
@@ -881,6 +1042,37 @@ def main():
         default=None,
         help="Voxel-anchor planarity threshold for residual_planarity mode",
     )
+    parser.add_argument(
+        "--lidar-sigma",
+        type=float,
+        default=None,
+        help="LiDAR rasterizer footprint sigma; larger values increase ray coverage",
+    )
+    # Residual saturation bounds (codex_geometry_residual_saturation_plan.md)
+    parser.add_argument("--head-center-bound", type=float, default=None,
+                        help="Max analytic-centre residual magnitude (m); default 0.3")
+    parser.add_argument("--rot-tilt-deg", type=float, default=None,
+                        help="Rotation tilt bound (deg); default 10")
+    parser.add_argument("--rot-spin-deg", type=float, default=None,
+                        help="Rotation spin bound (deg); default 30")
+    parser.add_argument("--scale-log-mean-bound", type=float, default=None,
+                        help="Scale log-mean residual bound; default ln(2)≈0.693")
+    parser.add_argument("--scale-log-gap-bound", type=float, default=None,
+                        help="Scale log-gap residual bound; default ln(1.5)≈0.405")
+    parser.add_argument("--s3-log-bound", type=float, default=None,
+                        help="s3 log residual bound; default ln(1.5)≈0.405")
+    parser.add_argument(
+        "--debug-finite-check",
+        action="store_true",
+        default=False,
+        help="Log non-finite forward boundaries (primitives / rendered) in process_pair",
+    )
+    parser.add_argument(
+        "--debug-anomaly-batch",
+        type=int,
+        default=None,
+        help="Run torch.autograd.detect_anomaly on this batch_idx (-1 = off)",
+    )
     args = parser.parse_args()
 
     cfg = _load_config(args.config) if args.config else None
@@ -912,7 +1104,24 @@ def main():
         cfg.anchor_residual_threshold = args.anchor_residual_threshold
     if args.anchor_planarity_threshold is not None:
         cfg.anchor_planarity_threshold = args.anchor_planarity_threshold
-
+    if args.lidar_sigma is not None:
+        cfg.lidar_sigma = args.lidar_sigma
+    if args.head_center_bound is not None:
+        cfg.head_center_bound = args.head_center_bound
+    if args.rot_tilt_deg is not None:
+        cfg.rot_tilt_deg = args.rot_tilt_deg
+    if args.rot_spin_deg is not None:
+        cfg.rot_spin_deg = args.rot_spin_deg
+    if args.scale_log_mean_bound is not None:
+        cfg.scale_log_mean_bound = args.scale_log_mean_bound
+    if args.scale_log_gap_bound is not None:
+        cfg.scale_log_gap_bound = args.scale_log_gap_bound
+    if args.s3_log_bound is not None:
+        cfg.s3_log_bound = args.s3_log_bound
+    if args.debug_finite_check:
+        cfg.debug_finite_check = True
+    if args.debug_anomaly_batch is not None:
+        cfg.debug_anomaly_batch = args.debug_anomaly_batch
     train(cfg, overfit_frames=args.overfit, resume=args.resume)
 
 

@@ -2,7 +2,8 @@
 
 Pipeline per sample:
   1) Static / dynamic split (instance_id 두 frame 공통 → dynamic, 그 외 static).
-  2) SphericalVoxelizer (Δφ=3°, Δθ=4°, Δr=3m, query_min=1) on static cloud.
+  2) Per-frame SphericalVoxelizer (Δφ=3°, Δθ=4°, Δr=3m, query_min=1);
+     frame-1 queries are transformed back into frame-0 coordinates.
   3) hybrid_radius_knn(query=voxel_mean, candidates=all_static_pts).
   4) fit_local_quadrics → residual, planarity, support, reach.
 
@@ -24,7 +25,7 @@ sys.path.insert(0, "/data1/nuScenes/loader")
 from dataset import NuScenesNVSDataset  # noqa: E402
 
 from models.geometry.decomposition import decompose_scene  # noqa: E402
-from models.geometry.spherical_voxel import SphericalVoxelizer  # noqa: E402
+from models.geometry.voxel_anchor import VoxelAnchorBuilder  # noqa: E402
 from models.geometry.knn_radius import hybrid_radius_knn  # noqa: E402
 from models.geometry.quadric_fit import fit_local_quadrics  # noqa: E402
 
@@ -40,25 +41,7 @@ N_SAMPLES = 10
 SEED = 42
 
 
-def voxel_adaptive_r_max(query_xyz: torch.Tensor) -> torch.Tensor:
-    """Spherical-voxel-aware k-NN radius.
-
-    Larger than the default per-point r_max because voxel diameter at far range
-    grows with r (Δφ·r, Δθ·r). Use r_max = max(voxel_diag, default_floor).
-    """
-    r = query_xyz.norm(dim=-1)
-    dphi_r = math.radians(DPHI_DEG) * r
-    dtheta_r = math.radians(DTHETA_DEG) * r
-    dr = torch.full_like(r, DR_M)
-    voxel_diag = torch.sqrt(dphi_r * dphi_r + dtheta_r * dtheta_r + dr * dr)
-    return torch.clamp(voxel_diag, min=0.5, max=8.0)
-
-
 def main():
-    import math as _math
-    global math
-    math = _math
-
     parser = argparse.ArgumentParser()
     parser.add_argument("--n_samples", type=int, default=N_SAMPLES)
     parser.add_argument("--seed", type=int, default=SEED)
@@ -82,8 +65,17 @@ def main():
 
     indices = random.sample(range(len(ds)), args.n_samples)
 
-    voxelizer = SphericalVoxelizer(
-        DPHI_DEG, DTHETA_DEG, DR_M, query_voxel_min_points=QUERY_MIN
+    anchor_builder = VoxelAnchorBuilder(
+        dphi_deg=DPHI_DEG,
+        dtheta_deg=DTHETA_DEG,
+        dr_m=DR_M,
+        query_voxel_min_points=QUERY_MIN,
+        k_min=K_MIN,
+        k_target=K_TARGET,
+        knn_chunk_size=256,
+        knn_method="bruteforce",
+        knn_r_min=0.5,
+        knn_r_max=8.0,
     )
 
     all_residual: list[float] = []
@@ -119,7 +111,12 @@ def main():
         i_all = scene["static_intensity"]
         src_all = scene["static_time"]
 
-        vox = voxelizer(xyz_all, intensity=i_all, src=src_all)
+        vox, r_max = anchor_builder._dual_frame_vox(
+            xyz_all,
+            i_all,
+            src_all,
+            T_1to0.to(device),
+        )
         M = vox.query_xyz.shape[0]
         N_total = xyz_all.shape[0]
         n_static_total += N_total
@@ -130,7 +127,7 @@ def main():
             points=vox.query_xyz,
             candidates=xyz_all,
             k_target=K_TARGET,
-            r_max_fn=voxel_adaptive_r_max,
+            r_max_fn=lambda _q, _r=r_max: _r,
             k_min=K_MIN,
             chunk_size=256,
         )

@@ -32,6 +32,7 @@ def test_channel_constants_self_consistent():
         LIDAR_INTENSITY_OFFSET,
         LIDAR_LATENT_DIM,
         LIDAR_LATENT_OFFSET,
+        LIDAR_RAYDROP_OFFSET,
         MIDDEPTH_OFFSET,
         NORMAL_OFFSET,
         NUM_CHANNELS,
@@ -40,7 +41,8 @@ def test_channel_constants_self_consistent():
 
     # Channel layout invariants from cuda_rasterizer/channel_layout.h.
     assert NUM_CHANNELS >= 1, "must have at least intensity channel"
-    assert LIDAR_LATENT_DIM == NUM_CHANNELS - 1
+    assert LIDAR_LATENT_DIM == NUM_CHANNELS - 2  # last slot is raydrop
+    assert LIDAR_RAYDROP_OFFSET == NUM_CHANNELS - 1
     assert OUTPUT_CHANNELS == NUM_CHANNELS + 10
     assert LIDAR_INTENSITY_OFFSET == 0
     assert LIDAR_LATENT_OFFSET == 1
@@ -77,6 +79,7 @@ def test_pack_unpack_roundtrip_at_built_dim():
     opacities = torch.full((N, 1), 0.75, device=device, dtype=torch.float32)
     intensity = torch.full((N,), 0.5, device=device, dtype=torch.float32)
     latent = torch.randn(N, LIDAR_LATENT_DIM, device=device, dtype=torch.float32)
+    raydrop = torch.zeros(N, device=device, dtype=torch.float32)
 
     settings = make_lidar_settings(
         image_height=H, image_width=W,
@@ -87,7 +90,7 @@ def test_pack_unpack_roundtrip_at_built_dim():
     out = LiDARRasterizer(settings)(
         means3D=means3D, means2D=means2D, opacities=opacities,
         scales=scales, rotations=rotations,
-        intensity=intensity, latent=latent,
+        intensity=intensity, latent=latent, raydrop=raydrop,
     )
     assert out.raw.shape == (OUTPUT_CHANNELS, H, W)
     assert out.latent.shape == (LIDAR_LATENT_DIM, H, W)
@@ -134,4 +137,5 @@ def test_wrong_latent_dim_raises_helpful_error():
                                    device=device, dtype=torch.float32),
             intensity=torch.full((N,), 0.5, device=device, dtype=torch.float32),
             latent=bad_latent,
+            raydrop=torch.zeros(N, device=device, dtype=torch.float32),
         )
