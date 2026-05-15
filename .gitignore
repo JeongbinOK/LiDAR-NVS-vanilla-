@@ -33,3 +33,18 @@ renderer/lidar_qgs_rasterizer/diff_quadratic_rasterization/_C*.so
 env/
 venv/
 ENV/
+.codex
+
+# Local-only agent/editor/workflow files
+.agents/
+.claude/
+.vscode/
+AGENTS.md
+CLAUDE.md
+
+# Local-only experiments and validation helpers
+scripts/
+tests/
+test_bbox_viz.py
+viz.py
+visualize_qgs_surfaces.py
