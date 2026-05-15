@@ -27,10 +27,6 @@ def load_cfg_from_checkpoint(checkpoint_path: str) -> QGSConfig:
     config_path = os.path.join(run_dir, "configs", "config.json")
     with open(config_path) as f:
         raw = json.load(f)
-    if "primitive_mode" not in raw:
-        raw["primitive_mode"] = "per_point"
-    if "ptv3_model_in_channels" not in raw:
-        raw["ptv3_model_in_channels"] = raw.get("input_feature_dim", QGSConfig.input_feature_dim)
     if "ptv3_decoupled_stem" not in raw:
         raw["ptv3_decoupled_stem"] = False
     if "ptv3_pdnorm_bn" not in raw:
@@ -95,23 +91,6 @@ def _peak_from_records(records: list[dict]) -> dict:
         "max_alloc_mb": max(float(r.get("max_alloc_mb", 0.0)) for r in records),
         "max_reserved_mb": max(float(r.get("max_reserved_mb", 0.0)) for r in records),
     }
-
-
-def _record_memory_with_peak(
-    stage: str,
-    device: torch.device,
-    records: list[dict],
-    *,
-    peak_records: list[dict] | None = None,
-) -> None:
-    if device.type != "cuda":
-        return
-    snapshot = _cuda_memory_snapshot(device)
-    if peak_records:
-        peak = _peak_from_records(peak_records)
-        snapshot["max_alloc_mb"] = max(snapshot["max_alloc_mb"], peak["max_alloc_mb"])
-        snapshot["max_reserved_mb"] = max(snapshot["max_reserved_mb"], peak["max_reserved_mb"])
-    records.append({"stage": stage, **snapshot})
 
 
 def _box_to_pose(box: torch.Tensor) -> torch.Tensor:
@@ -323,33 +302,6 @@ def _skipped_context_diagnostics(
         "alpha_p95": None,
         "memory_stages": [],
     }
-
-
-def build_context_primitives(
-    model,
-    cfg: QGSConfig,
-    name: str,
-    context_type: str,
-    xyz: torch.Tensor,
-    intensity_norm: torch.Tensor,
-    *,
-    time_scalar: torch.Tensor | None,
-    ego_motion: torch.Tensor,
-    is_dynamic_flag: torch.Tensor,
-) -> tuple[dict | None, dict | None]:
-    if xyz.shape[0] < cfg.knn_k_min:
-        return None, None
-    primitives = model.forward_context(
-        xyz,
-        intensity_norm,
-        context_type=context_type,
-        time_scalar=time_scalar,
-        ego_motion=ego_motion,
-        is_dynamic_flag=is_dynamic_flag,
-        neighbor_xyz=xyz,
-        return_diagnostics=True,
-    )
-    return primitives, _context_diagnostics(name, context_type, primitives, xyz.shape[0])
 
 
 def _make_static_anchor_builder(cfg: QGSConfig) -> VoxelAnchorBuilder:
@@ -618,7 +570,6 @@ def evaluate_pair_sample(
         }
     _record_memory("scene_decomposition", device_t, memory_records)
 
-    e_dir = rel_input_1_pose[:3, 3].to(dtype=xyz0.dtype, device=device)
     inv_pose = torch.linalg.inv(rel_input_1_pose)
 
     frame0_contexts: list[dict] = []
@@ -641,86 +592,7 @@ def evaluate_pair_sample(
         "dynamic_fallback_count": 0,
     }
 
-    if cfg.primitive_mode == "per_point":
-        _reset_cuda_peak(device_t)
-        static_prims, static_diag = build_context_primitives(
-            model,
-            cfg,
-            "static",
-            "static",
-            scene["static_xyz"].to(device),
-            scene["static_intensity"].to(device),
-            time_scalar=scene["static_time"].to(device),
-            ego_motion=e_dir,
-            is_dynamic_flag=torch.zeros(scene["static_xyz"].shape[0], device=device, dtype=xyz0.dtype),
-        )
-        _record_memory_with_peak(
-            "static_context",
-            device_t,
-            memory_records,
-            peak_records=None if static_diag is None else static_diag.get("memory_stages", []),
-        )
-        if static_prims is not None and static_diag is not None:
-            frame0_contexts.append({"name": "static", "primitives": static_prims, "context": static_diag})
-            frame1_contexts.append({"name": "static", "primitives": static_prims, "context": static_diag})
-            context_summaries.append(static_diag)
-        else:
-            context_summaries.append(
-                _skipped_context_diagnostics(
-                    "static",
-                    "static",
-                    scene["static_xyz"].shape[0],
-                    f"n_input_points<{cfg.knn_k_min}",
-                )
-            )
-
-        for dyn_idx, dyn in enumerate(scene["dynamic"]):
-            _reset_cuda_peak(device_t)
-            dyn_prims, dyn_diag = build_context_primitives(
-                model,
-                cfg,
-                f"dynamic_{dyn_idx}",
-                "dynamic",
-                dyn["canonical_xyz"].to(device),
-                dyn["canonical_intensity"].to(device),
-                time_scalar=dyn["canonical_time"].to(device),
-                ego_motion=e_dir,
-                is_dynamic_flag=torch.ones(dyn["canonical_xyz"].shape[0], device=device, dtype=xyz0.dtype),
-            )
-            _record_memory_with_peak(
-                f"dynamic_context_{dyn_idx}",
-                device_t,
-                memory_records,
-                peak_records=None if dyn_diag is None else dyn_diag.get("memory_stages", []),
-            )
-            if dyn_prims is None or dyn_diag is None:
-                skipped = _skipped_context_diagnostics(
-                    f"dynamic_{dyn_idx}",
-                    "dynamic",
-                    dyn["canonical_xyz"].shape[0],
-                    f"n_input_points<{cfg.knn_k_min}",
-                )
-                skipped["instance_id"] = int(dyn["instance_id"])
-                context_summaries.append(skipped)
-                continue
-            dyn_diag["instance_id"] = int(dyn["instance_id"])
-            context_summaries.append(dyn_diag)
-            if dyn.get("box_0") is not None:
-                frame0_contexts.append({
-                    "name": f"dynamic_{dyn_idx}",
-                    "primitives": transform_primitives(dyn_prims, _box_to_pose(dyn["box_0"].to(device))),
-                    "context": dyn_diag,
-                })
-            if dyn.get("box_1") is not None:
-                frame1_contexts.append({
-                    "name": f"dynamic_{dyn_idx}",
-                    "primitives": transform_primitives(
-                        dyn_prims,
-                        _box1_to_frame0_pose(dyn["box_1"].to(device), rel_input_1_pose),
-                    ),
-                    "context": dyn_diag,
-                })
-    elif cfg.primitive_mode == "voxel_anchor":
+    if cfg.primitive_mode == "voxel_anchor":
         dyn_anchor_outputs = []
         dyn_prims_list = []
         if scene["dynamic"]:
@@ -823,20 +695,6 @@ def evaluate_pair_sample(
             )
     else:
         raise ValueError(f"unsupported primitive_mode {cfg.primitive_mode!r}")
-
-    if cfg.primitive_mode == "per_point":
-        for ctx in context_summaries:
-            if ctx.get("skipped"):
-                continue
-            if ctx.get("context_type") == "static":
-                anchor_summary["static_primitives"] += int(ctx.get("n_generated", 0))
-                anchor_summary["static_init_count"] += int(ctx.get("n_points_with_init", 0))
-                anchor_summary["static_fallback_count"] += int(ctx.get("n_points_without_init", 0))
-            elif ctx.get("context_type") == "dynamic":
-                anchor_summary["dynamic_primitives"] += int(ctx.get("n_generated", 0))
-                anchor_summary["dynamic_init_count"] += int(ctx.get("n_points_with_init", 0))
-                anchor_summary["dynamic_fallback_count"] += int(ctx.get("n_points_without_init", 0))
-        anchor_summary["query_voxels"] = anchor_summary["input_points"]
 
     anchor_summary["final_primitives"] = (
         anchor_summary["static_primitives"] + anchor_summary["dynamic_primitives"]

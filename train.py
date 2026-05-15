@@ -171,31 +171,6 @@ def _filter_frame_points(
     return xyz[keep], intensity[keep], ring[keep]
 
 
-def _build_scene_primitives(
-    model: QGSModel,
-    cfg: QGSConfig,
-    xyz: torch.Tensor,
-    intensity_norm: torch.Tensor,
-    *,
-    context_type: str,
-    time_scalar: torch.Tensor | None,
-    ego_motion: torch.Tensor,
-    is_dynamic_flag: torch.Tensor,
-) -> tuple[dict | None, torch.Tensor | None]:
-    if xyz.shape[0] < cfg.knn_k_min:
-        return None, None
-    primitives = model.forward_context(
-        xyz,
-        intensity_norm,
-        context_type=context_type,
-        time_scalar=time_scalar,
-        ego_motion=ego_motion,
-        is_dynamic_flag=is_dynamic_flag,
-        neighbor_xyz=xyz,
-    )
-    return primitives, xyz
-
-
 def _make_static_anchor_builder(cfg: QGSConfig) -> VoxelAnchorBuilder:
     return VoxelAnchorBuilder(
         k_min=cfg.knn_k_min,
@@ -532,7 +507,6 @@ def process_pair(
     _profile_count(profile, "dynamic_instances", len(scene["dynamic"]))
     t_prof = _profile_mark(profile, "decompose_scene", t_prof, device)
 
-    e_dir = rel_input_1_pose[:3, 3].to(dtype=xyz0.dtype, device=device)
     inv_pose = torch.linalg.inv(rel_input_1_pose)
 
     frame0_primitives = []
@@ -540,45 +514,7 @@ def process_pair(
     diagnostic_primitives = []
 
     dyn_list = scene["dynamic"]
-    if cfg.primitive_mode == "per_point":
-        static_xyz = scene["static_xyz"].to(device)
-        static_i = scene["static_intensity"].to(device)
-        static_t = scene["static_time"].to(device)
-        static_flag = torch.zeros(static_xyz.shape[0], device=device, dtype=static_xyz.dtype)
-        static_prims, _ = _build_scene_primitives(
-            model, cfg, static_xyz, static_i,
-            context_type="static",
-            time_scalar=static_t, ego_motion=e_dir,
-            is_dynamic_flag=static_flag,
-        )
-
-        if static_prims is not None:
-            diagnostic_primitives.append(static_prims)
-            frame0_primitives.append(static_prims)
-            frame1_primitives.append(static_prims)
-
-    if cfg.primitive_mode == "per_point" and dyn_list:
-        dyn_xyz_list = [d["canonical_xyz"].to(device) for d in dyn_list]
-        dyn_int_list = [d["canonical_intensity"].to(device) for d in dyn_list]
-        dyn_time_list = [d["canonical_time"].to(device) for d in dyn_list]
-        dyn_prims_list = model.forward_contexts_batched(
-            dyn_xyz_list, dyn_int_list,
-            context_type="dynamic",
-            time_list=dyn_time_list,
-            ego_motion=e_dir,
-        )
-        for dyn, dyn_prims in zip(dyn_list, dyn_prims_list):
-            if dyn_prims is None:
-                continue
-            diagnostic_primitives.append(dyn_prims)
-            if dyn.get("box_0") is not None:
-                frame0_primitives.append(_transform_primitives(dyn_prims, _box_to_pose(dyn["box_0"].to(device))))
-            if dyn.get("box_1") is not None:
-                frame1_primitives.append(_transform_primitives(
-                    dyn_prims,
-                    _box1_to_frame0_pose(dyn["box_1"].to(device), rel_input_1_pose),
-                ))
-    elif cfg.primitive_mode == "voxel_anchor":
+    if cfg.primitive_mode == "voxel_anchor":
         dyn_anchor_outputs = []
         if dyn_list:
             dynamic_builder = _make_dynamic_anchor_builder(cfg)
@@ -808,7 +744,7 @@ def train(cfg: QGSConfig, overfit_frames: int = 0, resume: str = ""):
     print(
         "PTv3 official_full "
         f"(branches={branch_label}, backbone={backbone_core_params:,}, "
-        f"wrapper={backbone_total_params:,}, base_8ch={OFFICIAL_FULL_PTV3_BACKBONE_PARAMS:,})"
+        f"wrapper={backbone_total_params:,}, official_base={OFFICIAL_FULL_PTV3_BACKBONE_PARAMS:,})"
     )
     if (
         expected_backbone_params is not None
@@ -1067,10 +1003,6 @@ def train(cfg: QGSConfig, overfit_frames: int = 0, resume: str = ""):
 def _load_config(path: str) -> QGSConfig:
     with open(path) as f:
         raw = json.load(f)
-    if "primitive_mode" not in raw:
-        raw["primitive_mode"] = "per_point"
-    if "ptv3_model_in_channels" not in raw:
-        raw["ptv3_model_in_channels"] = raw.get("input_feature_dim", QGSConfig.input_feature_dim)
     allowed = {field.name for field in dataclasses.fields(QGSConfig)}
     return QGSConfig(**{k: v for k, v in raw.items() if k in allowed})
 
@@ -1101,7 +1033,6 @@ def main():
     parser.add_argument("--resume", type=str, default="",
                         help="Path to checkpoint to resume training from")
     parser.add_argument("--device", default=None)
-    parser.add_argument("--primitive-mode", choices=("voxel_anchor", "per_point"), default=None)
     parser.add_argument(
         "--anchor-token-variant",
         choices=("full", "no_fit_quality", "no_intensity_stats", "with_normal"),
@@ -1187,9 +1118,6 @@ def main():
         cfg.lidar_latent_dim = resolve_lidar_latent_dim(args.lidar_latent_dim)
     if args.device is not None:
         cfg.device = args.device
-    if args.primitive_mode is not None:
-        cfg.primitive_mode = args.primitive_mode
-        cfg.ptv3_model_in_channels = cfg.resolved_input_channels()
     if args.anchor_token_variant is not None:
         cfg.anchor_token_variant = args.anchor_token_variant
         cfg.anchor_token_dim = 25 if args.anchor_token_variant == "with_normal" else 22

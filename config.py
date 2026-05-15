@@ -36,8 +36,7 @@ class QGSConfig:
 
     # Backbone
     feature_dim: int = 64
-    primitive_mode: str = "voxel_anchor"  # "voxel_anchor"=anchor primitives, "per_point"=legacy point primitives
-    input_feature_dim: int = 8      # raw QGS feature contract: xyz + intensity + time + e_dir
+    primitive_mode: str = "voxel_anchor"  # voxel-anchor primitives only
     anchor_token_dim: int = 22      # voxel-anchor token width consumed by PTv3 in voxel_anchor mode
     ptv3_model_in_channels: int | None = None  # None resolves to mode feature width; kept for legacy configs
 
@@ -173,7 +172,7 @@ class QGSConfig:
             # Discard so downstream code never accidentally uses them.
             self.lidar_el_min_deg = None
             self.lidar_el_max_deg = None
-        allowed_modes = {"voxel_anchor", "per_point"}
+        allowed_modes = {"voxel_anchor"}
         if self.primitive_mode not in allowed_modes:
             raise ValueError(
                 f"primitive_mode must be one of {sorted(allowed_modes)}; "
@@ -207,8 +206,6 @@ class QGSConfig:
             self.ptv3_model_in_channels = self.resolved_input_channels()
 
     def resolved_input_channels(self) -> int:
-        if self.primitive_mode == "per_point":
-            return int(self.input_feature_dim)
         return int(self.anchor_token_dim)
 
     def ptv3_backbone_kwargs(self) -> dict:
