@@ -485,7 +485,9 @@ __global__ void preprocessCUDA(int P, int D, int M,
 // spherical.h. The render-side math (view2gaussian, ray-paraboloid
 // intersection, rscales_opacity, scales_sign) is unchanged.
 //
-// cam_intr is repurposed: [el_min, el_max, w_per_rad_az, h_per_rad_el].
+// cam_intr is repurposed: [el_min_eff, el_max_eff, w_per_rad_az, H_float].
+// `row_to_elevation_rad[H]` carries per-row center elevations; v is computed
+// via piecewise-linear interp (qgs_lidar::el_to_v_nonuniform), not linear.
 //
 // A3.2.d (wraparound): when the spherical AABB straddles the ±π seam, we
 // widen the image-space rect to cover the full azimuth row (u ∈ [0, W]).
@@ -515,7 +517,7 @@ __global__ void preprocessLidarCUDA(int P, int D, int M,
 	const float el_min,
 	const float el_max,
 	const float w_per_rad_az,
-	const float h_per_rad_el,
+	const float* row_to_elevation_rad,
 	const float r_near,
 	const float r_far,
 	int* radii,
@@ -597,10 +599,10 @@ __global__ void preprocessLidarCUDA(int P, int D, int M,
 	if (el_hi <= el_lo) return;
 
 	// --- Pixel projection ---
-	// v is identical for wrap / no-wrap.
-	const float v_c  = (el_c  - el_min) * h_per_rad_el;
-	const float v_lo = (el_lo - el_min) * h_per_rad_el;
-	const float v_hi = (el_hi - el_min) * h_per_rad_el;
+	// v uses nonuniform piecewise-linear el→v table (HDL-32E or equivalent).
+	const float v_c  = qgs_lidar::el_to_v_nonuniform(el_c,  row_to_elevation_rad, H);
+	const float v_lo = qgs_lidar::el_to_v_nonuniform(el_lo, row_to_elevation_rad, H);
+	const float v_hi = qgs_lidar::el_to_v_nonuniform(el_hi, row_to_elevation_rad, H);
 
 	// u: wrapped primitives get conservatively widened to cover [0, W].
 	// Both preprocess and duplicateWithKeys re-derive the rect from the
@@ -688,7 +690,7 @@ renderCUDA(
 	const bool lidar_mode,
 	const float el_min_rad,
 	const float w_per_rad_az,
-	const float h_per_rad_el,
+	const float* __restrict__ row_to_elevation_rad,
 	const float r_near,
 	const float r_far)
 {
@@ -710,7 +712,8 @@ renderCUDA(
 	float3 ray_point;
 	if (lidar_mode) {
 		const float az = pixf.x / w_per_rad_az - qgs_lidar::PI_F;
-		const float el = pixf.y / h_per_rad_el + el_min_rad;
+		// Pixel center → row index → exact row elevation (no sub-pixel interp).
+		const float el = row_to_elevation_rad[pix.y];
 		const float cos_el = cosf(el);
 		ray_point = { sinf(az) * cos_el, cosf(az) * cos_el, sinf(el) };
 	} else {
@@ -1028,7 +1031,7 @@ void FORWARD::render(
 	const bool lidar_mode,
 	const float el_min_rad,
 	const float w_per_rad_az,
-	const float h_per_rad_el,
+	const float* row_to_elevation_rad,
 	const float r_near,
 	const float r_far)
 {
@@ -1056,7 +1059,7 @@ void FORWARD::render(
 		bg_color,
 		out_color,
 		n_touched,
-		lidar_mode, el_min_rad, w_per_rad_az, h_per_rad_el, r_near, r_far);
+		lidar_mode, el_min_rad, w_per_rad_az, row_to_elevation_rad, r_near, r_far);
 #else
 	renderCUDA<NUM_CHANNELS> << <grid, block >> > (
 		P,
@@ -1081,7 +1084,7 @@ void FORWARD::render(
 		bg_color,
 		out_color,
 		n_touched,
-		lidar_mode, el_min_rad, w_per_rad_az, h_per_rad_el, r_near, r_far);
+		lidar_mode, el_min_rad, w_per_rad_az, row_to_elevation_rad, r_near, r_far);
 #endif
 }
 
@@ -1170,7 +1173,7 @@ void FORWARD::preprocessLidar(int P, int D, int M,
 	const float el_min,
 	const float el_max,
 	const float w_per_rad_az,
-	const float h_per_rad_el,
+	const float* row_to_elevation_rad,
 	const float r_near,
 	const float r_far,
 	int* radii,
@@ -1201,7 +1204,7 @@ void FORWARD::preprocessLidar(int P, int D, int M,
 		viewmatrix,
 		cam_pos,
 		W, H,
-		el_min, el_max, w_per_rad_az, h_per_rad_el,
+		el_min, el_max, w_per_rad_az, row_to_elevation_rad,
 		r_near, r_far,
 		radii,
 		rects,

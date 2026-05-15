@@ -28,12 +28,12 @@ cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
 def test_make_lidar_ray_grid_unit_vectors():
-    from nn.render_utils import make_lidar_ray_grid
+    from nn.lidar_geometry import make_lidar_ray_grid
+    from tests._lidar_test_helpers import uniform_lidar_cfg
 
     H, W = 8, 32
-    el_min = math.radians(-30.0)
-    el_max = math.radians(+10.0)
-    ray = make_lidar_ray_grid(H, W, el_min, el_max)
+    cfg = uniform_lidar_cfg(H, W, math.radians(-30.0), math.radians(+10.0))
+    ray = make_lidar_ray_grid(cfg)
     assert ray.shape == (3, H, W)
 
     norms = ray.pow(2).sum(dim=0).sqrt()
@@ -45,18 +45,20 @@ def test_make_lidar_ray_grid_unit_vectors():
 
 def test_make_lidar_ray_grid_matches_kernel_formula():
     """Hand-compute one pixel's ray direction and compare against the helper."""
-    from nn.render_utils import make_lidar_ray_grid
+    from nn.lidar_geometry import make_lidar_ray_grid
+    from tests._lidar_test_helpers import uniform_lidar_cfg
 
     H, W = 16, 64
     el_min, el_max = math.radians(-30.0), math.radians(+10.0)
-    ray = make_lidar_ray_grid(H, W, el_min, el_max)
+    cfg = uniform_lidar_cfg(H, W, el_min, el_max)
+    ray = make_lidar_ray_grid(cfg)
 
-    # Pixel (u=10, v=5)
+    # Pixel (u=10, v=5). With uniform spacing the new convention reduces to
+    # row k center elevation = el_min + (k + 0.5) * (el_max - el_min) / H.
     u, v = 10, 5
-    w_per_rad_az = W / (2.0 * math.pi)
-    h_per_rad_el = H / (el_max - el_min)
-    az = (u + 0.5) / w_per_rad_az - math.pi
-    el = (v + 0.5) / h_per_rad_el + el_min
+    step = (el_max - el_min) / H
+    az = (u + 0.5) * (2.0 * math.pi / W) - math.pi
+    el = el_min + (v + 0.5) * step
     expected = torch.tensor([
         math.sin(az) * math.cos(el),
         math.cos(az) * math.cos(el),

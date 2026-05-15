@@ -62,10 +62,21 @@ RasterizeGaussiansCUDA(
 	const bool debug,
 	const bool lidar_mode,
 	const float r_near,
-	const float r_far)
+	const float r_far,
+	const torch::Tensor& row_to_elevation_rad)
 {
   if (means3D.ndimension() != 2 || means3D.size(1) != 3) {
     AT_ERROR("means3D must have dimensions (num_points, 3)");
+  }
+  const float* row_to_el_ptr = nullptr;
+  if (lidar_mode) {
+    if (!row_to_elevation_rad.defined() || row_to_elevation_rad.numel() == 0) {
+      AT_ERROR("lidar_mode=true requires a non-empty row_to_elevation_rad tensor.");
+    }
+    if (row_to_elevation_rad.size(0) != image_height) {
+      AT_ERROR("row_to_elevation_rad length must equal image_height.");
+    }
+    row_to_el_ptr = row_to_elevation_rad.contiguous().data_ptr<float>();
   }
   
   const int P = means3D.size(0);
@@ -134,7 +145,8 @@ RasterizeGaussiansCUDA(
 		debug,
 		lidar_mode,
 		r_near,
-		r_far);
+		r_far,
+		row_to_el_ptr);
   }
   return std::make_tuple(rendered, n_touched, aabb, out_color, radii, geomBuffer, binningBuffer, imgBuffer);
 }
@@ -173,11 +185,22 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	const bool reciprocal_z,
 	const bool lidar_mode,
 	const float r_near,
-	const float r_far)
+	const float r_far,
+	const torch::Tensor& row_to_elevation_rad)
 {
   const int P = means3D.size(0);
   const int H = dL_dout_color.size(1);
   const int W = dL_dout_color.size(2);
+  const float* row_to_el_ptr = nullptr;
+  if (lidar_mode) {
+    if (!row_to_elevation_rad.defined() || row_to_elevation_rad.numel() == 0) {
+      AT_ERROR("lidar_mode=true requires a non-empty row_to_elevation_rad tensor.");
+    }
+    if (row_to_elevation_rad.size(0) != H) {
+      AT_ERROR("row_to_elevation_rad length must equal image_height.");
+    }
+    row_to_el_ptr = row_to_elevation_rad.contiguous().data_ptr<float>();
+  }
   
   int M = 0;
   if(sh.size(0) != 0)
@@ -237,7 +260,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	  debug,
 	  lidar_mode,
 	  r_near,
-	  r_far);
+	  r_far,
+	  row_to_el_ptr);
   }
   // also return dL_dview2gaussian so it could be used when view2gaussian is precomputed
   return std::make_tuple(dL_dmeans2D, dL_dcolors, dL_dopacity, dL_dmeans3D, dL_dsh, dL_dscales, dL_drotations, dL_dview2gaussian);

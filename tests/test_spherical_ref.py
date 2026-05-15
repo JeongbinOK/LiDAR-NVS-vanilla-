@@ -35,6 +35,36 @@ from python_ref.spherical_ref import (  # noqa: E402
 )
 
 
+def _uniform_row_table(el_min_deg: float, el_max_deg: float, H: int) -> torch.Tensor:
+    """Uniformly-spaced row centers, mimicking the legacy linear FOV.
+
+    Used by tests that don't care about HDL-32E specifics — only that the
+    boundary semantics (el_min_eff → v=0, el_max_eff → v=H) hold.
+    """
+    el_min = math.radians(el_min_deg)
+    el_max = math.radians(el_max_deg)
+    step = (el_max - el_min) / H
+    # Row k center elevation: el_min + (k + 0.5) * step. Then
+    # el_min_eff = row[0] - 0.5*step = el_min ✓
+    # el_max_eff = row[H-1] + 0.5*step = el_max ✓
+    centers = el_min + (torch.arange(H, dtype=torch.float64) + 0.5) * step
+    return centers.to(torch.float32)
+
+
+def _intr_with_row(W: int, H: int, el_min_deg: float, el_max_deg: float):
+    """cam_intr + row table for a uniform-FOV setup."""
+    row_el = _uniform_row_table(el_min_deg, el_max_deg, H)
+    el_min_eff = (row_el[0] - 0.5 * (row_el[1] - row_el[0])).item()
+    el_max_eff = (row_el[-1] + 0.5 * (row_el[-1] - row_el[-2])).item()
+    cam_intr = torch.tensor([
+        el_min_eff,
+        el_max_eff,
+        W / (2.0 * math.pi),
+        float(H),
+    ], dtype=torch.float32)
+    return cam_intr, row_el
+
+
 # ---------------------------------------------------------------------------
 # project_to_sphere — known-answer ground truths
 # ---------------------------------------------------------------------------
@@ -113,41 +143,41 @@ class TestProjectToSphere:
 
 class TestSphericalToPixel:
     def _intr(self, W=1024, H=32, el_min_deg=-30.0, el_max_deg=10.0):
-        el_min = math.radians(el_min_deg)
-        el_max = math.radians(el_max_deg)
-        return torch.tensor([
-            el_min,
-            el_max,
-            W / (2.0 * math.pi),
-            H / (el_max - el_min),
-        ])
+        return _intr_with_row(W, H, el_min_deg, el_max_deg)
 
     def test_az_minus_pi_maps_to_u_zero(self):
-        intr = self._intr()
-        u, v = spherical_to_pixel(torch.tensor(-PI), torch.tensor(0.0), intr)
+        cam, row = self._intr()
+        u, v = spherical_to_pixel(torch.tensor(-PI), torch.tensor(0.0), cam, row)
         assert math.isclose(u.item(), 0.0, abs_tol=1e-6)
 
     def test_az_plus_pi_maps_to_u_W(self):
-        intr = self._intr(W=1024)
-        u, _ = spherical_to_pixel(torch.tensor(PI), torch.tensor(0.0), intr)
+        cam, row = self._intr(W=1024)
+        u, _ = spherical_to_pixel(torch.tensor(PI), torch.tensor(0.0), cam, row)
         assert math.isclose(u.item(), 1024.0, abs_tol=1e-4)
 
     def test_az_zero_maps_to_u_half_W(self):
-        intr = self._intr(W=2048)
-        u, _ = spherical_to_pixel(torch.tensor(0.0), torch.tensor(0.0), intr)
+        cam, row = self._intr(W=2048)
+        u, _ = spherical_to_pixel(torch.tensor(0.0), torch.tensor(0.0), cam, row)
         assert math.isclose(u.item(), 1024.0, abs_tol=1e-4)
 
-    def test_el_min_maps_to_v_zero(self):
-        intr = self._intr(el_min_deg=-30.0, el_max_deg=10.0)
-        _, v = spherical_to_pixel(torch.tensor(0.0),
-                                  torch.tensor(math.radians(-30.0)), intr)
-        assert math.isclose(v.item(), 0.0, abs_tol=1e-6)
+    def test_el_min_eff_maps_to_v_zero(self):
+        cam, row = self._intr(el_min_deg=-30.0, el_max_deg=10.0)
+        _, v = spherical_to_pixel(torch.tensor(0.0), cam[0].clone().detach(), cam, row)
+        assert math.isclose(v.item(), 0.0, abs_tol=1e-5)
 
-    def test_el_max_maps_to_v_H(self):
-        intr = self._intr(H=32, el_min_deg=-30.0, el_max_deg=10.0)
-        _, v = spherical_to_pixel(torch.tensor(0.0),
-                                  torch.tensor(math.radians(10.0)), intr)
+    def test_el_max_eff_maps_to_v_H(self):
+        cam, row = self._intr(H=32, el_min_deg=-30.0, el_max_deg=10.0)
+        _, v = spherical_to_pixel(torch.tensor(0.0), cam[1].clone().detach(), cam, row)
         assert math.isclose(v.item(), 32.0, abs_tol=1e-4)
+
+    def test_row_center_round_trip(self):
+        """v(row_to_el[k]) == k + 0.5 by construction, for every row."""
+        cam, row = self._intr(H=32, el_min_deg=-30.0, el_max_deg=10.0)
+        for k in range(row.shape[0]):
+            _, v = spherical_to_pixel(torch.tensor(0.0), row[k].clone().detach(),
+                                      cam, row)
+            assert math.isclose(v.item(), k + 0.5, abs_tol=1e-5), \
+                f"row {k}: v={v.item()}"
 
 
 # ---------------------------------------------------------------------------
@@ -156,12 +186,13 @@ class TestSphericalToPixel:
 
 class TestFrustum:
     def _intr(self):
-        # nuScenes 32-beam: el ∈ [-30°, +10°]
+        # nuScenes 32-beam: el ∈ [-30°, +10°]. Frustum bounds match el_min/max
+        # in cam_intr[0]/[1] (effective bounds in the new convention).
         return torch.tensor([
             math.radians(-30.0),
             math.radians(10.0),
             1024.0 / (2.0 * math.pi),
-            32.0 / math.radians(40.0),
+            32.0,
         ])
 
     def test_in_band_passes(self):
@@ -355,12 +386,9 @@ class TestRoundTrip:
     def test_random_in_frustum_points_yield_valid_pixels(self):
         torch.manual_seed(1)
         W, H = 1024, 32
-        el_min, el_max = math.radians(-30.0), math.radians(10.0)
-        intr = torch.tensor([
-            el_min, el_max,
-            W / (2.0 * math.pi),
-            H / (el_max - el_min),
-        ])
+        cam_intr, row_el = _intr_with_row(W, H, -30.0, 10.0)
+        el_min = float(cam_intr[0])
+        el_max = float(cam_intr[1])
 
         # Sample r, az, el uniformly in valid ranges, then construct (x,y,z)
         N = 200
@@ -374,11 +402,11 @@ class TestRoundTrip:
         p = torch.stack([x, y, z], dim=-1)
 
         # All should be in frustum
-        in_fr = is_in_spherical_frustum(p, intr, r_near=0.2, r_far=100.0)
+        in_fr = is_in_spherical_frustum(p, cam_intr, r_near=0.2, r_far=100.0)
         assert in_fr.all(), f"only {in_fr.float().mean():.2%} in frustum"
 
         # Project and check pixel bounds
         sph = project_to_sphere(p)
-        u, v = spherical_to_pixel(sph[..., 1], sph[..., 2], intr)
+        u, v = spherical_to_pixel(sph[..., 1], sph[..., 2], cam_intr, row_el)
         assert (u >= 0).all() and (u <= W + 1e-3).all()
         assert (v >= 0).all() and (v <= H + 1e-3).all()

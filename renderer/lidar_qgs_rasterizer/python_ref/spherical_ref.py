@@ -4,6 +4,17 @@ Pure-Python mirror of cuda_rasterizer/spherical.h.
 Used to validate the CUDA helper math without needing to round-trip through
 the GPU kernel. The two implementations MUST stay in sync — any change to
 spherical.h must also be reflected here, and vice versa.
+
+cam_intr layout (lidar mode):
+    [0] el_min_eff_rad        — extrapolated bottom edge (v=0)
+    [1] el_max_eff_rad        — extrapolated top    edge (v=H)
+    [2] w_per_rad_az = W / (2π)
+    [3] H (float)             — vertical resolution
+
+`row_to_elevation_rad` is an additional [H] tensor providing the row-center
+elevations in ascending order (v=0=bottom convention). `spherical_to_pixel`
+uses it for a piecewise-linear v(el) mapping; the previous linear `h_per_rad_el`
+slot has been retired.
 """
 
 from __future__ import annotations
@@ -35,17 +46,32 @@ def project_to_sphere(p: torch.Tensor) -> torch.Tensor:
     return torch.stack([r, az, el], dim=-1)
 
 
-def spherical_to_pixel(az: torch.Tensor, el: torch.Tensor,
-                       cam_intr: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+def spherical_to_pixel(
+    az: torch.Tensor,
+    el: torch.Tensor,
+    cam_intr: torch.Tensor,
+    row_to_elevation_rad: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Map (az, el) -> (u, v) given LiDAR intrinsics
-        cam_intr = [el_min, el_max, w_per_rad_az, h_per_rad_el].
+    Map (az, el) → (u, v) given LiDAR intrinsics
+        cam_intr = [el_min_eff, el_max_eff, w_per_rad_az, H_float]
+    and the per-row elevation table `row_to_elevation_rad` (ascending).
+
+    u: linear, `(az + π) * w_per_rad_az`.
+    v: piecewise-linear through `{(row_to_el[k], k+0.5)}_{k=0..H-1}` with edge
+       segments extrapolated by the first/last slope so el=el_min_eff → v=0
+       and el=el_max_eff → v=H. No clamp applied here.
     """
-    el_min       = cam_intr[0]
     w_per_rad_az = cam_intr[2]
-    h_per_rad_el = cam_intr[3]
     u = (az + PI) * w_per_rad_az
-    v = (el - el_min) * h_per_rad_el
+
+    el_t = el if torch.is_tensor(el) else torch.as_tensor(el)
+    H = row_to_elevation_rad.shape[0]
+    idx = torch.searchsorted(row_to_elevation_rad, el_t, right=False)
+    seg = (idx - 1).clamp(min=0, max=H - 2)
+    e_lo = row_to_elevation_rad[seg]
+    e_hi = row_to_elevation_rad[seg + 1]
+    v = seg.to(el_t.dtype) + 0.5 + (el_t - e_lo) / (e_hi - e_lo)
     return u, v
 
 
@@ -56,6 +82,9 @@ def is_in_spherical_frustum(p: torch.Tensor,
     """
     Element-wise frustum test (vertical FOV + range gate).
     p: [..., 3] sensor-frame.  Returns [...] bool.
+
+    Uses the *effective* elevation bounds in cam_intr[0], cam_intr[1]
+    (extrapolated to v=0 and v=H), not the row centers.
     """
     res = project_to_sphere(p)
     r, _, el = res[..., 0], res[..., 1], res[..., 2]

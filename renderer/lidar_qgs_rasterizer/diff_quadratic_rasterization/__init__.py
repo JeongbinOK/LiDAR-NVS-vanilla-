@@ -72,9 +72,14 @@ class _RasterizeGaussians(torch.autograd.Function):
         raster_settings,
     ):
 
-        # Restructure arguments the way that the C++ lib expects them
+        # Restructure arguments the way that the C++ lib expects them.
+        # `row_to_el` is required when lidar_mode=True; pass an empty tensor
+        # otherwise (the kernel ignores it on the camera path).
+        row_to_el = raster_settings.lidar_row_to_el
+        if row_to_el is None:
+            row_to_el = torch.empty(0, dtype=torch.float32)
         args = (
-            raster_settings.bg, 
+            raster_settings.bg,
             means3D,
             colors_precomp,
             opacities,
@@ -102,6 +107,7 @@ class _RasterizeGaussians(torch.autograd.Function):
             raster_settings.lidar_mode,
             raster_settings.r_near,
             raster_settings.r_far,
+            row_to_el,
         )
 
         # Invoke C++/CUDA rasterizer
@@ -131,25 +137,28 @@ class _RasterizeGaussians(torch.autograd.Function):
         color, colors_precomp, means3D, scales, rotations, view2gaussian_precomp, radii, sh, geomBuffer, binningBuffer, imgBuffer = ctx.saved_tensors
 
         # Restructure args as C++ method expects them
+        row_to_el = raster_settings.lidar_row_to_el
+        if row_to_el is None:
+            row_to_el = torch.empty(0, dtype=torch.float32)
         args = (raster_settings.bg,
-                means3D, 
-                radii, 
+                means3D,
+                radii,
                 color,
-                colors_precomp, 
-                scales, 
-                rotations, 
-                raster_settings.scale_modifier, 
+                colors_precomp,
+                scales,
+                rotations,
+                raster_settings.scale_modifier,
                 raster_settings.sigma,
                 view2gaussian_precomp,
-                raster_settings.viewmatrix, 
-                raster_settings.projmatrix, 
-                raster_settings.tanfovx, 
-                raster_settings.tanfovy, 
+                raster_settings.viewmatrix,
+                raster_settings.projmatrix,
+                raster_settings.tanfovx,
+                raster_settings.tanfovy,
                 raster_settings.kernel_size,
                 raster_settings.subpixel_offset,
-                grad_out_color, 
-                sh, 
-                raster_settings.sh_degree, 
+                grad_out_color,
+                sh,
+                raster_settings.sh_degree,
                 raster_settings.campos,
                 raster_settings.cam_intr, # On cpu
                 geomBuffer,
@@ -163,7 +172,8 @@ class _RasterizeGaussians(torch.autograd.Function):
                 raster_settings.reciprocal_z,
                 raster_settings.lidar_mode,
                 raster_settings.r_near,
-                raster_settings.r_far)
+                raster_settings.r_far,
+                row_to_el)
 
         # Compute gradients for relevant tensors by invoking backward method
         if raster_settings.debug:
@@ -193,7 +203,7 @@ class _RasterizeGaussians(torch.autograd.Function):
 
 class GaussianRasterizationSettings(NamedTuple):
     image_height: int
-    image_width: int 
+    image_width: int
     tanfovx : float
     tanfovy : float
     kernel_size : float
@@ -213,11 +223,15 @@ class GaussianRasterizationSettings(NamedTuple):
     return_depth : bool
     return_normal : bool
     # A3.2.c: panoramic LiDAR mode (spherical projection). If True, cam_intr is
-    # repurposed as [el_min_rad, el_max_rad, w_per_rad_az, h_per_rad_el] and
+    # repurposed as [el_min_eff_rad, el_max_eff_rad, w_per_rad_az, H_float] and
     # projmatrix is ignored. Camera mode (default) is unchanged.
     lidar_mode : bool = False
     r_near : float = 0.2
     r_far : float = 100.0
+    # Per-row center elevations (rad), ascending row_bottom0 convention.
+    # Required when lidar_mode=True; CUDA path uses it for piecewise-linear
+    # el→v projection (and exact pixel-center inverse).
+    lidar_row_to_el : Optional[torch.Tensor] = None
 
 class GaussianRasterizer(nn.Module):
     def __init__(self, raster_settings):
@@ -319,6 +333,7 @@ def make_lidar_settings(
     image_width: int,
     el_min_rad: float,
     el_max_rad: float,
+    row_to_elevation_rad: torch.Tensor,
     viewmatrix: torch.Tensor,
     campos: torch.Tensor,
     sigma: float = 3.0,
@@ -336,21 +351,29 @@ def make_lidar_settings(
     `viewmatrix` is the public row-major world-to-sensor transform
     (x=right, y=forward, z=up). `LiDARRasterizer.forward` converts it to the
     transposed CUDA layout only at the kernel boundary.
-    `cam_intr` is repurposed as [el_min_rad, el_max_rad, w_per_rad_az, h_per_rad_el]
-    on the CPU (the upstream convention, see rasterizer_impl.cu host-side unpack).
+
+    `cam_intr` (on CPU) carries `[el_min_eff_rad, el_max_eff_rad, w_per_rad_az,
+    H_float]`. The per-row elevation table is passed separately as
+    `row_to_elevation_rad` (device tensor, ascending row_bottom0 convention).
     """
     if el_max_rad <= el_min_rad:
         raise ValueError(
             f"el_max_rad ({el_max_rad}) must exceed el_min_rad ({el_min_rad})"
         )
+    if row_to_elevation_rad.dim() != 1 or row_to_elevation_rad.shape[0] != image_height:
+        raise ValueError(
+            f"row_to_elevation_rad shape must be ({image_height},); "
+            f"got {tuple(row_to_elevation_rad.shape)}"
+        )
 
     device = viewmatrix.device
+    row_to_el = row_to_elevation_rad.to(device=device, dtype=torch.float32).contiguous()
     cam_intr = torch.tensor(
         [
             float(el_min_rad),
             float(el_max_rad),
             image_width / (2.0 * math.pi),
-            image_height / (el_max_rad - el_min_rad),
+            float(image_height),
         ],
         device="cpu",
         dtype=torch.float32,
@@ -386,6 +409,7 @@ def make_lidar_settings(
         lidar_mode=True,
         r_near=r_near,
         r_far=r_far,
+        lidar_row_to_el=row_to_el,
     )
 
 

@@ -54,7 +54,9 @@ namespace FORWARD
 
 	// Panoramic LiDAR preprocess (A3.2.c). Mirrors `preprocess` above but uses
 	// spherical (az, el) projection from spherical.h instead of perspective.
-	// `cam_intr_lidar` = [el_min, el_max, w_per_rad_az, h_per_rad_el].
+	// cam_intr_lidar = [el_min_eff, el_max_eff, w_per_rad_az, H_float] and
+	// `row_to_elevation_rad[H]` provides the per-row center elevations
+	// (nonuniform piecewise-linear el→v mapping).
 	void preprocessLidar(int P, int D, int M,
 		float* aabb,
 		const float* orig_points,
@@ -73,7 +75,7 @@ namespace FORWARD
 		const float el_min,
 		const float el_max,
 		const float w_per_rad_az,
-		const float h_per_rad_el,
+		const float* row_to_elevation_rad,
 		const float r_near,
 		const float r_far,
 		int* radii,
@@ -90,9 +92,9 @@ namespace FORWARD
 
 	// Main rasterization method.
 	//
-	// A3.2.d: `lidar_mode` + `el_min_rad`/`w_per_rad_az`/`h_per_rad_el` select
-	// between camera (pinhole) and LiDAR (spherical) per-pixel ray construction.
-	// When lidar_mode=false the spherical params are ignored.
+	// A3.2.d: `lidar_mode` + `el_min_rad`/`w_per_rad_az`/`row_to_elevation_rad`
+	// select between camera (pinhole) and LiDAR (spherical) per-pixel ray
+	// construction. When lidar_mode=false the spherical params are ignored.
 	void render(
 		const int P,
 		const dim3 grid, dim3 block,
@@ -120,7 +122,7 @@ namespace FORWARD
 		const bool lidar_mode = false,
 		const float el_min_rad = 0.f,
 		const float w_per_rad_az = 0.f,
-		const float h_per_rad_el = 0.f,
+		const float* row_to_elevation_rad = nullptr,
 		const float r_near = 0.2f,
 		const float r_far = 100.0f);
 

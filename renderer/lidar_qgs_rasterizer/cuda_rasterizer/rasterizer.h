@@ -61,7 +61,10 @@ namespace CudaRasterizer
 			// A3.2.c: LiDAR (panoramic spherical) mode.
 			bool lidar_mode = false,
 			float r_near = 0.2f,
-			float r_far  = 100.0f);
+			float r_far  = 100.0f,
+			// Device buffer [H] of row-center elevations (rad), ascending
+			// (row_bottom0). Used only when lidar_mode=true; nullptr otherwise.
+			const float* row_to_elevation_rad = nullptr);
 
 		static void backward(
 			const int P, int D, int M, int R,
@@ -105,7 +108,10 @@ namespace CudaRasterizer
 			// when lidar_mode=true (see rasterizer_impl.cu).
 			bool lidar_mode = false,
 			float r_near = 0.2f,
-			float r_far = 100.0f);
+			float r_far = 100.0f,
+			// Device buffer [H] of row-center elevations (rad), ascending
+			// (row_bottom0). Used only when lidar_mode=true; nullptr otherwise.
+			const float* row_to_elevation_rad = nullptr);
 
 	};
 };

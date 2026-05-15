@@ -50,6 +50,7 @@ def _run_lidar(
         LiDARRasterizer,
         make_lidar_settings,
     )
+    from tests._lidar_test_helpers import uniform_row_elevation_rad
 
     device = means3D.device
     N = means3D.shape[0]
@@ -62,11 +63,13 @@ def _run_lidar(
     latent = torch.zeros((N, LIDAR_LATENT_DIM), device=device, dtype=torch.float32)
     raydrop = torch.zeros(N, device=device, dtype=torch.float32)
 
+    row_to_el = uniform_row_elevation_rad(el_min, el_max, image_height).to(device)
     settings = make_lidar_settings(
         image_height=image_height,
         image_width=image_width,
         el_min_rad=el_min,
         el_max_rad=el_max,
+        row_to_elevation_rad=row_to_el,
         viewmatrix=torch.eye(4, device=device, dtype=torch.float32),
         campos=torch.zeros(3, device=device, dtype=torch.float32),
         sigma=SIGMA,

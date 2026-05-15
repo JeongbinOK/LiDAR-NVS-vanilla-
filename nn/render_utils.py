@@ -2,15 +2,16 @@
 
 Provides:
   - `rotmat_to_quat`        : differentiable [...,3,3] → [...,4] (w,x,y,z)
-  - `build_target_lidar_image`: bin a LiDAR sweep onto the spherical grid used
-                                 by the rasterizer (first-hit range, first-hit intensity)
+  - `quat_to_rotmat`        : differentiable [...,4] → [...,3,3]
   - `build_gt_normal_map`   : estimate per-pixel GT surface normals from a range image
   - `render_primitives`     : wrap a primitive dict into a `LiDARRasterizer` call
+
+GT range/intensity map generation and the spherical ray grid live in
+`nn/lidar_geometry.py` (single source of truth for row ↔ elevation ↔ ring).
 """
 
 from __future__ import annotations
 
-import math
 from typing import Optional
 
 import torch
@@ -18,6 +19,8 @@ import torch.nn.functional as F
 from torch import Tensor
 
 import diff_quadratic_rasterization as dq
+
+from nn.lidar_geometry import get_effective_el_bounds, get_row_to_elevation_rad
 
 LiDARRasterOutput = dq.LiDARRasterOutput
 LiDARRasterizer = dq.LiDARRasterizer
@@ -92,105 +95,6 @@ def quat_to_rotmat(q: Tensor) -> Tensor:
 
 
 # ---------------------------------------------------------------------------
-# Target image construction
-# ---------------------------------------------------------------------------
-
-def build_target_lidar_image(
-    xyz: Tensor,
-    intensity: Tensor,
-    *,
-    height: int,
-    width: int,
-    el_min_rad: float,
-    el_max_rad: float,
-    r_near: float = 0.2,
-    r_far: float = 70.0,
-) -> dict:
-    """Bin a sensor-frame point cloud onto the spherical pixel grid.
-
-    The pixel mapping mirrors `make_lidar_ray_grid` and the CUDA forward kernel:
-        u_int = round((az + π) * (W / 2π) - 0.5)
-        v_int = round((el - el_min) * (H / (el_max - el_min)) - 0.5)
-
-    Per pixel we record the *first-hit* range (min over all points falling in
-    the pixel) and the intensity of that same first-hit point. Intensity is
-    expected pre-normalised to [0, 1] (raw nuScenes intensity divided by 255).
-
-    Args:
-        xyz: [N, 3]  sensor-frame points.
-        intensity: [N]  in [0, 1].
-        height/width: spherical image dimensions.
-        el_min_rad/el_max_rad: vertical FOV in radians.
-        r_near/r_far: range bounds — points outside this band are skipped.
-
-    Returns dict:
-        'range_image':     [H, W]  zeroed where no point hit.
-        'intensity_image': [H, W]  zeroed where no point hit (first-hit point's intensity).
-        'valid_mask':      [H, W] bool.
-    """
-    if xyz.shape[0] != intensity.shape[0]:
-        raise ValueError(
-            f"xyz N={xyz.shape[0]} but intensity N={intensity.shape[0]}"
-        )
-    device = xyz.device
-    dtype = xyz.dtype
-    HW = height * width
-
-    x, y, z = xyz.unbind(dim=-1)
-    r = xyz.norm(dim=-1)
-    az = torch.atan2(x, y)                                   # [-π, π]
-    xy = (x * x + y * y).clamp(min=1e-12).sqrt()
-    el = torch.atan2(z, xy)
-
-    w_per_rad_az = width / (2.0 * math.pi)
-    h_per_rad_el = height / (el_max_rad - el_min_rad)
-
-    u_f = (az + math.pi) * w_per_rad_az - 0.5
-    v_f = (el - el_min_rad) * h_per_rad_el - 0.5
-
-    u_int = u_f.round().long().clamp(0, width - 1)
-    v_int = v_f.round().long().clamp(0, height - 1)
-
-    in_fov = (
-        (el >= el_min_rad) & (el <= el_max_rad) &
-        (r >= r_near) & (r <= r_far)
-    )
-
-    pix = v_int * width + u_int                              # [N]
-    pix_v = pix[in_fov]
-    r_v = r[in_fov]
-    int_v = intensity[in_fov]
-
-    range_flat = torch.full((HW,), float("inf"), dtype=dtype, device=device)
-    range_flat.scatter_reduce_(0, pix_v, r_v, reduce="amin", include_self=True)
-
-    # First-hit intensity: pick the same return as first-hit range.
-    # For duplicate pixel indices, use deterministic tie-break by earliest point.
-    intensity_flat = torch.zeros(HW, dtype=dtype, device=device)
-    if pix_v.numel() > 0:
-        first_r = range_flat[pix_v]                                  # [M]
-        is_first = torch.isclose(r_v, first_r, rtol=0.0, atol=1e-6) # [M]
-        local_idx = torch.arange(pix_v.shape[0], device=device, dtype=torch.long)
-        sentinel = pix_v.shape[0]
-        cand_idx = torch.where(is_first, local_idx, local_idx.new_full(local_idx.shape, sentinel))
-
-        first_idx_flat = local_idx.new_full((HW,), sentinel)
-        first_idx_flat.scatter_reduce_(0, pix_v, cand_idx, reduce="amin", include_self=True)
-
-        has_hit = first_idx_flat < sentinel
-        intensity_flat[has_hit] = int_v[first_idx_flat[has_hit]]
-
-    valid_flat = range_flat.isfinite()
-    range_flat = torch.where(valid_flat, range_flat, torch.zeros_like(range_flat))
-
-    return {
-        "range_image":     range_flat.view(height, width),
-        "intensity_image": intensity_flat.view(height, width),
-        "valid_mask":      valid_flat.view(height, width),
-    }
-
-
-# ---------------------------------------------------------------------------
 # GT normal map
 # ---------------------------------------------------------------------------
 
@@ -253,59 +157,14 @@ def build_gt_normal_map(
 
 
 # ---------------------------------------------------------------------------
-# Ray grid helper (moved from models/head/drop_head.py)
-# ---------------------------------------------------------------------------
-
-def make_lidar_ray_grid(
-    height: int,
-    width: int,
-    el_min_rad: float,
-    el_max_rad: float,
-    *,
-    device: torch.device | str = "cpu",
-    dtype: torch.dtype = torch.float32,
-) -> Tensor:
-    """Per-pixel unit ray direction in sensor frame.
-
-    Mirrors the spherical projection used by the CUDA LiDAR-mode kernel
-    (cuda_rasterizer/forward.cu, lidar_mode branch):
-        az = (u + 0.5) / w_per_rad_az - π
-        el = (v + 0.5) / h_per_rad_el + el_min
-        d  = (sin(az)cos(el), cos(az)cos(el), sin(el))
-
-    Returns a [3, H, W] tensor.
-    """
-    w_per_rad_az = width / (2.0 * math.pi)
-    h_per_rad_el = height / (el_max_rad - el_min_rad)
-    u = torch.arange(width, device=device, dtype=dtype) + 0.5
-    v = torch.arange(height, device=device, dtype=dtype) + 0.5
-    az = u / w_per_rad_az - math.pi
-    el = v / h_per_rad_el + el_min_rad
-    cos_el = torch.cos(el)
-    sin_el = torch.sin(el)
-    sin_az = torch.sin(az)
-    cos_az = torch.cos(az)
-    dx = sin_az[None, :] * cos_el[:, None]
-    dy = cos_az[None, :] * cos_el[:, None]
-    dz = sin_el[:, None].expand(height, width)
-    return torch.stack([dx, dy, dz], dim=0)
-
-
-# ---------------------------------------------------------------------------
 # Render wrapper
 # ---------------------------------------------------------------------------
 
 def render_primitives(
     primitives: dict,
+    cfg,
     *,
-    height: int,
-    width: int,
-    el_min_rad: float,
-    el_max_rad: float,
-    sigma: float = 3.0,
     scale_modifier: float = 1.0,
-    r_near: float = 0.2,
-    r_far: float = 70.0,
     viewmatrix: Optional[Tensor] = None,
     campos: Optional[Tensor] = None,
 ) -> LiDARRasterOutput:
@@ -320,8 +179,8 @@ def render_primitives(
             'intensity' [N]      in [0, 1]
             'latent'    [N, L]   L == LIDAR_LATENT_DIM
             'raydrop'   [N]      per-Gaussian raydrop in [0, 0.5]
-        height/width: spherical image dimensions.
-        el_min_rad/el_max_rad: vertical FOV.
+        cfg: QGSConfig — provides lidar_height/width, ring_to_elevation_deg,
+             lidar_sigma, r_near, r_far.
         viewmatrix: [4,4]  world → sensor. Defaults to identity (sensor frame).
         campos:     [3]    sensor centre in world. Defaults to origin.
 
@@ -334,17 +193,20 @@ def render_primitives(
     if campos is None:
         campos = torch.zeros(3, device=device, dtype=torch.float32)
 
+    el_min_eff, el_max_eff = get_effective_el_bounds(cfg)
+    row_to_el = get_row_to_elevation_rad(cfg, device=device, dtype=torch.float32)
     settings = make_lidar_settings(
-        image_height=height,
-        image_width=width,
-        el_min_rad=el_min_rad,
-        el_max_rad=el_max_rad,
+        image_height=int(cfg.lidar_height),
+        image_width=int(cfg.lidar_width),
+        el_min_rad=el_min_eff,
+        el_max_rad=el_max_eff,
+        row_to_elevation_rad=row_to_el,
         viewmatrix=viewmatrix,
         campos=campos,
-        sigma=sigma,
+        sigma=float(cfg.lidar_sigma),
         scale_modifier=scale_modifier,
-        r_near=r_near,
-        r_far=r_far,
+        r_near=float(cfg.r_near),
+        r_far=float(cfg.r_far),
     )
 
     means3D = primitives["means3D"]

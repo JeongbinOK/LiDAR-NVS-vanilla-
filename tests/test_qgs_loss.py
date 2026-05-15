@@ -4,8 +4,10 @@ from types import SimpleNamespace
 
 import torch
 
-from nn.render_utils import build_gt_normal_map, make_lidar_ray_grid
+from nn.lidar_geometry import make_lidar_ray_grid
 from nn.qgs_loss import QGSLoss
+from nn.render_utils import build_gt_normal_map
+from tests._lidar_test_helpers import uniform_lidar_cfg
 
 
 def test_qgs_loss_penalizes_alpha_collapse():
@@ -57,11 +59,34 @@ def test_qgs_loss_uses_raw_alpha_blended_intensity():
     assert torch.allclose(loss["intensity"], torch.tensor(0.0))
 
 
+def test_qgs_loss_depth_averages_expected_and_median_depth():
+    loss_fn = QGSLoss(w_depth=1.0, w_intensity=0.0, w_raydrop=0.0, w_distortion=0.0, w_normal=0.0)
+
+    target = {
+        "range_image": torch.tensor([[10.0]]),
+        "intensity_image": torch.tensor([[0.0]]),
+        "valid_mask": torch.tensor([[True]]),
+    }
+    rendered = SimpleNamespace(
+        range=torch.tensor([[8.0]]),
+        middepth=torch.tensor([[13.0]]),
+        intensity=torch.tensor([[0.0]]),
+        alpha_accum=torch.tensor([[1.0]]),
+    )
+
+    loss = loss_fn(rendered, target, drop_prob=torch.tensor([[0.0]]))
+
+    assert torch.allclose(loss["depth_range"], torch.tensor(2.0))
+    assert torch.allclose(loss["depth_median"], torch.tensor(3.0))
+    assert torch.allclose(loss["depth"], torch.tensor(2.5))
+    assert torch.allclose(loss["total"], torch.tensor(2.5))
+
+
 def test_qgs_loss_qgs_normal_term_is_zero_when_normals_align():
     loss_fn = QGSLoss(w_depth=0.0, w_intensity=0.0, w_raydrop=0.0, w_normal=1.0)
 
     h, w = 3, 3
-    ray_grid = make_lidar_ray_grid(h, w, -0.2, 0.2)
+    ray_grid = make_lidar_ray_grid(uniform_lidar_cfg(h, w, -0.2, 0.2))
     alpha = torch.full((h, w), 0.5)
     middepth = torch.ones(h, w)
     target = {
@@ -89,7 +114,7 @@ def test_qgs_loss_curvature_guidance_downweights_high_curvature_pixels():
     loss_fn = QGSLoss(w_depth=0.0, w_intensity=0.0, w_raydrop=0.0, w_normal=1.0)
 
     h, w = 3, 3
-    ray_grid = make_lidar_ray_grid(h, w, -0.2, 0.2)
+    ray_grid = make_lidar_ray_grid(uniform_lidar_cfg(h, w, -0.2, 0.2))
     alpha = torch.ones(h, w)
     middepth = torch.ones(h, w)
     target = {

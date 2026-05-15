@@ -88,12 +88,12 @@ renderkBufferCUDA(
 	int* __restrict__ n_touched,
 	// A3.2.d — LiDAR mode ray construction.
 	// When lidar_mode=true, focal_x/focal_y/principal_{x,y} are ignored and
-	// the ray is built from pixel → (az, el) → unit Cartesian direction using
-	// the spherical intrinsics (el_min, w_per_rad_az, h_per_rad_el).
+	// the ray is built from pixel → row_to_elevation_rad[pix.y] (exact row
+	// elevation, no sub-pixel interp).
 	const bool lidar_mode,
 	const float el_min_rad,
 	const float w_per_rad_az,
-	const float h_per_rad_el,
+	const float* __restrict__ row_to_elevation_rad,
 	const float r_near,
 	const float r_far)
 {
@@ -120,7 +120,7 @@ renderkBufferCUDA(
 	float3 ray_point;
 	if (lidar_mode) {
 		const float az = pixf.x / w_per_rad_az - qgs_lidar::PI_F;
-		const float el = pixf.y / h_per_rad_el + el_min_rad;
+		const float el = row_to_elevation_rad[pix.y];
 		const float cos_el = cosf(el);
 		ray_point = { sinf(az) * cos_el, cosf(az) * cos_el, sinf(el) };
 	} else {
@@ -476,12 +476,12 @@ renderkBufferBackwardCUDA(
 	float* __restrict__ dL_dscales,
 	float* __restrict__ dL_dview2gaussian,
 	// A3.x — LiDAR-mode backward (mirrors forward kernel ray construction).
-	// When lidar_mode=true, focal_x/focal_y/principal_{x,y} are ignored and
-	// the per-pixel ray direction is built spherically from cam_intr.
+	// When lidar_mode=true, focal_x/focal_y/principal_{x,y} are ignored and the
+	// per-pixel ray direction is built from row_to_elevation_rad[pix.y].
 	const bool lidar_mode,
 	const float el_min_rad,
 	const float w_per_rad_az,
-	const float h_per_rad_el,
+	const float* __restrict__ row_to_elevation_rad,
 	const float r_near,
 	const float r_far)
 {
@@ -493,12 +493,12 @@ renderkBufferBackwardCUDA(
 	const uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
 	const uint32_t pix_id = W * pix.y + pix.x;
 	float2 pixf = { (float)pix.x + 0.5f, (float)pix.y + 0.5f };
- 
+
 	const bool inside = pix.x < W && pix.y < H;
 	const uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
- 
+
 	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
-	
+
 	bool done = !inside;
 	int toDo = range.y - range.x;
 
@@ -509,7 +509,7 @@ renderkBufferBackwardCUDA(
 	float3 ray_point;
 	if (lidar_mode) {
 		const float az = pixf.x / w_per_rad_az - qgs_lidar::PI_F;
-		const float el = pixf.y / h_per_rad_el + el_min_rad;
+		const float el = row_to_elevation_rad[pix.y];
 		const float cos_el = cosf(el);
 		ray_point = { sinf(az) * cos_el, cosf(az) * cos_el, sinf(el) };
 	} else {

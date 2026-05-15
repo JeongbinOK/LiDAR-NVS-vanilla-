@@ -11,20 +11,28 @@
  *   el     = atan2(z, sqrt(x² + y²)) ∈ [-π/2, π/2]
  *
  *   cam_intr[4] (re-purposed from camera mode):
- *     [0] el_min_rad           — bottom of vertical FOV
- *     [1] el_max_rad           — top    of vertical FOV
+ *     [0] el_min_eff_rad       — extrapolated bottom edge (v=0)
+ *     [1] el_max_eff_rad       — extrapolated top    edge (v=H)
  *     [2] w_per_rad_az = W / (2π)
- *     [3] h_per_rad_el = H / (el_max - el_min)
+ *     [3] H (float)            — vertical resolution
+ *
+ *   row_to_el[H]               — per-row center elevation (rad), ascending
+ *                                (row_bottom0 convention).
  *
  * Pixel coords:
- *   u = (az + π) * w_per_rad_az             ∈ [0, W)
- *   v = (el - el_min) * h_per_rad_el        ∈ [0, H)
+ *   u = (az + π) * w_per_rad_az           ∈ [0, W)
+ *   v = el_to_v_nonuniform(el, row_to_el, H)
+ *     — piecewise-linear through {(row_to_el[k], k+0.5)}_{k=0..H-1}.
+ *     — edge segments extrapolated by first/last slope.
+ *     — el_min_eff → v=0, el_max_eff → v=H by construction.
+ *
+ * Inverse (per-pixel ray reconstruction): pixf.y = pix.y + 0.5 → el = row_to_el[pix.y].
  *
  * Azimuth wraparound is the caller's responsibility — when the bbox crosses ±π,
  * emit two image-space rectangles instead of one.
  *
  * Header-only: include this from forward.cu / preprocess kernels.
- * The same math is mirrored in `tests/_spherical_python_ref.py` for validation.
+ * The same math is mirrored in `python_ref/spherical_ref.py` for validation.
  */
 
 #pragma once
@@ -61,18 +69,58 @@ void project_to_sphere(float x, float y, float z,
 }
 
 /* ------------------------------------------------------------------ */
+/* Piecewise-linear el → v through {(row_to_el[k], k+0.5)}_{k=0..H-1}. */
+/* Edge segments extrapolated by the first/last segment slope so       */
+/*   el_min_eff = row_to_el[0] - 0.5*(row_to_el[1]-row_to_el[0]) → v=0  */
+/*   el_max_eff = row_to_el[H-1]+ 0.5*(row_to_el[H-1]-row_to_el[H-2]) → v=H */
+/* Linear scan suffices for H≈32; for larger sensors swap to binary.   */
+/* ------------------------------------------------------------------ */
+SPH_HOSTDEV
+float el_to_v_nonuniform(float el, const float* row_to_el, int H)
+{
+    if (H < 2)
+    {
+        // Degenerate single-row sensor: collapse to the lone row center.
+        return 0.5f;
+    }
+    // Bracket: find seg ∈ [0, H-2] s.t. row_to_el[seg] <= el <= row_to_el[seg+1]
+    // or use endpoint segment for extrapolation.
+    int seg = 0;
+    if (el <= row_to_el[0])
+    {
+        seg = 0;
+    }
+    else if (el >= row_to_el[H - 1])
+    {
+        seg = H - 2;
+    }
+    else
+    {
+        // Linear scan ascending.
+        #pragma unroll
+        for (int k = 0; k < 64; ++k) {
+            if (k >= H - 1) break;
+            if (el >= row_to_el[k] && el <= row_to_el[k + 1]) { seg = k; break; }
+        }
+    }
+    const float e_lo = row_to_el[seg];
+    const float e_hi = row_to_el[seg + 1];
+    return (float)seg + 0.5f + (el - e_lo) / (e_hi - e_lo);
+}
+
+/* ------------------------------------------------------------------ */
 /* Map (az, el) → (u, v) pixel coordinates given LiDAR intrinsics.    */
+/* Uses cam_intr[2] for the linear u-axis; v uses the nonuniform LUT.  */
 /* ------------------------------------------------------------------ */
 SPH_HOSTDEV
 void spherical_to_pixel(float az, float el,
                         const float* cam_intr,
+                        const float* row_to_el, int H,
                         float& u, float& v)
 {
-    const float el_min       = cam_intr[0];
     const float w_per_rad_az = cam_intr[2];
-    const float h_per_rad_el = cam_intr[3];
     u = (az + PI_F) * w_per_rad_az;
-    v = (el - el_min) * h_per_rad_el;
+    v = el_to_v_nonuniform(el, row_to_el, H);
 }
 
 /* ------------------------------------------------------------------ */

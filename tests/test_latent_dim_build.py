@@ -81,9 +81,13 @@ def test_pack_unpack_roundtrip_at_built_dim():
     latent = torch.randn(N, LIDAR_LATENT_DIM, device=device, dtype=torch.float32)
     raydrop = torch.zeros(N, device=device, dtype=torch.float32)
 
+    from tests._lidar_test_helpers import uniform_row_elevation_rad
     settings = make_lidar_settings(
         image_height=H, image_width=W,
         el_min_rad=_m.radians(-30.0), el_max_rad=_m.radians(10.0),
+        row_to_elevation_rad=uniform_row_elevation_rad(
+            _m.radians(-30.0), _m.radians(10.0), H
+        ).to(device),
         viewmatrix=torch.eye(4, device=device, dtype=torch.float32),
         campos=torch.zeros(3, device=device, dtype=torch.float32),
     )
@@ -117,9 +121,13 @@ def test_wrong_latent_dim_raises_helpful_error():
         [[0.0, 5.0, 0.0], [1.0, 5.0, 0.0]],
         device=device, dtype=torch.float32,
     )
+    from tests._lidar_test_helpers import uniform_row_elevation_rad
     settings = make_lidar_settings(
         image_height=H, image_width=W,
         el_min_rad=_m.radians(-30.0), el_max_rad=_m.radians(10.0),
+        row_to_elevation_rad=uniform_row_elevation_rad(
+            _m.radians(-30.0), _m.radians(10.0), H
+        ).to(device),
         viewmatrix=torch.eye(4, device=device, dtype=torch.float32),
         campos=torch.zeros(3, device=device, dtype=torch.float32),
     )

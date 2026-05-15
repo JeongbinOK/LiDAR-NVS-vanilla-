@@ -93,11 +93,14 @@ def _gen(seed: int) -> torch.Generator:
 def _forward(params: dict) -> torch.Tensor:
     """Run forward pass and return a scalar loss for backprop / FD comparison."""
     from diff_quadratic_rasterization import LiDARRasterizer, make_lidar_settings
+    from tests._lidar_test_helpers import uniform_row_elevation_rad
 
     device = params["means3D"].device
+    row_to_el = uniform_row_elevation_rad(EL_MIN, EL_MAX, H).to(device)
     settings = make_lidar_settings(
         image_height=H, image_width=W,
         el_min_rad=EL_MIN, el_max_rad=EL_MAX,
+        row_to_elevation_rad=row_to_el,
         viewmatrix=torch.eye(4, device=device, dtype=torch.float32),
         campos=torch.zeros(3, device=device, dtype=torch.float32),
         r_far=params.get("r_far", 100.0),

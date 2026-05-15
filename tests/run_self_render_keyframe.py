@@ -243,9 +243,12 @@ def self_render(
     # -------- rasterizer settings (sensor at origin, identity view) -----
     viewmatrix = torch.eye(4, device=device, dtype=torch.float32)
     campos = torch.zeros(3, device=device, dtype=torch.float32)
+    from tests._lidar_test_helpers import uniform_row_elevation_rad
+    row_to_el = uniform_row_elevation_rad(el_min_rad, el_max_rad, H).to(device)
     settings = make_lidar_settings(
         image_height=H, image_width=W,
         el_min_rad=el_min_rad, el_max_rad=el_max_rad,
+        row_to_elevation_rad=row_to_el,
         viewmatrix=viewmatrix, campos=campos,
         sigma=sigma, r_near=0.2, r_far=r_far,
     )

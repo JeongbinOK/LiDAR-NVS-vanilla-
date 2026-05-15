@@ -272,7 +272,8 @@ int CudaRasterizer::Rasterizer::forward(
 	bool debug,
 	bool lidar_mode,
 	float r_near,
-	float r_far)
+	float r_far,
+	const float* row_to_elevation_rad)
 {
 	const float focal_x = cam_intr[0];
 	const float focal_y = cam_intr[1];
@@ -304,11 +305,17 @@ int CudaRasterizer::Rasterizer::forward(
 	// Run preprocessing per-Gaussian (transformation, bounding, conversion of SHs to RGB)
 	if (lidar_mode) {
 		// A3.2.c: panoramic spherical projection. cam_intr is repurposed as
-		// [el_min_rad, el_max_rad, w_per_rad_az, h_per_rad_el] and lives on CPU.
+		// [el_min_eff_rad, el_max_eff_rad, w_per_rad_az, H_float] and lives on
+		// CPU; the per-row elevation table is passed separately as a device
+		// buffer `row_to_elevation_rad`.
+		if (row_to_elevation_rad == nullptr) {
+			throw std::runtime_error(
+				"lidar_mode=true requires row_to_elevation_rad device buffer."
+			);
+		}
 		const float el_min_rad    = cam_intr[0];
 		const float el_max_rad    = cam_intr[1];
 		const float w_per_rad_az  = cam_intr[2];
-		const float h_per_rad_el  = cam_intr[3];
 		CHECK_CUDA(FORWARD::preprocessLidar(
 			P, D, M,
 			aabb,
@@ -325,7 +332,7 @@ int CudaRasterizer::Rasterizer::forward(
 			viewmatrix,
 			(glm::vec3*)cam_pos,
 			width, height,
-			el_min_rad, el_max_rad, w_per_rad_az, h_per_rad_el,
+			el_min_rad, el_max_rad, w_per_rad_az, row_to_elevation_rad,
 			r_near, r_far,
 			radii,
 			geomState.rects2D,
@@ -448,10 +455,11 @@ int CudaRasterizer::Rasterizer::forward(
 	const float* view2gaussian = view2gaussian_precomp != nullptr ? view2gaussian_precomp : geomState.view2gaussian;
 	// const float* view2gaussian = view2gaussian_precomp;
 	// A3.2.d: forward the LiDAR spherical intrinsics to the render kernel when
-	// lidar_mode is on. They were already read host-side above (cam_intr[0..3]).
+	// lidar_mode is on. cam_intr[3] is now H_float and unused inside the kernel
+	// (the per-row table replaces it).
 	const float el_min_rad_render   = lidar_mode ? cam_intr[0] : 0.f;
 	const float w_per_rad_az_render = lidar_mode ? cam_intr[2] : 0.f;
-	const float h_per_rad_el_render = lidar_mode ? cam_intr[3] : 0.f;
+	const float* row_to_el_render   = lidar_mode ? row_to_elevation_rad : nullptr;
 	CHECK_CUDA(FORWARD::render(
 		P,
 		tile_grid, block,
@@ -479,7 +487,7 @@ int CudaRasterizer::Rasterizer::forward(
 		lidar_mode,
 		el_min_rad_render,
 		w_per_rad_az_render,
-		h_per_rad_el_render,
+		row_to_el_render,
 		r_near,
 		r_far), debug)
 
@@ -529,7 +537,8 @@ void CudaRasterizer::Rasterizer::backward(
 	bool debug,
 	bool lidar_mode,
 	float r_near,
-	float r_far)
+	float r_far,
+	const float* row_to_elevation_rad)
 {
 	GeometryState geomState = GeometryState::fromChunk(geom_buffer, P);
 	BinningState binningState = BinningState::fromChunk(binning_buffer, R);
@@ -550,9 +559,14 @@ void CudaRasterizer::Rasterizer::backward(
 	const float principal_y  = lidar_mode ? 0.0f : cam_intr[3];
 
 	// Spherical intrinsics for LiDAR ray construction (mirror forward).
-	const float el_min_rad   = lidar_mode ? cam_intr[0] : 0.0f;
-	const float w_per_rad_az = lidar_mode ? cam_intr[2] : 0.0f;
-	const float h_per_rad_el = lidar_mode ? cam_intr[3] : 0.0f;
+	const float el_min_rad        = lidar_mode ? cam_intr[0] : 0.0f;
+	const float w_per_rad_az      = lidar_mode ? cam_intr[2] : 0.0f;
+	const float* row_to_el_render = lidar_mode ? row_to_elevation_rad : nullptr;
+	if (lidar_mode && row_to_elevation_rad == nullptr) {
+		throw std::runtime_error(
+			"lidar_mode=true requires row_to_elevation_rad device buffer."
+		);
+	}
 
 	const dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);
 	const dim3 block(BLOCK_X, BLOCK_Y, 1);
@@ -598,7 +612,7 @@ void CudaRasterizer::Rasterizer::backward(
 		lidar_mode,
 		el_min_rad,
 		w_per_rad_az,
-		h_per_rad_el,
+		row_to_el_render,
 		r_near,
 		r_far), debug)
 

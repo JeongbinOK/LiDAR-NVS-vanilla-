@@ -12,8 +12,13 @@ import torch
 from config import QGSConfig
 from models.geometry import decompose_scene
 from models.geometry.voxel_anchor import DynamicVoxelAnchorBuilder, VoxelAnchorBuilder
+from nn.lidar_geometry import (
+    make_lidar_ray_grid,
+    points_to_lidar_maps,
+    range_map_to_points,
+)
 from nn.qgs_loss import QGSLoss
-from nn.render_utils import make_lidar_ray_grid, quat_to_rotmat, render_primitives, rotmat_to_quat, build_target_lidar_image
+from nn.render_utils import quat_to_rotmat, render_primitives, rotmat_to_quat
 
 
 def load_cfg_from_checkpoint(checkpoint_path: str) -> QGSConfig:
@@ -415,8 +420,8 @@ def gaussian_slice_stats(
     viewmatrix: torch.Tensor,
     cfg: QGSConfig,
 ) -> dict:
-    el_min_rad = math.radians(cfg.lidar_el_min_deg)
-    el_max_rad = math.radians(cfg.lidar_el_max_deg)
+    from nn.lidar_geometry import get_effective_el_bounds
+    el_min_rad, el_max_rad = get_effective_el_bounds(cfg)
     visible = _sensor_visibility_mask(
         primitives["means3D"],
         viewmatrix,
@@ -481,11 +486,6 @@ def frame_gaussian_stats(
     return {"overall": totals, "contexts": context_stats}
 
 
-def range_image_to_points(ray_grid: torch.Tensor, range_image: torch.Tensor, valid_mask: torch.Tensor):
-    pts = (ray_grid * range_image.unsqueeze(0)).permute(1, 2, 0)
-    return pts[valid_mask]
-
-
 def approx_chamfer(pred_pts: torch.Tensor, gt_pts: torch.Tensor, max_points: int = 2048) -> float:
     if pred_pts.numel() == 0 or gt_pts.numel() == 0:
         return float("inf")
@@ -515,8 +515,11 @@ def frame_metrics(
     pred_intensity = rendered.intensity
     pred_range = rendered.middepth
 
-    gt_pts = range_image_to_points(ray_grid, target["range_image"], gt_valid)
-    pred_pts = range_image_to_points(ray_grid, pred_range, pred_valid)
+    def _unproject(rng: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        return (ray_grid * rng.unsqueeze(0)).permute(1, 2, 0)[mask]
+
+    gt_pts = _unproject(target["range_image"], gt_valid)
+    pred_pts = _unproject(pred_range, pred_valid)
 
     precision = float(intersect.sum().item() / max(pred_valid.sum().item(), 1))
     recall = float(intersect.sum().item() / max(gt_valid.sum().item(), 1))
@@ -851,30 +854,15 @@ def evaluate_pair_sample(
     frame0 = concat_primitives([ctx["primitives"] for ctx in frame0_contexts])
     frame1 = concat_primitives([ctx["primitives"] for ctx in frame1_contexts])
 
-    el_min_rad = math.radians(cfg.lidar_el_min_deg)
-    el_max_rad = math.radians(cfg.lidar_el_max_deg)
-    ray_grid = make_lidar_ray_grid(cfg.lidar_height, cfg.lidar_width, el_min_rad, el_max_rad, device=device)
+    ray_grid = make_lidar_ray_grid(cfg, device=device)
 
-    target0 = build_target_lidar_image(
-        xyz0, i0,
-        height=cfg.lidar_height, width=cfg.lidar_width,
-        el_min_rad=el_min_rad, el_max_rad=el_max_rad,
-        r_near=cfg.r_near, r_far=cfg.r_far,
-    )
-    target1 = build_target_lidar_image(
-        xyz1, i1,
-        height=cfg.lidar_height, width=cfg.lidar_width,
-        el_min_rad=el_min_rad, el_max_rad=el_max_rad,
-        r_near=cfg.r_near, r_far=cfg.r_far,
-    )
+    target0 = points_to_lidar_maps(xyz0, i0, cfg)
+    target1 = points_to_lidar_maps(xyz1, i1, cfg)
 
     _reset_cuda_peak(device_t)
     rendered0 = render_primitives(
         frame0,
-        height=cfg.lidar_height, width=cfg.lidar_width,
-        el_min_rad=el_min_rad, el_max_rad=el_max_rad,
-        sigma=cfg.lidar_sigma,
-        r_near=cfg.r_near, r_far=cfg.r_far,
+        cfg,
         viewmatrix=torch.eye(4, device=device, dtype=xyz0.dtype),
         campos=torch.zeros(3, device=device, dtype=xyz0.dtype),
     )
@@ -882,10 +870,7 @@ def evaluate_pair_sample(
     _reset_cuda_peak(device_t)
     rendered1 = render_primitives(
         frame1,
-        height=cfg.lidar_height, width=cfg.lidar_width,
-        el_min_rad=el_min_rad, el_max_rad=el_max_rad,
-        sigma=cfg.lidar_sigma,
-        r_near=cfg.r_near, r_far=cfg.r_far,
+        cfg,
         viewmatrix=inv_pose,
         campos=rel_input_1_pose[:3, 3],
     )

@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
+from typing import Optional
+
+_logger = logging.getLogger(__name__)
 
 
 OFFICIAL_FULL_PTV3_BACKBONE_PARAMS = 46_174_272
@@ -90,8 +94,26 @@ class QGSConfig:
     # LiDAR rasterizer (spherical projection)
     lidar_height: int = 32
     lidar_width: int = 1085  # 20Hz/46.08us -> ~1085 azimuth bins per revolution
-    lidar_el_min_deg: float = -30.67   # nuScenes LIDAR_TOP
-    lidar_el_max_deg: float = +10.67
+    # Per-ring elevation table (deg). nuScenes LIDAR_TOP exposes the `ring`
+    # channel **already sorted by elevation** (ascending, v=0=bottom): ring k
+    # corresponds to the k-th lowest beam. This is NOT the HDL-32E manufacturer
+    # firing order; it's the post-sort index nuScenes ships with each scan.
+    # Verified empirically (scripts/diag_ring_elevation.py).
+    #
+    # row_to_elevation_deg, ring_to_row, ring_at_row are all derived in
+    # nn.lidar_geometry from this single source of truth. Because the table is
+    # already sorted, ring_to_row is the identity mapping.
+    ring_to_elevation_deg: tuple = (
+        -30.67, -29.33, -28.00, -26.66, -25.33, -24.00, -22.67, -21.33,
+        -20.00, -18.67, -17.33, -16.00, -14.67, -13.33, -12.00, -10.67,
+         -9.33,  -8.00,  -6.66,  -5.33,  -4.00,  -2.67,  -1.33,   0.00,
+          1.33,   2.67,   4.00,   5.33,   6.67,   8.00,   9.33,  10.67,
+    )
+    # Legacy linear-FOV fields (deprecated; kept as tombstones so older
+    # checkpoints' config.json reload without raising). The runtime path never
+    # reads these — see __post_init__.
+    lidar_el_min_deg: Optional[float] = None
+    lidar_el_max_deg: Optional[float] = None
     lidar_sigma: float = 3.0
     r_near: float = 0.2
     r_far: float = 70.0
@@ -133,9 +155,24 @@ class QGSConfig:
     # Debug
     debug_finite_check: bool = False  # log non-finite forward boundaries in process_pair
     debug_anomaly_batch: int = -1     # run set_detect_anomaly on this batch_idx (-1 = off)
+    debug_bad_grad_trace: bool = True  # log first non-finite primitive/render grads when Bad grad happens
+    debug_bad_grad_trace_max: int = 16  # max tensor-gradient records printed per bad batch
 
     def __post_init__(self) -> None:
         self.lidar_latent_dim = resolve_lidar_latent_dim(self.lidar_latent_dim)
+        if len(self.ring_to_elevation_deg) != self.lidar_height:
+            raise ValueError(
+                f"len(ring_to_elevation_deg)={len(self.ring_to_elevation_deg)} must "
+                f"equal lidar_height={self.lidar_height}"
+            )
+        if self.lidar_el_min_deg is not None or self.lidar_el_max_deg is not None:
+            _logger.warning(
+                "config.lidar_el_min_deg / lidar_el_max_deg are legacy tombstones; "
+                "ignored. Per-row elevations are derived from ring_to_elevation_deg."
+            )
+            # Discard so downstream code never accidentally uses them.
+            self.lidar_el_min_deg = None
+            self.lidar_el_max_deg = None
         allowed_modes = {"voxel_anchor", "per_point"}
         if self.primitive_mode not in allowed_modes:
             raise ValueError(

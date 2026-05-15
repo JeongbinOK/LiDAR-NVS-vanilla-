@@ -35,10 +35,12 @@ from models.geometry import decompose_scene
 from models.geometry.voxel_anchor import DynamicVoxelAnchorBuilder, VoxelAnchorBuilder
 from nn.model import QGSModel
 from nn.qgs_loss import QGSLoss
+from nn.lidar_geometry import (
+    make_lidar_ray_grid,
+    points_to_lidar_maps,
+)
 from nn.render_utils import (
     build_gt_normal_map,
-    build_target_lidar_image,
-    make_lidar_ray_grid,
     quat_to_rotmat,
     render_primitives,
     rotmat_to_quat,
@@ -156,10 +158,17 @@ def _restore_scheduler_state(
         group["lr"] = lr
 
 
-def _filter_frame_points(xyz: torch.Tensor, intensity: torch.Tensor, cfg: QGSConfig):
+def _filter_frame_points(
+    xyz: torch.Tensor,
+    intensity: torch.Tensor,
+    cfg: QGSConfig,
+    ring: torch.Tensor | None = None,
+):
     r = xyz.norm(dim=1)
     keep = (r > cfg.ego_radius) & (r < cfg.r_far)
-    return xyz[keep], intensity[keep]
+    if ring is None:
+        return xyz[keep], intensity[keep]
+    return xyz[keep], intensity[keep], ring[keep]
 
 
 def _build_scene_primitives(
@@ -391,7 +400,82 @@ def _check_finite_render(rendered, label: str) -> None:
               f"nan={nan_c} inf={inf_c} finite_abs_max={fmax:.2e}")
 
 
-def process_pair(model, loss_fn, ray_dir, batch, idx, device, cfg, profile: dict | None = None):
+def _make_bad_grad_trace(cfg) -> dict | None:
+    if not getattr(cfg, "debug_bad_grad_trace", False):
+        return None
+    return {
+        "records": [],
+        "total_nonfinite_tensors": 0,
+        "max_records": int(getattr(cfg, "debug_bad_grad_trace_max", 16)),
+    }
+
+
+def _grad_trace_record(trace: dict | None, label: str, tensor: torch.Tensor) -> None:
+    if trace is None or not torch.is_tensor(tensor) or not tensor.requires_grad:
+        return
+
+    def _hook(grad: torch.Tensor) -> torch.Tensor:
+        if grad is None:
+            return grad
+        grad_det = grad.detach()
+        finite_mask = torch.isfinite(grad_det)
+        if bool(finite_mask.all()):
+            return grad
+
+        trace["total_nonfinite_tensors"] = trace.get("total_nonfinite_tensors", 0) + 1
+        records = trace.setdefault("records", [])
+        max_records = int(trace.get("max_records", 16))
+        if len(records) < max_records:
+            nan_count = int(torch.isnan(grad_det).sum().item())
+            inf_count = int(torch.isinf(grad_det).sum().item())
+            finite_abs_max = (
+                float(grad_det[finite_mask].abs().max().item())
+                if bool(finite_mask.any())
+                else float("nan")
+            )
+            bad_indices = torch.nonzero(~finite_mask, as_tuple=False)
+            first_bad = tuple(int(x) for x in bad_indices[0].detach().cpu().tolist()) if bad_indices.numel() else ()
+            records.append(
+                f"{label}: shape={tuple(grad_det.shape)} first_bad={first_bad} "
+                f"nan={nan_count} inf={inf_count} finite_abs_max={finite_abs_max:.2e}"
+            )
+        return grad
+
+    tensor.register_hook(_hook)
+
+
+def _attach_primitive_grad_trace(trace: dict | None, prims: dict, label: str) -> None:
+    for key in ("means3D", "scales", "rotations", "opacities", "intensity", "latent", "raydrop"):
+        _grad_trace_record(trace, f"{label}.{key}", prims.get(key))
+
+
+def _attach_render_grad_trace(trace: dict | None, rendered, label: str) -> None:
+    for attr in ("range", "middepth", "intensity", "raydrop", "alpha_accum", "normal", "curvature", "raw"):
+        _grad_trace_record(trace, f"{label}.{attr}", getattr(rendered, attr, None))
+
+
+def _summarize_bad_grad_trace(trace: dict | None) -> str:
+    if trace is None:
+        return ""
+    records = trace.get("records", [])
+    if not records:
+        return "no non-finite primitive/render tensor grad hook fired"
+    total = int(trace.get("total_nonfinite_tensors", len(records)))
+    suffix = f"; ... +{total - len(records)} more" if total > len(records) else ""
+    return "; ".join(records) + suffix
+
+
+def process_pair(
+    model,
+    loss_fn,
+    ray_dir,
+    batch,
+    idx,
+    device,
+    cfg,
+    profile: dict | None = None,
+    bad_grad_trace: dict | None = None,
+):
     """Build a shared scene from a frame pair and render both keyframes."""
     _profile_sync(device)
     t_prof = time.perf_counter()
@@ -402,17 +486,23 @@ def process_pair(model, loss_fn, ray_dir, batch, idx, device, cfg, profile: dict
     xyz0 = p0[:, :3].float()
     i0_raw = p0[:, 3].float()
     i0 = (i0_raw / 255.0).clamp(0.0, 1.0)
+    ring0 = p0[:, 4].to(torch.int64) if p0.shape[1] >= 5 else None
     xyz1 = p1[:, :3].float()
     i1_raw = p1[:, 3].float()
     i1 = (i1_raw / 255.0).clamp(0.0, 1.0)
+    ring1 = p1[:, 4].to(torch.int64) if p1.shape[1] >= 5 else None
 
     boxes_0 = _batch_item(batch, "boxes_0", idx).to(device) if "boxes_0" in batch else torch.empty(0, 7, device=device)
     boxes_1 = _batch_item(batch, "boxes_1", idx).to(device) if "boxes_1" in batch else torch.empty(0, 7, device=device)
     instance_ids_0 = _batch_item(batch, "instance_ids_0", idx).to(device) if "instance_ids_0" in batch else torch.empty(0, dtype=torch.long, device=device)
     instance_ids_1 = _batch_item(batch, "instance_ids_1", idx).to(device) if "instance_ids_1" in batch else torch.empty(0, dtype=torch.long, device=device)
 
-    xyz0, i0 = _filter_frame_points(xyz0, i0, cfg)
-    xyz1, i1 = _filter_frame_points(xyz1, i1, cfg)
+    if ring0 is not None:
+        xyz0, i0, ring0 = _filter_frame_points(xyz0, i0, cfg, ring=ring0)
+        xyz1, i1, ring1 = _filter_frame_points(xyz1, i1, cfg, ring=ring1)
+    else:
+        xyz0, i0 = _filter_frame_points(xyz0, i0, cfg)
+        xyz1, i1 = _filter_frame_points(xyz1, i1, cfg)
     _profile_count(profile, "filtered_frame0_points", xyz0.shape[0])
     _profile_count(profile, "filtered_frame1_points", xyz1.shape[0])
     if xyz0.shape[0] < cfg.knn_k_min or xyz1.shape[0] < cfg.knn_k_min:
@@ -563,25 +653,14 @@ def process_pair(model, loss_fn, ray_dir, batch, idx, device, cfg, profile: dict
         return None
     _profile_count(profile, "frame0_primitives", frame0["means3D"].shape[0])
     _profile_count(profile, "frame1_primitives", frame1["means3D"].shape[0])
+    _attach_primitive_grad_trace(bad_grad_trace, frame0, f"pair{idx}.frame0.prims")
+    _attach_primitive_grad_trace(bad_grad_trace, frame1, f"pair{idx}.frame1.prims")
 
-    el_min_rad = math.radians(cfg.lidar_el_min_deg)
-    el_max_rad = math.radians(cfg.lidar_el_max_deg)
-
-    target0 = build_target_lidar_image(
-        xyz0, i0,
-        height=cfg.lidar_height, width=cfg.lidar_width,
-        el_min_rad=el_min_rad, el_max_rad=el_max_rad,
-        r_near=cfg.r_near, r_far=cfg.r_far,
-    )
+    target0 = points_to_lidar_maps(xyz0, i0, cfg, ring=ring0)
     target0.update(build_gt_normal_map(
         target0["range_image"], target0["valid_mask"], ray_dir,
     ))
-    target1 = build_target_lidar_image(
-        xyz1, i1,
-        height=cfg.lidar_height, width=cfg.lidar_width,
-        el_min_rad=el_min_rad, el_max_rad=el_max_rad,
-        r_near=cfg.r_near, r_far=cfg.r_far,
-    )
+    target1 = points_to_lidar_maps(xyz1, i1, cfg, ring=ring1)
     target1.update(build_gt_normal_map(
         target1["range_image"], target1["valid_mask"], ray_dir,
     ))
@@ -589,28 +668,24 @@ def process_pair(model, loss_fn, ray_dir, batch, idx, device, cfg, profile: dict
 
     rendered0 = render_primitives(
         frame0,
-        height=cfg.lidar_height, width=cfg.lidar_width,
-        el_min_rad=el_min_rad, el_max_rad=el_max_rad,
-        sigma=cfg.lidar_sigma,
-        r_near=cfg.r_near, r_far=cfg.r_far,
+        cfg,
         viewmatrix=torch.eye(4, device=device, dtype=static_xyz.dtype),
         campos=torch.zeros(3, device=device, dtype=static_xyz.dtype),
     )
     t_prof = _profile_mark(profile, "render_frame0", t_prof, device)
     if cfg.debug_finite_check:
         _check_finite_render(rendered0, "rendered0")
+    _attach_render_grad_trace(bad_grad_trace, rendered0, f"pair{idx}.rendered0")
     rendered1 = render_primitives(
         frame1,
-        height=cfg.lidar_height, width=cfg.lidar_width,
-        el_min_rad=el_min_rad, el_max_rad=el_max_rad,
-        sigma=cfg.lidar_sigma,
-        r_near=cfg.r_near, r_far=cfg.r_far,
+        cfg,
         viewmatrix=inv_pose,
         campos=rel_input_1_pose[:3, 3],
     )
     t_prof = _profile_mark(profile, "render_frame1", t_prof, device)
     if cfg.debug_finite_check:
         _check_finite_render(rendered1, "rendered1")
+    _attach_render_grad_trace(bad_grad_trace, rendered1, f"pair{idx}.rendered1")
 
     loss0 = loss_fn(rendered0, target0, rendered0.raydrop, ray_dir)
     loss1 = loss_fn(rendered1, target1, rendered1.raydrop, ray_dir)
@@ -619,6 +694,8 @@ def process_pair(model, loss_fn, ray_dir, batch, idx, device, cfg, profile: dict
     loss_dict = {
         "total": total,
         "depth": 0.5 * (loss0["depth"] + loss1["depth"]),
+        "depth_range": 0.5 * (loss0["depth_range"] + loss1["depth_range"]),
+        "depth_median": 0.5 * (loss0["depth_median"] + loss1["depth_median"]),
         "intensity": 0.5 * (loss0["intensity"] + loss1["intensity"]),
         "raydrop": 0.5 * (loss0["raydrop"] + loss1["raydrop"]),
         "distortion": 0.5 * (loss0["distortion"] + loss1["distortion"]),
@@ -712,13 +789,7 @@ def train(cfg: QGSConfig, overfit_frames: int = 0, resume: str = ""):
         w_normal=getattr(cfg, "loss_w_normal", 0.05),
         alpha_eps=cfg.loss_alpha_eps,
     ).to(device)
-    ray_grid = make_lidar_ray_grid(
-        cfg.lidar_height,
-        cfg.lidar_width,
-        math.radians(cfg.lidar_el_min_deg),
-        math.radians(cfg.lidar_el_max_deg),
-        device=device,
-    )
+    ray_grid = make_lidar_ray_grid(cfg, device=device)
     if hasattr(model.backbone, "parameter_count"):
         backbone_core_params = model.backbone.parameter_count(include_projection=False)
         backbone_total_params = model.backbone.parameter_count(include_projection=True)
@@ -781,7 +852,7 @@ def train(cfg: QGSConfig, overfit_frames: int = 0, resume: str = ""):
     print(f"Dataset: {len(dataset)} pairs")
     print(f"Epochs: {cfg.num_epochs}, batch_size: {cfg.batch_size}")
     print(f"LiDAR image: {cfg.lidar_width}×{cfg.lidar_height} "
-          f"el∈[{cfg.lidar_el_min_deg}, {cfg.lidar_el_max_deg}]°")
+          f"el∈[{min(cfg.ring_to_elevation_deg):.2f}, {max(cfg.ring_to_elevation_deg):.2f}]°")
     print("-" * 60)
 
     best_loss = float("inf")
@@ -828,6 +899,7 @@ def train(cfg: QGSConfig, overfit_frames: int = 0, resume: str = ""):
 
             optimizer.zero_grad()
             valid_pairs = 0
+            bad_grad_trace = _make_bad_grad_trace(cfg)
 
             _anomaly_ctx = (
                 torch.autograd.detect_anomaly()
@@ -836,7 +908,16 @@ def train(cfg: QGSConfig, overfit_frames: int = 0, resume: str = ""):
             )
             with _anomaly_ctx:
                 for b in range(B):
-                    out = process_pair(model, loss_fn, ray_grid, batch, b, device, cfg)
+                    out = process_pair(
+                        model,
+                        loss_fn,
+                        ray_grid,
+                        batch,
+                        b,
+                        device,
+                        cfg,
+                        bad_grad_trace=bad_grad_trace,
+                    )
                     if out is None:
                         continue
                     if not torch.isfinite(out["total"]):
@@ -866,6 +947,7 @@ def train(cfg: QGSConfig, overfit_frames: int = 0, resume: str = ""):
             if has_bad_grad:
                 named_params = list(model.named_parameters())
                 bad_grad_summary = _summarize_bad_gradients(named_params)
+                bad_grad_trace_summary = _summarize_bad_grad_trace(bad_grad_trace)
                 avg_batch = {
                     k: sum(d[k] for d in batch_loss_dicts) / len(batch_loss_dicts)
                     for k in batch_loss_dicts[0]
@@ -881,6 +963,8 @@ def train(cfg: QGSConfig, overfit_frames: int = 0, resume: str = ""):
                     f"alpha_miss={avg_batch.get('alpha_miss_mean', 0.0):.3f} "
                     f"bad={bad_grad_summary}"
                 )
+                if bad_grad_trace_summary:
+                    pbar.write(f"  Bad grad tensor trace: {bad_grad_trace_summary}")
                 optimizer.zero_grad()
                 continue
 
@@ -1073,6 +1157,18 @@ def main():
         default=None,
         help="Run torch.autograd.detect_anomaly on this batch_idx (-1 = off)",
     )
+    parser.add_argument(
+        "--no-debug-bad-grad-trace",
+        action="store_true",
+        default=False,
+        help="Disable primitive/render backward hooks used to localize Bad grad batches",
+    )
+    parser.add_argument(
+        "--debug-bad-grad-trace-max",
+        type=int,
+        default=None,
+        help="Maximum primitive/render tensor-gradient records to print per Bad grad batch",
+    )
     args = parser.parse_args()
 
     cfg = _load_config(args.config) if args.config else None
@@ -1122,6 +1218,10 @@ def main():
         cfg.debug_finite_check = True
     if args.debug_anomaly_batch is not None:
         cfg.debug_anomaly_batch = args.debug_anomaly_batch
+    if args.no_debug_bad_grad_trace:
+        cfg.debug_bad_grad_trace = False
+    if args.debug_bad_grad_trace_max is not None:
+        cfg.debug_bad_grad_trace_max = args.debug_bad_grad_trace_max
     train(cfg, overfit_frames=args.overfit, resume=args.resume)
 
 

@@ -44,7 +44,9 @@ RasterizeGaussiansCUDA(
 	const bool debug,
 	const bool lidar_mode = false,
 	const float r_near = 0.2f,
-	const float r_far  = 100.0f);
+	const float r_far  = 100.0f,
+	// Per-row elevation (rad), ascending row_bottom0. Only used when lidar_mode=true.
+	const torch::Tensor& row_to_elevation_rad = torch::Tensor());
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
  RasterizeGaussiansBackwardCUDA(
@@ -80,7 +82,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	const bool reciprocal_z,
 	const bool lidar_mode = false,
 	const float r_near = 0.2f,
-	const float r_far = 100.0f);
+	const float r_far = 100.0f,
+	// Per-row elevation (rad), ascending row_bottom0. Only used when lidar_mode=true.
+	const torch::Tensor& row_to_elevation_rad = torch::Tensor());
 		
 torch::Tensor markVisible(
 		torch::Tensor& means3D,

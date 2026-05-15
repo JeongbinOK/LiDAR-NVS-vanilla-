@@ -450,7 +450,7 @@ renderCUDA(
 	const bool lidar_mode,
 	const float el_min_rad,
 	const float w_per_rad_az,
-	const float h_per_rad_el,
+	const float* __restrict__ row_to_elevation_rad,
 	const float r_near,
 	const float r_far)
 {
@@ -465,18 +465,21 @@ renderCUDA(
 
 	const bool inside = pix.x < W&& pix.y < H;
 	const uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
- 
+
 	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
-	
+
 	bool done = !inside;
 	int toDo = range.y - range.x;
 
 	// Mirror forward kernel: spherical ray construction in LiDAR mode, pinhole
-	// otherwise. The per-pixel ray is treated as a constant (no gradient back).
+	// otherwise. The per-pixel ray is treated as a constant (no gradient back) —
+	// preprocessCUDA backward (line 384-416) does NOT touch el_min/row_to_el, so
+	// no new Jacobian work is needed for the nonuniform mapping.
 	float3 ray_point;
 	if (lidar_mode) {
 		const float az = pixf.x / w_per_rad_az - qgs_lidar::PI_F;
-		const float el = pixf.y / h_per_rad_el + el_min_rad;
+		// Pixel center → row index → exact row elevation (no sub-pixel interp).
+		const float el = row_to_elevation_rad[pix.y];
 		const float cos_el = cosf(el);
 		ray_point = { sinf(az) * cos_el, cosf(az) * cos_el, sinf(el) };
 	} else {
@@ -1082,7 +1085,7 @@ void BACKWARD::render(
 	const bool lidar_mode,
 	const float el_min_rad,
 	const float w_per_rad_az,
-	const float h_per_rad_el,
+	const float* row_to_elevation_rad,
 	const float r_near,
 	const float r_far)
 {
@@ -1117,7 +1120,7 @@ void BACKWARD::render(
 		lidar_mode,
 		el_min_rad,
 		w_per_rad_az,
-		h_per_rad_el,
+		row_to_elevation_rad,
 		r_near,
 		r_far
 	);
@@ -1151,7 +1154,7 @@ void BACKWARD::render(
 		lidar_mode,
 		el_min_rad,
 		w_per_rad_az,
-		h_per_rad_el,
+		row_to_elevation_rad,
 		r_near,
 		r_far
 		);

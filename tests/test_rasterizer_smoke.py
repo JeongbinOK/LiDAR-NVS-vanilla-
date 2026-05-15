@@ -19,6 +19,8 @@ import torch
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "renderer" / "lidar_qgs_rasterizer"))
 
+from tests._lidar_test_helpers import uniform_row_elevation_rad  # noqa: E402
+
 # Skip whole module if no CUDA — rasterizer is GPU-only
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -104,6 +106,7 @@ def _lidar_scene(
         image_width=image_width,
         el_min_rad=el_min,
         el_max_rad=el_max,
+        row_to_elevation_rad=uniform_row_elevation_rad(el_min, el_max, image_height if 'image_height' in dir() else H).to(device),
         viewmatrix=viewmatrix,
         campos=campos,
         r_near=r_near,
@@ -155,6 +158,7 @@ def _lidar_scene_custom(
         image_width=image_width,
         el_min_rad=el_min,
         el_max_rad=el_max,
+        row_to_elevation_rad=uniform_row_elevation_rad(el_min, el_max, image_height if 'image_height' in dir() else H).to(device),
         viewmatrix=viewmatrix,
         campos=campos,
         r_near=r_near,
@@ -324,13 +328,14 @@ def test_lidar_forward_runs():
     colors_precomp[:, :3] = 0.7
 
     # ---- LiDAR "intrinsics" in cam_intr slot ----
-    # [el_min, el_max, w_per_rad_az, h_per_rad_el]
+    # [el_min_eff, el_max_eff, w_per_rad_az, H_float]
     cam_intr = torch.tensor([
         el_min,
         el_max,
         W / (2.0 * math.pi),
-        H / (el_max - el_min),
+        float(H),
     ], device="cpu", dtype=torch.float32)
+    lidar_row_to_el = uniform_row_elevation_rad(el_min, el_max, H).to(device)
 
     # LiDAR mode: viewmatrix is still used for world→sensor. projmatrix is ignored.
     viewmatrix = torch.eye(4, device=device, dtype=torch.float32)
@@ -361,6 +366,7 @@ def test_lidar_forward_runs():
         lidar_mode=True,
         r_near=0.2,
         r_far=100.0,
+        lidar_row_to_el=lidar_row_to_el,
     )
 
     rasterizer = GaussianRasterizer(raster_settings=settings)
@@ -426,15 +432,11 @@ def test_lidar_public_viewmatrix_applies_standard_world_to_sensor_pose():
         "raydrop": torch.zeros(1, device=device, dtype=dtype),
     }
 
+    from tests._lidar_test_helpers import uniform_lidar_cfg
+    cfg_local = uniform_lidar_cfg(H, W, el_min, el_max, r_near=0.2, r_far=70.0, lidar_sigma=3.0)
     out = render_primitives(
         primitives,
-        height=H,
-        width=W,
-        el_min_rad=el_min,
-        el_max_rad=el_max,
-        r_near=0.2,
-        r_far=70.0,
-        sigma=3.0,
+        cfg_local,
         viewmatrix=viewmatrix,
         campos=torch.zeros(3, device=device, dtype=dtype),
     )
@@ -498,8 +500,9 @@ def test_lidar_forward_wraparound():
         el_min,
         el_max,
         W / (2.0 * math.pi),
-        H / (el_max - el_min),
+        float(H),
     ], device="cpu", dtype=torch.float32)
+    lidar_row_to_el = uniform_row_elevation_rad(el_min, el_max, H).to(device)
 
     viewmatrix = torch.eye(4, device=device, dtype=torch.float32)
     projmatrix = torch.eye(4, device=device, dtype=torch.float32)
@@ -529,6 +532,7 @@ def test_lidar_forward_wraparound():
         lidar_mode=True,
         r_near=0.2,
         r_far=100.0,
+        lidar_row_to_el=lidar_row_to_el,
     )
 
     rasterizer = GaussianRasterizer(raster_settings=settings)
@@ -618,6 +622,7 @@ def test_lidar_rasterizer_named_layout():
         image_width=W,
         el_min_rad=el_min,
         el_max_rad=el_max,
+        row_to_elevation_rad=uniform_row_elevation_rad(el_min, el_max, image_height if 'image_height' in dir() else H).to(device),
         viewmatrix=viewmatrix,
         campos=campos,
     )
@@ -922,6 +927,7 @@ def test_lidar_backward_runs_and_matches_finite_diff():
     settings = make_lidar_settings(
         image_height=H, image_width=W,
         el_min_rad=el_min, el_max_rad=el_max,
+        row_to_elevation_rad=uniform_row_elevation_rad(el_min, el_max, H).to(device),
         viewmatrix=viewmatrix, campos=campos,
     )
 
@@ -1063,6 +1069,7 @@ def test_lidar_backward_matches_finite_diff_for_shape_opacity_rotation():
         image_width=W,
         el_min_rad=el_min,
         el_max_rad=el_max,
+        row_to_elevation_rad=uniform_row_elevation_rad(el_min, el_max, image_height if 'image_height' in dir() else H).to(device),
         viewmatrix=viewmatrix,
         campos=campos,
     )
@@ -1137,6 +1144,7 @@ def test_lidar_backward_matches_finite_diff_for_shape_opacity_rotation():
         image_width=64,
         el_min_rad=el_min,
         el_max_rad=el_max,
+        row_to_elevation_rad=uniform_row_elevation_rad(el_min, el_max, 16).to(device),
         viewmatrix=viewmatrix,
         campos=campos,
     )
