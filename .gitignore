@@ -46,5 +46,6 @@ CLAUDE.md
 scripts/
 tests/
 test_bbox_viz.py
+inspect_overfit_pair.py
 viz.py
 visualize_qgs_surfaces.py
