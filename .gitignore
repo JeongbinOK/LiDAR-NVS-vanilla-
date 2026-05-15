@@ -49,3 +49,6 @@ test_bbox_viz.py
 inspect_overfit_pair.py
 viz.py
 visualize_qgs_surfaces.py
+
+# Local-only method notes
+docs_method/
