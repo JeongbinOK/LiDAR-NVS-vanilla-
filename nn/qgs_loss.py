@@ -1,7 +1,7 @@
 """Phase A loss for pair-wise LiDAR rendering.
 
 Loss family:
-  - Depth         : L1 on expected depth (rendered.range) over GT hit rays
+  - Depth         : mean of expected-depth and median-depth L1 over GT hit rays
   - Intensity     : L1 on alpha-blended intensity over GT hit rays
   - Raydrop       : BCE on predicted drop probability over all rays
   - Depth distort : 2DGS depth distortion regulariser (CUDA-computed per pixel)
@@ -65,12 +65,21 @@ class QGSLoss(nn.Module):
 
         depth_gt = target["range_image"]
         intensity_gt = target["intensity_image"]
-        # Train with expected (alpha-blended) depth — smooth gradients flow to all
-        # Gaussians on the ray. Evaluation uses middepth (see eval_utils.py).
+        # Train with both expected (alpha-blended) depth and median depth. The
+        # expected term gives smooth gradients to all ray contributors, while
+        # the median term aligns the supervised depth with eval-time geometry.
         depth_pred = rendered.range
+        depth_median_pred = getattr(rendered, "middepth", rendered.range)
         intensity_pred = rendered.intensity
 
-        depth_loss = F.l1_loss(depth_pred[valid_mask], depth_gt[valid_mask]) if valid_mask.any() else rendered.range.new_zeros(())
+        if valid_mask.any():
+            depth_range_loss = F.l1_loss(depth_pred[valid_mask], depth_gt[valid_mask])
+            depth_median_loss = F.l1_loss(depth_median_pred[valid_mask], depth_gt[valid_mask])
+            depth_loss = 0.5 * (depth_range_loss + depth_median_loss)
+        else:
+            depth_range_loss = rendered.range.new_zeros(())
+            depth_median_loss = rendered.range.new_zeros(())
+            depth_loss = rendered.range.new_zeros(())
         intensity_loss = (
             F.l1_loss(intensity_pred[valid_mask], intensity_gt[valid_mask])
             if valid_mask.any()
@@ -160,6 +169,8 @@ class QGSLoss(nn.Module):
         return {
             "total": total,
             "depth": depth_loss.detach(),
+            "depth_range": depth_range_loss.detach(),
+            "depth_median": depth_median_loss.detach(),
             "intensity": intensity_loss.detach(),
             "raydrop": raydrop_loss.detach(),
             "distortion": distortion_loss.detach(),
