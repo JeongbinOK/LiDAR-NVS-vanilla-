@@ -57,7 +57,8 @@ class QGSModel(nn.Module):
 
         # Init-summary normalization.
         self.knn_k_target = int(getattr(cfg, "knn_k_target", 16))
-
+    def aaa(self, batch):
+        return out
     def _run_backbone(
         self,
         xyz: Tensor,
