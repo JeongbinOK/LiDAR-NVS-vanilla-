@@ -16,6 +16,11 @@ import os
 import sys
 import time
 import warnings
+from lightning.pytorch import Trainer
+from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
+from lightning.pytorch.loggers.wandb import WandbLogger
+from lightning.pytorch.plugins.environments import SLURMEnvironment
+from omegaconf import DictConfig, OmegaConf
 
 warnings.filterwarnings("ignore", category=FutureWarning, module="spconv")
 
@@ -484,7 +489,7 @@ def process_pair(
         return None
     t_prof = _profile_mark(profile, "load_filter", t_prof, device)
 
-    if boxes_0.numel() and boxes_1.numel():
+    if boxes_0.numel() and boxes_1.numel(): # bbox -> scene decmop해서 static/dynamic
         scene = decompose_scene(
             xyz0, xyz1, i0, i1,
             boxes_0, boxes_1,
@@ -492,7 +497,7 @@ def process_pair(
             rel_input_1_pose,
         )
     else:
-        p1_in_frame0 = (rel_input_1_pose[:3, :3] @ xyz1.T).T + rel_input_1_pose[:3, 3]
+        p1_in_frame0 = (rel_input_1_pose[:3, :3] @ xyz1.T).T + rel_input_1_pose[:3, 3] 
         scene = {
             "static_xyz": torch.cat([xyz0, p1_in_frame0], dim=0),
             "static_intensity": torch.cat([i0, i1], dim=0),
@@ -514,77 +519,79 @@ def process_pair(
     diagnostic_primitives = []
 
     dyn_list = scene["dynamic"]
-    if cfg.primitive_mode == "voxel_anchor":
-        dyn_anchor_outputs = []
-        if dyn_list:
-            dynamic_builder = _make_dynamic_anchor_builder(cfg)
-            dyn_anchor_pairs = dynamic_builder(
-                dyn_list,
-                profile=profile,
-                profile_prefix="dynamic_anchor",
-            )
-            dyn_anchor_outputs = [out for _, out in dyn_anchor_pairs]
-            _profile_count(profile, "dynamic_query_voxels", sum(out.diagnostics.get("query_voxels", 0) for out in dyn_anchor_outputs))
-            _profile_count(profile, "dynamic_final_anchors", sum(out.c_init.shape[0] for out in dyn_anchor_outputs))
-            t_prof = _profile_mark(profile, "dynamic_anchor_build", t_prof, device)
-            dyn_prims_list = model.forward_anchor_contexts_batched(
-                dyn_anchor_outputs,
-                context_type="dynamic",
-            )
-            t_prof = _profile_mark(profile, "dynamic_ptv3_head", t_prof, device)
-        else:
-            dyn_prims_list = []
-
-        static_xyz_parts = [scene["static_xyz"].to(device)]
-        static_i_parts = [scene["static_intensity"].to(device)]
-        static_t_parts = [scene["static_time"].to(device)]
-        for dyn, dyn_anchor_out, dyn_prims in zip(dyn_list, dyn_anchor_outputs, dyn_prims_list):
-            if dyn_prims is None or dyn_anchor_out.c_init.shape[0] == 0:
-                static_xyz_parts.append(dyn["fallback_xyz"].to(device))
-                static_i_parts.append(dyn["fallback_intensity"].to(device))
-                static_t_parts.append(dyn["fallback_time"].to(device))
-                continue
-            diagnostic_primitives.append(dyn_prims)
-            if dyn.get("box_0") is not None:
-                frame0_primitives.append(_transform_primitives(dyn_prims, _box_to_pose(dyn["box_0"].to(device))))
-            if dyn.get("box_1") is not None:
-                frame1_primitives.append(_transform_primitives(
-                    dyn_prims,
-                    _box1_to_frame0_pose(dyn["box_1"].to(device), rel_input_1_pose),
-                ))
-
-        static_xyz = torch.cat(static_xyz_parts, dim=0)
-        static_i = torch.cat(static_i_parts, dim=0)
-        static_t = torch.cat(static_t_parts, dim=0)
-        src = static_t
-        static_anchor_out = _make_static_anchor_builder(cfg)(
-            static_xyz,
-            static_i,
-            src,
-            pose_frame1_in_frame0=rel_input_1_pose,
+    
+    dyn_anchor_outputs = []
+    if dyn_list:
+        dynamic_builder = _make_dynamic_anchor_builder(cfg)
+        dyn_anchor_pairs = dynamic_builder(
+            dyn_list,
             profile=profile,
-            profile_prefix="static_anchor",
+            profile_prefix="dynamic_anchor",
         )
-        _profile_count(profile, "static_query_voxels", static_anchor_out.diagnostics.get("query_voxels", 0))
-        _profile_count(profile, "static_final_anchors", static_anchor_out.c_init.shape[0])
-        t_prof = _profile_mark(profile, "static_anchor_build", t_prof, device)
-        static_prims = model.forward_anchor_context(
-            static_anchor_out,
-            context_type="static",
-        )
-        t_prof = _profile_mark(profile, "static_ptv3_head", t_prof, device)
-        if static_prims is not None:
-            diagnostic_primitives.append(static_prims)
-            frame0_primitives.append(static_prims)
-            frame1_primitives.append(static_prims)
+        dyn_anchor_outputs = [out for _, out in dyn_anchor_pairs] # instance 마다 초기 QGS 생성. => bbox 개수 (foreground 용)
+
+        # _profile_count(profile, "dynamic_query_voxels", sum(out.diagnostics.get("query_voxels", 0) for out in dyn_anchor_outputs))
+        # _profile_count(profile, "dynamic_final_anchors", sum(out.c_init.shape[0] for out in dyn_anchor_outputs))
+        # t_prof = _profile_mark(profile, "dynamic_anchor_build", t_prof, device)
+
+        dyn_prims_list = model.forward_anchor_contexts_batched(
+            dyn_anchor_outputs,
+            context_type="dynamic",
+        ) # dynamic이라고 labeling.  
+
+        #t_prof = _profile_mark(profile, "dynamic_ptv3_head", t_prof, device)
     else:
-        raise ValueError(f"unsupported primitive_mode {cfg.primitive_mode!r}")
+        dyn_prims_list = [] # dyanmic이 없다. 
+
+    static_xyz_parts = [scene["static_xyz"].to(device)]
+    static_i_parts = [scene["static_intensity"].to(device)]
+    static_t_parts = [scene["static_time"].to(device)] # static의 parameter (4-channel + frame 번호) 
+    for dyn, dyn_anchor_out, dyn_prims in zip(dyn_list, dyn_anchor_outputs, dyn_prims_list):
+        if dyn_prims is None or dyn_anchor_out.c_init.shape[0] == 0:
+            static_xyz_parts.append(dyn["fallback_xyz"].to(device))
+            static_i_parts.append(dyn["fallback_intensity"].to(device))
+            static_t_parts.append(dyn["fallback_time"].to(device)) # 점과 곡면 사이 d의 평균이 k보다 크면 cut 
+            continue
+        diagnostic_primitives.append(dyn_prims)
+        if dyn.get("box_0") is not None:
+            frame0_primitives.append(_transform_primitives(dyn_prims, _box_to_pose(dyn["box_0"].to(device))))
+        if dyn.get("box_1") is not None:
+            frame1_primitives.append(_transform_primitives(
+                dyn_prims,
+                _box1_to_frame0_pose(dyn["box_1"].to(device), rel_input_1_pose),
+            )) # Gaussian initialize => foreground initialize (only in the bbox)
+
+    static_xyz = torch.cat(static_xyz_parts, dim=0)
+    static_i = torch.cat(static_i_parts, dim=0)
+    static_t = torch.cat(static_t_parts, dim=0)
+    src = static_t
+    static_anchor_out = _make_static_anchor_builder(cfg)(
+        static_xyz,
+        static_i,
+        src,
+        pose_frame1_in_frame0=rel_input_1_pose,
+        profile=profile,
+        profile_prefix="static_anchor",
+    )
+    _profile_count(profile, "static_query_voxels", static_anchor_out.diagnostics.get("query_voxels", 0))
+    _profile_count(profile, "static_final_anchors", static_anchor_out.c_init.shape[0])
+    t_prof = _profile_mark(profile, "static_anchor_build", t_prof, device)
+    static_prims = model.forward_anchor_context(
+        static_anchor_out,
+        context_type="static",
+    )
+    t_prof = _profile_mark(profile, "static_ptv3_head", t_prof, device)
+    if static_prims is not None:
+        diagnostic_primitives.append(static_prims)
+        frame0_primitives.append(static_prims)
+        frame1_primitives.append(static_prims)
+
 
     if cfg.debug_finite_check and diagnostic_primitives:
         _check_finite_prims(diagnostic_primitives, "primitives")
 
     frame0 = _concat_primitives(frame0_primitives)
-    frame1 = _concat_primitives(frame1_primitives)
+    frame1 = _concat_primitives(frame1_primitives) # spherical => 
     if not frame0 or not frame1:
         return None
     _profile_count(profile, "frame0_primitives", frame0["means3D"].shape[0])
