@@ -6,6 +6,8 @@ from torch import Tensor
 
 class TBD__(nn.Module):
     def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
     
     def forward(self, batch):
         return None

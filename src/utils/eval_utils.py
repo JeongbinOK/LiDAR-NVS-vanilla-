@@ -12,13 +12,13 @@ import torch
 from config import QGSConfig
 from models.geometry import decompose_scene
 from models.geometry.voxel_anchor import DynamicVoxelAnchorBuilder, VoxelAnchorBuilder
-from nn.lidar_geometry import (
+from utils.lidar_geometry import (
     make_lidar_ray_grid,
     points_to_lidar_maps,
     range_map_to_points,
 )
-from nn.qgs_loss import QGSLoss
-from nn.render_utils import quat_to_rotmat, render_primitives, rotmat_to_quat
+from utils.qgs_loss import QGSLoss
+from utils.render_utils import quat_to_rotmat, render_primitives, rotmat_to_quat
 
 
 def load_cfg_from_checkpoint(checkpoint_path: str) -> QGSConfig:
@@ -124,11 +124,12 @@ def transform_primitives(primitives: dict, T: torch.Tensor) -> dict:
         "opacities": primitives["opacities"],
         "intensity": primitives["intensity"],
         "latent": primitives["latent"],
+        "raydrop": primitives["raydrop"],
     }
 
 
 def concat_primitives(primitives: list[dict]) -> dict:
-    keys = ["means3D", "scales", "rotations", "opacities", "intensity", "latent"]
+    keys = ["means3D", "scales", "rotations", "opacities", "intensity", "latent", "raydrop"]
     return {key: torch.cat([p[key] for p in primitives], dim=0) for key in keys}
 
 
@@ -372,7 +373,7 @@ def gaussian_slice_stats(
     viewmatrix: torch.Tensor,
     cfg: QGSConfig,
 ) -> dict:
-    from nn.lidar_geometry import get_effective_el_bounds
+    from utils.lidar_geometry import get_effective_el_bounds
     el_min_rad, el_max_rad = get_effective_el_bounds(cfg)
     visible = _sensor_visibility_mask(
         primitives["means3D"],
@@ -734,8 +735,8 @@ def evaluate_pair_sample(
     )
     _record_memory("render_frame1", device_t, memory_records)
 
-    loss0 = loss_fn(rendered0, target0, rendered0.raydrop)
-    loss1 = loss_fn(rendered1, target1, rendered1.raydrop)
+    loss0 = loss_fn(rendered0, target0, rendered0.raydrop, ray_grid)
+    loss1 = loss_fn(rendered1, target1, rendered1.raydrop, ray_grid)
     total_loss = loss0["total"] + loss1["total"]
 
     frame0_data = {
