@@ -7,7 +7,7 @@ Provides:
   - `render_primitives`     : wrap a primitive dict into a `LiDARRasterizer` call
 
 GT range/intensity map generation and the spherical ray grid live in
-`nn/lidar_geometry.py` (single source of truth for row ↔ elevation ↔ ring).
+`utils/lidar_geometry.py` (single source of truth for row ↔ elevation ↔ ring).
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from torch import Tensor
 
 import diff_quadratic_rasterization as dq
 
-from nn.lidar_geometry import get_effective_el_bounds, get_row_to_elevation_rad
+from utils.lidar_geometry import get_effective_el_bounds, get_row_to_elevation_rad
 
 LiDARRasterOutput = dq.LiDARRasterOutput
 LiDARRasterizer = dq.LiDARRasterizer

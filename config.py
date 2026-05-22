@@ -13,7 +13,9 @@ OFFICIAL_FULL_PTV3_BACKBONE_PARAMS = 46_174_272
 
 
 def resolve_lidar_latent_dim(lidar_latent_dim: int | None = None) -> int:
-    """Resolve/check the latent width against the compiled rasterizer extension."""
+    """Resolve/check the latent width against the compiled rasterizer extension.
+        CUDA rasterizer 가 빌드한 LIDAR_LATENT_DIM과 config의 lidar_latent_dim이 일치하는지 확인하고, None이면 빌드된 값 사용.
+    """
     from diff_quadratic_rasterization import LIDAR_LATENT_DIM
 
     built_dim = int(LIDAR_LATENT_DIM)
@@ -33,24 +35,13 @@ def resolve_lidar_latent_dim(lidar_latent_dim: int | None = None) -> int:
 @dataclass
 class QGSConfig:
     """Hyperparameters for the QGS pipeline."""
-
+    #######################
     # Backbone
     feature_dim: int = 64
     primitive_mode: str = "voxel_anchor"  # voxel-anchor primitives only
-    anchor_token_dim: int = 22      # voxel-anchor token width consumed by PTv3 in voxel_anchor mode
     ptv3_model_in_channels: int | None = None  # None resolves to mode feature width; kept for legacy configs
 
     # PTv3 default backbone settings (aligned to outputs/train_044)
-    ptv3_grid_size: float = 0.1
-    ptv3_stride: tuple = (2, 2)  # full=(2, 2, 2, 2), mid=(2, 2, 2), small=(2, 2)
-    ptv3_enc_depths: tuple = (2, 2, 4)  # full=(2, 2, 2, 6, 2), mid=(2, 2, 2, 4), small=(2, 2, 4)
-    ptv3_enc_channels: tuple = (32, 64, 128)  # full=(32, 64, 128, 256, 512), mid=(32, 64, 128, 256), small=(32, 64, 128)
-    ptv3_enc_num_head: tuple = (2, 4, 8)  # full=(2, 4, 8, 16, 32), mid=(2, 4, 8, 16), small=(2, 4, 8)
-    ptv3_enc_patch_size: tuple = (1024, 1024, 1024)  # full=(1024, 1024, 1024, 1024, 1024), mid=(1024, 1024, 1024, 1024), small=(1024, 1024, 1024)
-    ptv3_dec_depths: tuple = (2, 2)  # full=(2, 2, 2, 2), mid=(2, 2, 2), small=(2, 2)
-    ptv3_dec_channels: tuple = (64, 128)  # full=(64, 64, 128, 256), mid=(64, 64, 128), small=(64, 128)
-    ptv3_dec_num_head: tuple = (4, 8)  # full=(4, 4, 8, 16), mid=(4, 4, 8), small=(4, 8)
-    ptv3_dec_patch_size: tuple = (1024, 1024)  # full=(1024, 1024, 1024, 1024), mid=(1024, 1024, 1024), small=(1024, 1024)
     ptv3_enable_flash: bool = True
     ptv3_conv_algo: str = "native"    # "auto" | "native" | "mask_implicit_gemm" | "mask_split_implicit_gemm"
     ptv3_batch_norm_eval: bool = True
@@ -108,6 +99,7 @@ class QGSConfig:
          -9.33,  -8.00,  -6.66,  -5.33,  -4.00,  -2.67,  -1.33,   0.00,
           1.33,   2.67,   4.00,   5.33,   6.67,   8.00,   9.33,  10.67,
     )
+
     # Legacy linear-FOV fields (deprecated; kept as tombstones so older
     # checkpoints' config.json reload without raising). The runtime path never
     # reads these — see __post_init__.
@@ -125,7 +117,7 @@ class QGSConfig:
     loss_w_distortion: float = 0.05   # 2DGS depth distortion regulariser
     loss_w_normal: float = 0.05       # QGS curvature-aware normal consistency
 
-    # Preprocessing
+    #Preprocessing
     ego_radius: float = 2.5
 
     # Training
@@ -240,3 +232,52 @@ class QGSConfig:
         ):
             return OFFICIAL_FULL_PTV3_BACKBONE_PARAMS
         return None
+
+    #######################
+
+
+
+
+    # Backbone
+    
+    anchor_token_dim: int = 22      # voxel-anchor token width consumed by PTv3 in voxel_anchor mode
+    ptv3_model_in_channels: int | None = None  # None resolves to mode feature width; kept for legacy configs
+
+    # PTv3 default backbone settings (aligned to outputs/train_044)
+    ptv3_grid_size: float = 0.1
+    ptv3_stride: tuple = (2, 2)  # full=(2, 2, 2, 2), mid=(2, 2, 2), small=(2, 2)
+    ptv3_enc_depths: tuple = (2, 2, 4)  # full=(2, 2, 2, 6, 2), mid=(2, 2, 2, 4), small=(2, 2, 4)
+    ptv3_enc_channels: tuple = (32, 64, 128)  # full=(32, 64, 128, 256, 512), mid=(32, 64, 128, 256), small=(32, 64, 128)
+    ptv3_enc_num_head: tuple = (2, 4, 8)  # full=(2, 4, 8, 16, 32), mid=(2, 4, 8, 16), small=(2, 4, 8)
+    ptv3_enc_patch_size: tuple = (1024, 1024, 1024)  # full=(1024, 1024, 1024, 1024, 1024), mid=(1024, 1024, 1024, 1024), small=(1024, 1024, 1024)
+    ptv3_dec_depths: tuple = (2, 2)  # full=(2, 2, 2, 2), mid=(2, 2, 2), small=(2, 2)
+    ptv3_dec_channels: tuple = (64, 128)  # full=(64, 64, 128, 256), mid=(64, 64, 128), small=(64, 128)
+    ptv3_dec_num_head: tuple = (4, 8)  # full=(4, 4, 8, 16), mid=(4, 4, 8), small=(4, 8)
+    ptv3_dec_patch_size: tuple = (1024, 1024)  # full=(1024, 1024, 1024, 1024), mid=(1024, 1024, 1024), small=(1024, 1024)
+    
+
+    # QGS head
+    
+
+    # Local quadric init / k-NN
+ 
+
+    # Voxel-anchor primitive generation
+    
+    # LiDAR rasterizer (spherical projection)
+    
+    # Loss weights
+
+   
+    # Preprocessing
+    
+    # Training
+
+    
+    # Data
+    
+
+    # Device
+    
+
+    # Debug

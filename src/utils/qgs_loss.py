@@ -20,7 +20,7 @@ from torch import Tensor
 
 import diff_quadratic_rasterization as dq
 from diff_quadratic_rasterization import LiDARRasterOutput
-from nn.render_utils import build_gt_normal_map
+from utils.render_utils import build_gt_normal_map
 
 # DISTORTION_OFFSET and CURV_DISTORTION_OFFSET are not re-exported by the
 # Python wrapper, so compute from the base offset (channel_layout.h).

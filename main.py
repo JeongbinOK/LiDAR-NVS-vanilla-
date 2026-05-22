@@ -13,8 +13,8 @@ from lightning.pytorch.loggers.wandb import WandbLogger
 from lightning.pytorch.plugins.environments import SLURMEnvironment
 from omegaconf import DictConfig, OmegaConf
 
-from src.models.model_wrapper import ModelWrapper
-from dataLoader import dataset_dict
+from src.model_wrapper import ModelWrapper
+from dataloader import dataset_dict
 
 def main(cfg):
     parser = argparse.ArgumentParser()
