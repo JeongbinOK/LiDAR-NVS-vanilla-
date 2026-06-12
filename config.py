@@ -109,39 +109,39 @@ class QGSConfig:
     r_near: float = 0.2
     r_far: float = 70.0
 
-    # Loss weights
-    loss_w_range: float = 1.0
-    loss_w_intensity: float = 0.1
-    loss_alpha_eps: float = 0.5
-    loss_w_raydrop: float = 0.1
-    loss_w_distortion: float = 0.05   # 2DGS depth distortion regulariser
-    loss_w_normal: float = 0.05       # QGS curvature-aware normal consistency
+    # # Loss weights
+    # loss_w_range: float = 1.0
+    # loss_w_intensity: float = 0.1
+    # loss_alpha_eps: float = 0.5
+    # loss_w_raydrop: float = 0.1
+    # loss_w_distortion: float = 0.05   # 2DGS depth distortion regulariser
+    # loss_w_normal: float = 0.05       # QGS curvature-aware normal consistency
 
     #Preprocessing
     ego_radius: float = 2.5
 
-    # Training
-    lr: float = 5e-4                    # legacy single-lr; ignored when lr_backbone/lr_head set
-    lr_backbone: float = 1e-4           # PTv3 + flash-attn (bf16) is sensitive to large lr
-    lr_head: float = 5e-4               # head MLPs tolerate higher lr (lower than 1e-3 to dampen alpha-range cycle)
-    warmup_iters: int = 500             # linear warmup over this many optimizer steps
-    weight_decay: float = 1e-4
-    grad_clip: float = 1.0
-    num_epochs: int = 30
-    batch_size: int = 2
+    # # Training
+    # lr: float = 5e-4                    # legacy single-lr; ignored when lr_backbone/lr_head set
+    # lr_backbone: float = 1e-4           # PTv3 + flash-attn (bf16) is sensitive to large lr
+    # lr_head: float = 5e-4               # head MLPs tolerate higher lr (lower than 1e-3 to dampen alpha-range cycle)
+    # warmup_iters: int = 500             # linear warmup over this many optimizer steps
+    # weight_decay: float = 1e-4
+    # grad_clip: float = 1.0
+    # num_epochs: int = 30
+    # batch_size: int = 2
 
-    # Data
-    data_root: str = "/data1/nuScenes"
-    nuscenes_version: str = "v1.0-trainval"
-    train_split: str = "train"
-    eval_split: str = "val"
-    frame_gap: int = 2                  # 1 → 0.5 s gap, 2 → 1.0 s gap (Phase B target)
-    dataset_mode: str = "bbox"           # "nvs" | "bbox" (Phase A=nvs; Phase B switches to bbox)
-    bbox_json_path: str = "bbox/tracking_{split}.json"    # {split} resolves to train_split/eval_split; "" = GT annotations
-    num_workers: int = 4                # DataLoader worker count
+    # # Data
+    # data_root: str = "/data1/nuScenes"
+    # nuscenes_version: str = "v1.0-trainval"
+    # train_split: str = "train"
+    # eval_split: str = "val"
+    # frame_gap: int = 2                  # 1 → 0.5 s gap, 2 → 1.0 s gap (Phase B target)
+    # dataset_mode: str = "bbox"           # "nvs" | "bbox" (Phase A=nvs; Phase B switches to bbox)
+    # bbox_json_path: str = "bbox/tracking_{split}.json"    # {split} resolves to train_split/eval_split; "" = GT annotations
+    # num_workers: int = 4                # DataLoader worker count
 
-    # Device
-    device: str = "cuda"
+    # # Device
+    # device: str = "cuda"
 
     # Debug
     debug_finite_check: bool = False  # log non-finite forward boundaries in process_pair
@@ -255,29 +255,3 @@ class QGSConfig:
     ptv3_dec_num_head: tuple = (4, 8)  # full=(4, 4, 8, 16), mid=(4, 4, 8), small=(4, 8)
     ptv3_dec_patch_size: tuple = (1024, 1024)  # full=(1024, 1024, 1024, 1024), mid=(1024, 1024, 1024), small=(1024, 1024)
     
-
-    # QGS head
-    
-
-    # Local quadric init / k-NN
- 
-
-    # Voxel-anchor primitive generation
-    
-    # LiDAR rasterizer (spherical projection)
-    
-    # Loss weights
-
-   
-    # Preprocessing
-    
-    # Training
-
-    
-    # Data
-    
-
-    # Device
-    
-
-    # Debug

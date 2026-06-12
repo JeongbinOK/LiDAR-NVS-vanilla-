@@ -7,39 +7,41 @@ import os
 import sys
 import time
 import warnings
+
+from torch.utils.data import DataLoader
 from lightning.pytorch import Trainer
 from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.loggers.wandb import WandbLogger
 from lightning.pytorch.plugins.environments import SLURMEnvironment
 from omegaconf import DictConfig, OmegaConf
-
+from pytorch_lightning.strategies import DDPStrategy
 from src.model_wrapper import ModelWrapper
-from dataloader import dataset_dict
+from src.models_new.utils.model_utils import StepTracker, DataModule
+from src.dataloader import dataset_dict
+
+import os
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+
 
 def main(cfg):
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", type=str, default="eval",
-                        help="train/eval, defaul=eval")
-
-
-
-    # Wandb logging => 필요한 거 올리기 (추후 얘기)
+    os.makedirs(cfg.logger.dir, exist_ok=True)
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
     callbacks = []
-    if cfg_dict.wandb.mode != "disabled":
+    if cfg.logger.enable:
+        os.environ["WANDB__SERVICE_WAIT"] = "300"
         logger = WandbLogger(
-            project=cfg_dict.wandb.project,
-            mode=cfg_dict.wandb.mode,
-            name=f"{cfg_dict.wandb.name} ({output_dir.parent.name}/{output_dir.name})",
-            save_dir=output_dir,
-            config=OmegaConf.to_container(cfg_dict),
+            project=cfg.project_name,
+            name=cfg.exp_name,
+            save_dir=cfg.logger.dir,
+            config=OmegaConf.to_container(cfg),
         )
         callbacks.append(LearningRateMonitor("step", True))
 
         # On rank != 0, wandb.run is None.
-        if wandb.run is not None:
-            wandb.run.log_code("src")
+        # if wandb.run is not None:
+        #     wandb.run.log_code("src")
     else:
-        logger = LocalLogger()
+        logger = None
     checkpoint_callback = ModelCheckpoint(
         dirpath=cfg.logger.dir,        # Path where checkpoints will be saved
         filename='{epoch}',        # Filename for the checkpoints
@@ -48,61 +50,42 @@ def main(cfg):
         save_on_train_epoch_end=True,  # Ensure it saves at the end of an epoch, not the beginning
     )
 
-    checkpoint_path = update_checkpoint_path(cfg.checkpointing.load, cfg.wandb)
     step_tracker = StepTracker()
-
     trainer = Trainer(
-        max_epochs=cfg.trainer.max_epochs,
+        max_epochs=cfg.train.max_epochs,
         accelerator="gpu",
         logger=logger,
-        devices="auto",
+        devices=cfg.device,
         strategy=(
             "ddp_find_unused_parameters_true"
-            if torch.cuda.device_count() > 1
+            if len(cfg.device) > 1
             else "auto"
         ),
-        callbacks=callbacks,
-        val_check_interval=cfg.trainer.val_check_interval,
-        enable_progress_bar=False if cfg.mode == "train" else True,
+        callbacks=[checkpoint_callback],
+        val_check_interval=cfg.train.val_check_interval,
+        enable_progress_bar=True,
         # gradient_clip_val=cfg.trainer.gradient_clip_val,
-        max_steps=cfg.trainer.max_steps,
-        limit_test_batches=cfg.trainer.limit_test_batches,
+        max_steps=cfg.train.max_steps,
+        precision = "32"
     )
     #torch.manual_seed(cfg_dict.seed + trainer.global_rank)
 
 
-    model_wrapper = ModelWrapper(
-        cfg,
-        step_tracker,
-    )
+    model_wrapper = ModelWrapper(cfg,step_tracker)
+    dataset = dataset_dict[cfg.data.dataset_name]
+    datamodule = DataModule(dataset, cfg)
 
-    if  parser.mode == "train":
-        # data loader
-        dataset = dataset_dict[cfg.dataset_name]
-        dataloader = DataLoader(dataset(cfg = cfg.dataset, split="train"), 
-                                batch_size=cfg.train.batch_size,
-                                num_workers=8, 
-                                shuffle=True,
-                                pin_memory=True,)
-        trainer.fit(model_wrapper, datamodule=dataloader, ckpt_path=checkpoint_path)
+    if  cfg.mode == "train":
+        trainer.fit(model_wrapper, datamodule=datamodule, ckpt_path=cfg.train.ckpt_path)
     else:
-        # data loader
-        dataset = dataset_dict[cfg.dataset_name]
-        dataloader = DataLoader(dataset(cfg=cfg.dataset, split="test"), 
-                                batch_size=cfg.train.batch_size,
-                                num_workers=8, 
-                                shuffle=True,
-                                pin_memory=True,)
-        trainer.test(
-            model_wrapper,
-            datamodule=dataloader,
-            ckpt_path=checkpoint_path,
-        )
+        trainer.test(model_wrapper, datamodule=datamodule, ckpt_path=cfg.test.ckpt_path)
 
 
 if __name__ == '__main__':
-
-    base_conf = OmegaConf.load('')
+    base_conf = OmegaConf.load('/data1/hyuk/LiDAR-NVS-vanilla-/config/nuscene_train.yaml')
     cli_conf = OmegaConf.from_cli()
     cfg = OmegaConf.merge(base_conf, cli_conf)
+    if 'mode' not in cfg:
+            cfg.mode = "eval"
+    print(cfg)
     main(cfg)

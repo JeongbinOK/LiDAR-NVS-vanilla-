@@ -1,0 +1,156 @@
+device: [5]
+
+project_name: bbb 
+exp_name: aaa
+
+loss:
+  loss_w_range: 1.0
+  loss_w_intensity: 0.1
+  loss_alpha_eps: 0.5
+  loss_w_raydrop: 0.1
+  loss_w_distortion: 0.05   # 2DGS depth distortion regulariser
+  loss_w_normal: 0.05       # QGS curvature-aware normal consistency
+
+train:
+  lr: 5e-4
+  lr_backbone: 1e-4           # PTv3 + flash-attn (bf16) is sensitive to large lr
+  lr_head: 5e-4               # head MLPs tolerate higher lr (lower than 1e-3 to dampen alpha-range cycle)
+  warmup_iters: 500           # linear warmup over this many optimizer steps
+  weight_decay: 1e-4
+  grad_clip: 1.0
+  max_epochs: 30
+  batch_size: 2
+  val_check_interval: 1
+  max_steps: 1000000
+  ckpt_path: null
+
+test:
+  batch_size: 1
+  ckpt_path: null
+
+data:
+  dataset_name: "nuscenes"
+  dataroot: "/data1/nuScenes"
+  version: "v1.0-trainval"
+  train_split: "train"
+  eval_split: "val"
+  max_frame_gap: 4                  # 1 → 0.5 s gap, 2 → 1.0 s gap (Phase B target)
+  mode: "bbox"          # "nvs" | "bbox" (Phase A=nvs; Phase B switches to bbox)
+  bbox_json_path: "/data/jeongbin/qgs/bbox/tracking_train.json"
+  num_workers: 4
+
+logger:
+  enable: true
+  name: wandb
+  dir: logs/${exp_name}
+
+
+
+
+
+p2g:
+  # Backbone
+  feature_dim: 64
+  primitive_mode: "voxel_anchor"
+  anchor_token_dim: 22
+
+
+
+  # PTv3 backbone
+  ptv3_backbone: 
+    grid_size: 0.1
+    model_in_channels: ${p2g.anchor_token_dim}
+    enable_flash: true
+    conv_algo: "native"
+    batch_norm_eval: true
+    decoupled_stem: true
+    pdnorm_bn: true
+    pdnorm_ln: true
+    pdnorm_decouple: true
+    condition_names: ["static", "dynamic"]
+    stride: [2, 2]
+    enc_depths: [2, 2, 4]
+    enc_channels: [32, 64, 128]
+    enc_num_head: [2, 4, 8]
+    enc_patch_size: [1024, 1024, 1024]
+    dec_depths: [2, 2]
+    dec_channels: [64, 128]
+    dec_num_head: [4, 8]
+    dec_patch_size: [1024, 1024]
+
+  int_proj:
+    in_dim: 5
+    out_dim: 64
+
+  agg_mlp: 
+    in_dim: 640
+    hidden_dim: 256
+    out_dim: 256
+
+loss:
+  w_chamfer: 0.002
+  w_depth: 1.0
+  w_intensity: 1.0 
+  w_raydrop: 1.0
+
+  # QGS head
+  qgs_head:
+    head_hidden_dim: 128
+    lidar_latent_dim: null        # None → resolved from compiled rasterizer LIDAR_LATENT_DIM
+    head_alpha_bias_init: 0.0
+    head_intensity_residual: true
+    head_center_bound: 0.3
+    rot_tilt_deg: 10.0
+    rot_spin_deg: 30.0
+    scale_log_mean_bound: 0.6931471805599453  # ln(2)
+    scale_log_gap_bound: 0.4054651081081644   # ln(1.5)
+    s3_log_bound: 0.4054651081081644          # ln(1.5)
+    s3_fallback_abs: 0.05
+    init_feature_dim: 32
+
+  gs:
+    in_dim: 128
+    out_dim: 42
+  # Local quadric init / k-NN
+  knn_k_target: 16
+  knn_k_min: 8
+  knn_chunk_size: 1024
+  quadric_gamma: 1.73
+  quadric_kappa_max: 5.0
+  quadric_eps_lambda: 0.01
+  quadric_eps_kappa: 1e-3
+  quadric_eps_s: 1e-3
+  quadric_eps_s3: 1e-4
+
+  # Voxel-anchor primitive generation
+  anchor_token_variant: "full"
+  anchor_filter_mode: "residual"
+  anchor_residual_threshold: 0.806
+  anchor_planarity_threshold: 0.2
+
+  # LiDAR rasterizer
+  lidar_height: 32
+  lidar_width: 1085
+  ring_to_elevation_deg: [
+    -30.67, -29.33, -28.00, -26.66, -25.33, -24.00, -22.67, -21.33,
+    -20.00, -18.67, -17.33, -16.00, -14.67, -13.33, -12.00, -10.67,
+     -9.33,  -8.00,  -6.66,  -5.33,  -4.00,  -2.67,  -1.33,   0.00,
+      1.33,   2.67,   4.00,   5.33,   6.67,   8.00,   9.33,  10.67,
+  ]
+  lidar_sigma: 3.0
+  r_near: 0.2
+  r_far: 70.0
+
+  # Preprocessing
+  ego_radius: 2.5
+
+  # Debug
+  debug_finite_check: false
+  debug_anomaly_batch: -1
+  debug_bad_grad_trace: true
+  debug_bad_grad_trace_max: 16
+
+g2g:
+  tbd: true
+g2p:
+  tbd: true
