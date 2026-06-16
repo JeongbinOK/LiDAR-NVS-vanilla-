@@ -31,7 +31,7 @@ import os
 import torch
 import numpy as np
 import open3d as o3d
-from ..utils.camera import cameraList_from_camInfos
+
 
 def split_by_offset(tensor, offset):
     splits = []
@@ -119,14 +119,16 @@ class Point2Gaus(nn.Module):
             nn.SiLU(),
             nn.Linear(self.agg_mlp.hidden_dim, self.agg_mlp.out_dim), # 256 -> 128 
         )
+
         self.time_agg = TimeAgg(dim=self.agg_mlp.out_dim, num_heads= 8, k_bg= 8, k_fg= 16)
 
         self.gs = cfg.gs
         self.gs_predictor = nn.Sequential(
             nn.Linear(self.gs.in_dim, self.gs.in_dim),
             nn.SiLU(),
-            nn.Linear(self.gs.in_dim, self.gs.self.out_dim),
+            nn.Linear(self.gs.in_dim, self.gs.out_dim),
         )
+        self.gs_param_split = [cfg.gs_params.position, cfg.gs_params.shs, cfg.gs_params.opacity, cfg.gs_params.scaling, cfg.gs_params.rotation]
         #self.feature_extractor = PointTransformerV3(cfg=self.cfg, finetune = True).from_pretrained("Pointcept/Utonia")
         #self.feature_condition = Conditionor(cfg=self.cfg)
         #self.gaussian_predictor = Predictor(cfg=self.cfg)
@@ -215,13 +217,23 @@ class Point2Gaus(nn.Module):
         agg_feat_i = self.intensity_agg_mlp(torch.cat([feat, self.intensity_norm(feat_i)],dim=1))
         return agg_feat_i
 
-    def forward(self, x, batch_idx, mode):
-        lidar_points, offset, batch_idx, pose, bbox = x["lidar_points"], x["offset"], x["batch_idx"],  x["pose"], x["bbox"]
+    def gs_param_split(self, feat):
+        position, shs, opacity, scaling, rotation = torch.split(feat, self.gs_param_split)
+        return {
+            "position": position,
+            "shs": shs,
+            "opacity": opacity,
+            "scaling": scaling,
+            "rotation": rotation
+        }
+
+    def forward(self, _input, batch_idx, mode):
+        lidar_points, offset, batch_idx, pose, bbox = _input["lidar_points"], _input["offset"], _input["batch_idx"],  _input["pose"], _input["bbox"]
 
 
         voxelized_points  = self.voxelizer(lidar_points,offset,pose, mode="sphere")
 
-        features = self.feature_extractor(x["ptv3_input"]) 
+        features = self.feature_extractor(_input["ptv3_input"]) 
         grid_coords = features["grid_coord"]   # (V, 3) int
         utonia_feat = features["feat"]         # (V, D)
         feat_coord  = features["coord"] /0.2       # (V, 3)
@@ -303,7 +315,8 @@ class Point2Gaus(nn.Module):
         )
 
         # GS 예측
-        gs_raw = self.gs_predictor(out_feat, out_coord)
+        gs_feat = self.gs_predictor(out_feat, out_coord)
+        gs_raw = self.gs_param_split(gs_feat)
         # gs_raw: dict of (N_valid, ...) tensors
 
         # 배치별로 분리 + box_assign 붙이기
@@ -352,8 +365,7 @@ class Point2Gaus(nn.Module):
             #   "opacity"      : (Nb, 1)
             #   "scale"        : (Nb, 2)
             #   "rotation"     : (Nb, 4)
-            #   "intensity_sh" : (Nb, 16) -> L =3 임.
-            #   "raydrop_sh"   : (Nb, 16)
+            #   "shs" : (Nb, 16) -> L =3 임.
             #   "coord"        : (Nb, 3)  frame_0 좌표계
             #   "box_assign"   : (Nb,)    -1=bg, 0~B-1=box index
             #   "bg_mask"      : (Nb,)    bool

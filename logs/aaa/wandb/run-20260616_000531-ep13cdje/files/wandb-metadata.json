@@ -1,0 +1,103 @@
+{
+  "os": "Linux-5.15.0-164-generic-x86_64-with-glibc2.35",
+  "python": "CPython 3.10.20",
+  "startedAt": "2026-06-15T15:05:31.266628Z",
+  "program": "/data1/hyuk/LiDAR-NVS-vanilla-/main.py",
+  "codePath": "main.py",
+  "codePathLocal": "main.py",
+  "git": {
+    "remote": "https://github.com/JeongbinOK/LiDAR-NVS-vanilla-.git",
+    "commit": "33f4e83ebf43f20aff24786f88f4ab93ba9042f7"
+  },
+  "email": "mongyong2@g.skku.edu",
+  "root": "logs/aaa",
+  "host": "user",
+  "executable": "/data/hyuk/miniconda3/envs/utonia/bin/python3",
+  "cpu_count": 32,
+  "cpu_count_logical": 64,
+  "gpu": "NVIDIA GeForce RTX 4090",
+  "gpu_count": 10,
+  "disk": {
+    "/": {
+      "total": "430502043648",
+      "used": "402548858880"
+    }
+  },
+  "memory": {
+    "total": "540659695616"
+  },
+  "gpu_nvidia": [
+    {
+      "name": "NVIDIA GeForce RTX 4090",
+      "memoryTotal": "25757220864",
+      "cudaCores": 16384,
+      "architecture": "Ada",
+      "uuid": "GPU-26cac03c-0d2f-03f7-70a8-299f7c47c715"
+    },
+    {
+      "name": "NVIDIA GeForce RTX 4090",
+      "memoryTotal": "25757220864",
+      "cudaCores": 16384,
+      "architecture": "Ada",
+      "uuid": "GPU-4b483346-0c0f-5618-eff7-41b7ac8eb452"
+    },
+    {
+      "name": "NVIDIA GeForce RTX 4090",
+      "memoryTotal": "25757220864",
+      "cudaCores": 16384,
+      "architecture": "Ada",
+      "uuid": "GPU-4aec2b51-d8bd-d372-9aa1-c0a2bb135693"
+    },
+    {
+      "name": "NVIDIA GeForce RTX 4090",
+      "memoryTotal": "24146608128",
+      "cudaCores": 16384,
+      "architecture": "Ada",
+      "uuid": "GPU-2880b7bd-90ea-8387-9bf9-007211ee938d"
+    },
+    {
+      "name": "NVIDIA GeForce RTX 4090",
+      "memoryTotal": "25757220864",
+      "cudaCores": 16384,
+      "architecture": "Ada",
+      "uuid": "GPU-89a83657-3a3e-a3f2-63d8-851dc4096c00"
+    },
+    {
+      "name": "NVIDIA GeForce RTX 4090",
+      "memoryTotal": "25757220864",
+      "cudaCores": 16384,
+      "architecture": "Ada",
+      "uuid": "GPU-e46e11b8-b5dc-ca5b-cd92-354ae77672ec"
+    },
+    {
+      "name": "NVIDIA GeForce RTX 4090",
+      "memoryTotal": "25757220864",
+      "cudaCores": 16384,
+      "architecture": "Ada",
+      "uuid": "GPU-63a50301-2f93-62aa-bbbd-134459c125b4"
+    },
+    {
+      "name": "NVIDIA GeForce RTX 4090",
+      "memoryTotal": "25757220864",
+      "cudaCores": 16384,
+      "architecture": "Ada",
+      "uuid": "GPU-712b858b-ee6b-ee27-7ce6-5406cc95da1e"
+    },
+    {
+      "name": "NVIDIA GeForce RTX 4090",
+      "memoryTotal": "25757220864",
+      "cudaCores": 16384,
+      "architecture": "Ada",
+      "uuid": "GPU-fb084f32-b65f-c5ac-8b54-e549e8b0f184"
+    },
+    {
+      "name": "NVIDIA GeForce RTX 4090",
+      "memoryTotal": "25757220864",
+      "cudaCores": 16384,
+      "architecture": "Ada",
+      "uuid": "GPU-024e75d5-b726-f94d-c5cc-62e9463b5d34"
+    }
+  ],
+  "cudaVersion": "12.2",
+  "writerId": "jn0nyikg8iv8ri6cyo8dotecw6iba4mv"
+}

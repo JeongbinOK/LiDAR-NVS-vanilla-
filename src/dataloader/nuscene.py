@@ -8,7 +8,7 @@ from nuscenes.utils.splits import create_splits_scenes
 from pyquaternion import Quaternion
 
 from ..models_new import utonia 
-
+from ..models_new.utils.camera import Camera
 # ────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ────────────────────────────────────────────────────────────────────────────
@@ -194,12 +194,11 @@ class NuScenesNVSDataset(Dataset):
     pose         : Tensor(V, 4, 4)   frame_i → ref_frame (frame_0) rel pose
     timestamps   : Tensor(V,)        normalised to [0, 1]
     """
- 
+    #n_input = 2 + max_input_extra
     def __init__(self, cfg, split: str):
         self.cfg           = cfg
         self.dataroot      = cfg.dataroot
         self.split         = split
-        self.max_frame_gap = cfg.max_frame_gap        # max number of frames to sample
         self.mode          = getattr(cfg, 'mode', 'bbox')   # 'nvs' | 'bbox'
         self.nusc          = NuScenes(version=cfg.version,
                                       dataroot=cfg.dataroot, verbose=False)
@@ -237,50 +236,61 @@ class NuScenesNVSDataset(Dataset):
  
         # Build a flat index: each entry is (scene_idx, anchor_frame_idx)
         # The anchor is the first frame in the 1-second window.
+
         self.index = []
         for s_idx, frames in enumerate(self.scene_frames):
             for f_idx in range(len(frames)):
                 t0 = frames[f_idx][2]
-                # Check that there are at least 2 frames within 1 s
-                available = [i for i in range(f_idx, len(frames))
-                             if frames[i][2] - t0 <= 1000000]
+                available = [
+                    i for i in range(f_idx, len(frames))
+                    if frames[i][2] - t0 <= MAX_WIN_US
+                ]
                 if len(available) >= 2:
                     self.index.append((s_idx, f_idx))
 
-        print(f"[{split}] {len(self.index)} anchors (max_frame_gap={self.max_frame_gap})")
+        print(f"[{split}] {len(self.index)} anchors ")
+
+        
  
     # ── Core sampling ────────────────────────────────────────────────────────
     
 
     def _sample_frames(self, scene_idx: int, anchor_idx: int):
         """
-        Randomly sample V frames in [2, max_frame_gap] within a 1-second
-        window starting at anchor_idx, with >=0.1 s between consecutive picks.
- 
-        Returns List[(lidar_token, sample_token, timestamp_us)]
+        0.1초 간격으로 전체 프레임 선택.
         """
-        frames    = self.scene_frames[scene_idx]
-        t0        = frames[anchor_idx][2]
-        candidates = [i for i in range(anchor_idx, len(frames))
-                      if frames[i][2] - t0 <= MAX_WIN_US]
- 
-        #V = np.random.randint(2, self.max_frame_gap + 1)
-        V =2 
-        # Greedy random selection with min-gap constraint
+        frames     = self.scene_frames[scene_idx]
+        t0         = frames[anchor_idx][2]
+        candidates = [
+            i for i in range(anchor_idx, len(frames))
+            if frames[i][2] - t0 <= MAX_WIN_US
+        ]
+
         selected = [anchor_idx]
-        pool     = candidates[1:]   # exclude anchor itself
-        np.random.shuffle(pool)
- 
-        for i in pool:
+        for i in candidates[1:]:
             t_last = frames[selected[-1]][2]
-            if frames[i][2] - t_last >= 100000:
+            if frames[i][2] - t_last >= MIN_GAP_US:
                 selected.append(i)
-            if len(selected) == V:
-                break
- 
-        # If we couldn't get V frames, just use what we have (min 2)
-        selected = sorted(selected)
+
         return [frames[i] for i in selected]
+
+    def _select_input_indices(self, V: int) -> list:
+        """
+        전체 V개 프레임 중 input으로 쓸 index 선택.
+        - 항상 포함: 0 (맨 앞), V-1 (맨 뒤)
+        - 중간에서 random으로 n_input_extra개 추가
+        """
+        n_extra = np.random.randint(0, self.cfg.max_input_extra + 1)
+        middle  = list(range(1, V - 1))
+        if middle and n_extra > 0:
+            n_extra  = min(n_extra, len(middle))
+            extra    = sorted(np.random.choice(middle, n_extra, replace=False).tolist())
+        else:
+            extra = []
+
+        input_indices = sorted(set([0] + extra + [V - 1]))
+        return input_indices
+
  
     # ── __getitem__ ──────────────────────────────────────────────────────────
  
@@ -340,7 +350,6 @@ class NuScenesNVSDataset(Dataset):
                     boxes, ids = _boxes_in_sensor_frame(
                         self.nusc, sample_tok, lidar_tok)
             else:
-                print("fucker")
                 boxes = torch.zeros((0, 7), dtype=torch.float32)
                 ids   = []
             bbox_list.append(boxes)
@@ -354,23 +363,76 @@ class NuScenesNVSDataset(Dataset):
         for pts_sensor, boxes, inst_ids in zip(all_pts_sensor, bbox_list, assigned):
             iid_list.append(_point_iid_for_frame(pts_sensor, boxes, inst_ids))
  
-        # ── Concat along point dimension ─────────────────────────────────
-        lidar_points = torch.cat(all_pts_ref, dim=0)   # (N_total, 4)
-        point_iid    = torch.cat(iid_list,    dim=0)   # (N_total,)
- 
-        # frame_counts[v] = number of points in frame v
-        frame_counts = torch.tensor([p.shape[0] for p in all_pts_ref])  # (V,)
+        # ── input index 선택 ─────────────────────────────────────────────────
+        input_indices = self._select_input_indices(V)   # ex) [0, 2, V-1]
 
+        # ── input frames ─────────────────────────────────────────────────────
+        input_pts_ref    = [all_pts_ref[i]    for i in input_indices]
+        input_pts_sensor = [all_pts_sensor[i] for i in input_indices]
+        input_bbox       = [bbox_list[i]      for i in input_indices]
+        input_iid        = [iid_list[i]       for i in input_indices]
+        input_pose       = pose[input_indices]                  # (n_input, 4, 4)
+        input_timestamps = timestamps[input_indices]            # (n_input,)
+        input_tokens     = [lidar_tokens[i]   for i in input_indices]
 
+        input_frame_counts = torch.tensor([p.shape[0] for p in input_pts_ref])
+
+        # ── gt = 전체 ────────────────────────────────────────────────────────
+        gt_frame_counts = torch.tensor([p.shape[0] for p in all_pts_ref])
+
+        # ── Camera 객체 ──────────────────────────────────────────────────────
+        input_cameras = [
+            Camera.from_nuscenes(
+                nusc=self.nusc,
+                lidar_token=lidar_tok,
+                timestamp_normalized=ts_norm,
+                pts_sensor=pts_sensor,
+                cfg=self.cfg,
+                uid=uid,
+            )
+            for uid, (lidar_tok, pts_sensor, ts_norm) in enumerate(
+                zip(input_tokens, input_pts_sensor, input_timestamps.tolist())
+            )
+        ]
+
+        gt_cameras = [
+            Camera.from_nuscenes(
+                nusc=self.nusc,
+                lidar_token=lidar_tok,
+                timestamp_normalized=ts_norm,
+                pts_sensor=pts_sensor,
+                cfg=self.cfg,
+                uid=uid,
+            )
+            for uid, (lidar_tok, pts_sensor, ts_norm) in enumerate(
+                zip(lidar_tokens, all_pts_sensor, timestamps.tolist())
+            )
+        ]
 
         return {
-            'lidar_points':  lidar_points,     # (N, 4)   ref-frame xyz + intensity
-            'lidar_points_sensor' : torch.cat(all_pts_sensor, dim=0), 
-            'frame_counts':  frame_counts,     # (V,)     needed by collate for offset
-            'bbox':          bbox_list,        # List[Tensor(B_f, 7)]  sensor frame
-            'point_iid':     point_iid,        # (N,)
-            'pose':          pose,             # (V, 4, 4)  frame_i → frame_0
-            'timestamps':    timestamps,       # (V,)
+            "input": {
+            # ── input ────────────────────────────────────────────────────────
+            'lidar_points':           torch.cat(input_pts_ref,    dim=0),  # (N_in, 4)
+            'lidar_points_sensor':    torch.cat(input_pts_sensor, dim=0),  # (N_in, 4)
+            'frame_counts':           input_frame_counts,                  # (n_input,)
+            'bbox':                   input_bbox,
+            'point_iid':              torch.cat(input_iid, dim=0),
+            'pose':                   input_pose,                          # (n_input, 4, 4)
+            'timestamps':             input_timestamps,                    # (n_input,)
+            'cameras':                input_cameras,
+            'input_indices':          torch.tensor(input_indices),         # 어떤 프레임이 input인지
+            },
+            "gt":{
+            # ── gt (전체 프레임) ──────────────────────────────────────────────
+            'gt_lidar_points':        torch.cat(all_pts_ref,    dim=0),   # (N_all, 4)
+            'gt_lidar_points_sensor': torch.cat(all_pts_sensor, dim=0),
+            'gt_frame_counts':        gt_frame_counts,                    # (V,)
+            'gt_bbox':                bbox_list,
+            'gt_point_iid':           torch.cat(iid_list, dim=0),
+            'gt_pose':                pose,                               # (V, 4, 4)
+            'gt_timestamps':          timestamps,                         # (V,)
+            'gt_cameras':             gt_cameras,
+            }
         }
 
  
@@ -379,6 +441,7 @@ class NuScenesNVSDataset(Dataset):
 # ────────────────────────────────────────────────────────────────────────────
 
 transform = utonia.transform.default(0.2, apply_z_positive=False)    
+
 def ptv3_mod(lidar_points, offset):
     coords = lidar_points[:, :3]
     return {
@@ -389,48 +452,78 @@ def ptv3_mod(lidar_points, offset):
     }
 
 def multiframe_collate_fn(batch):
-    all_pts, all_sensor_pts, all_iid, all_bidx, all_counts, all_bbox = [], [], [], [], [], []
+    all_input_pts        = []
+    all_input_sensor_pts = []
+    all_input_iid        = []
+    all_input_bidx       = []
+    all_input_counts     = []
+    all_input_bbox       = []
+    all_input_pose       = []
+    all_input_timestamps = []
+    all_input_cameras    = []
+    all_input_indices    = []
+
+    all_gt_pts        = []
+    all_gt_sensor_pts = []
+    all_gt_iid        = []
+    all_gt_counts     = []
+    all_gt_bbox       = []
+    all_gt_pose       = []
+    all_gt_timestamps = []
+    all_gt_cameras    = []
 
     for b_idx, item in enumerate(batch):
-        pts    = item['lidar_points']
-        sensor_pts = item['lidar_points_sensor']
-        counts = item['frame_counts']
-        bboxes = item['bbox']
-        N      = pts.shape[0]
+        inp = item["input"]
+        gt  = item["gt"]
 
-        all_pts.append(pts)
-        all_iid.append(item['point_iid'])
-        all_bidx.append(torch.full((N,), b_idx))
-        all_counts.append(counts)
-        all_sensor_pts.append(sensor_pts)
-        all_bbox.append(bboxes)
-    lidar_points = torch.cat(all_pts,  dim=0)
-    point_iid    = torch.cat(all_iid,  dim=0)
-    batch_idx    = torch.cat(all_bidx, dim=0)
-    lidar_points_sensor = torch.cat(all_sensor_pts, dim=0)
+        N_in = inp["lidar_points"].shape[0]
+        all_input_pts.append(inp["lidar_points"])
+        all_input_sensor_pts.append(inp["lidar_points_sensor"])
+        all_input_iid.append(inp["point_iid"])
+        all_input_bidx.append(torch.full((N_in,), b_idx))
+        all_input_counts.append(inp["frame_counts"])
+        all_input_bbox.append(inp["bbox"])
+        all_input_pose.append(inp["pose"])
+        all_input_timestamps.append(inp["timestamps"])
+        all_input_cameras.append(inp["cameras"])
+        all_input_indices.append(inp["input_indices"])
 
-    flat_counts = torch.cat(all_counts, dim=0)
-    offset      = torch.cumsum(flat_counts, dim=0)
+        all_gt_pts.append(gt["gt_lidar_points"])
+        all_gt_sensor_pts.append(gt["gt_lidar_points_sensor"])
+        all_gt_iid.append(gt["gt_point_iid"])
+        all_gt_counts.append(gt["gt_frame_counts"])
+        all_gt_bbox.append(gt["gt_bbox"])
+        all_gt_pose.append(gt["gt_pose"])
+        all_gt_timestamps.append(gt["gt_timestamps"])
+        all_gt_cameras.append(gt["gt_cameras"])
 
-    # 각 (batch, frame) 슬라이스마다 따로 transform
+    # ── input concat ─────────────────────────────────────────────────────────
+    lidar_points        = torch.cat(all_input_pts,        dim=0)
+    lidar_points_sensor = torch.cat(all_input_sensor_pts, dim=0)
+    point_iid           = torch.cat(all_input_iid,        dim=0)
+    batch_idx           = torch.cat(all_input_bidx,       dim=0)
+    flat_counts         = torch.cat(all_input_counts,     dim=0)
+    offset              = torch.cumsum(flat_counts, dim=0)
+
+    # ── gt concat ────────────────────────────────────────────────────────────
+    gt_lidar_points        = torch.cat(all_gt_pts,        dim=0)
+    gt_lidar_points_sensor = torch.cat(all_gt_sensor_pts, dim=0)
+    gt_point_iid           = torch.cat(all_gt_iid,        dim=0)
+    gt_flat_counts         = torch.cat(all_gt_counts,     dim=0)
+    gt_offset              = torch.cumsum(gt_flat_counts, dim=0)
+
+    # ── ptv3 input (input frames만) ───────────────────────────────────────────
     ptv3_coords, ptv3_grid_coords, ptv3_colors, ptv3_inverses, ptv3_feats = [], [], [], [], []
     starts = torch.cat([torch.tensor([0]), offset[:-1]])
 
-    # print("flat_counts:", flat_counts)
-    # print("offset:", offset)
-    # print("starts:", starts)
-
-
     for start, end in zip(starts.tolist(), offset.tolist()):
-        #pts_slice = lidar_points[start:end]  # (N_f, 4)
-        pts_slice_sensor = lidar_points_sensor[start:end]  # (N_f, 4)
-        #coords = pts_slice[:, :3]
-        coords_sensor = pts_slice_sensor[:,:3]
+        pts_slice_sensor = lidar_points_sensor[start:end]
+        coords_sensor    = pts_slice_sensor[:, :3]
         d = {
             "coord":  coords_sensor.numpy(),
             "color":  np.zeros_like(coords_sensor.numpy()),
             "normal": np.zeros_like(coords_sensor.numpy()),
-            "batch": offset.numpy()
+            "batch":  offset.numpy()
         }
         d = transform(d)
         ptv3_coords.append(d["coord"])
@@ -439,12 +532,9 @@ def multiframe_collate_fn(batch):
         ptv3_inverses.append(d["inverse"])
         ptv3_feats.append(d["feat"])
 
-    #print("len(ptv3_coords):", len(ptv3_coords))
-    new_counts = torch.tensor([c.shape[0] for c in ptv3_coords])
+    new_counts  = torch.tensor([c.shape[0] for c in ptv3_coords])
     ptv3_offset = torch.cumsum(new_counts, dim=0)
-    #print("new_counts:", new_counts)
-    #print("ptv3_offset:", torch.cumsum(new_counts, dim=0))
-    ptv3_input = {
+    ptv3_input  = {
         "coord":      torch.cat(ptv3_coords,      dim=0),
         "grid_coord": torch.cat(ptv3_grid_coords, dim=0),
         "color":      torch.cat(ptv3_colors,      dim=0),
@@ -454,12 +544,27 @@ def multiframe_collate_fn(batch):
     }
 
     return {
-        'lidar_points': lidar_points,
-        'offset':       offset,
-        'batch_idx':    batch_idx,
-        'bbox':         all_bbox,
-        'point_iid':    point_iid,
-        'pose':         [item['pose']       for item in batch],
-        'timestamps':   [item['timestamps'] for item in batch],
-        'ptv3_input':   ptv3_input,
+        "input": {
+            "lidar_points":        lidar_points,         # (N_in, 4)
+            "lidar_points_sensor": lidar_points_sensor,  # (N_in, 4)
+            "point_iid":           point_iid,            # (N_in,)
+            "batch_idx":           batch_idx,            # (N_in,)
+            "offset":              offset,               # (n_input * B,)
+            "bbox":                all_input_bbox,       # List[List[Tensor(B_f, 7)]]
+            "pose":                all_input_pose,       # List[Tensor(n_input, 4, 4)]
+            "timestamps":          all_input_timestamps, # List[Tensor(n_input,)]
+            "cameras":             all_input_cameras,    # List[List[Camera]]
+            "input_indices":       all_input_indices,    # List[Tensor]
+            "ptv3_input":          ptv3_input,
+        },
+        "gt": {
+            "lidar_points":        gt_lidar_points,         # (N_all, 4)
+            "lidar_points_sensor": gt_lidar_points_sensor,  # (N_all, 4)
+            "point_iid":           gt_point_iid,            # (N_all,)
+            "offset":              gt_offset,               # (V * B,)
+            "bbox":                all_gt_bbox,             # List[List[Tensor(B_f, 7)]]
+            "pose":                all_gt_pose,             # List[Tensor(V, 4, 4)]
+            "timestamps":          all_gt_timestamps,       # List[Tensor(V,)]
+            "cameras":             all_gt_cameras,          # List[List[Camera]]
+        },
     }

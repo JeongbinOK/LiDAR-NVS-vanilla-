@@ -1,28 +1,35 @@
 import torch
 import math
 from .diff_gaussian_rasterization_2d import GaussianRasterizationSettings, GaussianRasterizer
-from scene.gaussian_model import GaussianModel
-from scene.cameras import Camera
-from utils.sh_utils import eval_sh
+
+from ..utils.camera import Camera
+#from utils.sh_utils import eval_sh
+from ..utils.render import Gaussianutil
+
+ 
+
+gu = Gaussianutil
 
 
-def render(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, scaling_modifier=1.0,
-           override_color=None, env_map=None,
-           time_shift=None, other=[], mask=None, is_training=False):
+
+
+
+def render(viewpoint_camera, pc, cfg, bg_color, input_timestamp, scaling_modifier=1.0,
+           override_color=None, env_map=None, other=[], mask=None, is_training=False):
     """
     Render the scene. 
     
     Background tensor (bg_color) must be on GPU!
     """
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
-    screenspace_points = torch.zeros((pc.get_xyz.shape[0], 4), dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
+    screenspace_points = torch.zeros((pc["position"].shape[0], 4), dtype=pc["position"].dtype, requires_grad=True, device="cuda") + 0
     try:
         screenspace_points.retain_grad()
     except:
         pass
 
     # Set up rasterization configuration
-    if pipe.neg_fov:
+    if cfg.neg_fov:
         # we find that set fov as -1 slightly improves the results
         tanfovx = math.tan(-0.5)
         tanfovy = math.tan(-0.5)
@@ -39,13 +46,13 @@ def render(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: torch.Te
         scale_modifier=scaling_modifier,
         viewmatrix=viewpoint_camera.world_view_transform,
         projmatrix=viewpoint_camera.full_proj_transform,
-        sh_degree=pc.active_sh_degree,
+        sh_degree=cfg.sh_degree,
         campos=viewpoint_camera.camera_center,
         prefiltered=False,
-        debug=pipe.debug,
+        debug=cfg.debug,
         vfov=viewpoint_camera.vfov,
         hfov=viewpoint_camera.hfov,
-        scale_factor=pipe.scale_factor
+        scale_factor=cfg.scale_factor
     )
 
     assert raster_settings.bg.shape[0] == 4
@@ -53,43 +60,30 @@ def render(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: torch.Te
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
     means2D = screenspace_points
-    opacity = pc.get_opacity
-    scales = None
-    rotations = None
-    cov3D_precomp = None
 
-    if time_shift is not None:
-        means3D = pc.get_xyz_SHM(viewpoint_camera.timestamp - time_shift)
-        means3D = means3D + pc.get_inst_velocity * time_shift
-        marginal_t = pc.get_marginal_t(viewpoint_camera.timestamp - time_shift)
-    else:
-        means3D = pc.get_xyz_SHM(viewpoint_camera.timestamp)
-        marginal_t = pc.get_marginal_t(viewpoint_camera.timestamp)
 
-    if pipe.dynamic:
-        opacity = opacity * marginal_t
-
-    if pipe.compute_cov3D_python:
-        cov3D_precomp = pc.get_covariance(scaling_modifier)
-    else:
-        scales = pc.get_scaling
-        rotations = pc.get_rotation
+    #params
+    means3D = get_means3D(pc, input_timestamp)
+    opacity = gu.get_opacity(pc["opacity"])
+    scales = gu.get_scaling(pc["scales"])
+    rotations = gu.get_rotations(pc["rotations"])
+    cov3D_precomp = gu.get_covariance(scales, scaling_modifier, rotations)
+    shs = pc["shs"]
 
     # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
     # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
-    shs = None
-    colors_precomp = None
-    if override_color is None:
-        if pipe.convert_SHs_python:
-            shs_view = pc.get_features.transpose(1, 2).view(-1, 3, pc.get_max_sh_channels)
-            dir_pp = (means3D.detach() - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1)).detach()
-            dir_pp_normalized = dir_pp / dir_pp.norm(dim=1, keepdim=True)
-            sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
-            colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
-        else:
-            shs = pc.get_features
-    else:
-        colors_precomp = override_color
+    # colors_precomp = None
+    # if override_color is None:
+    #     if cfg.convert_SHs_python:
+    #         shs_view = pc["shs"]
+    #         dir_pp = (means3D.detach() - viewpoint_camera.camera_center.repeat(pc["shs"].shape[0], 1)).detach()
+    #         dir_pp_normalized = dir_pp / dir_pp.norm(dim=1, keepdim=True)
+    #         sh2rgb = eval_sh(cfg.active_sh_degree, shs_view, dir_pp_normalized)
+    #         colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
+    #     else:
+            
+    # else:
+    #     colors_precomp = override_color
 
     feature_list = other
 
@@ -102,7 +96,7 @@ def render(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: torch.Te
 
     # Prefilter
     mask = (opacity[:, 0] > 1 / 255) if mask is None else mask & (opacity[:, 0] > 1 / 255)
-    if pipe.dynamic:
+    if cfg.dynamic:
         mask = mask & (marginal_t[:, 0] > 0.05)
 
     # Rasterize visible Gaussians to image, obtain their radii (on screen).
@@ -110,7 +104,7 @@ def render(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: torch.Te
         means3D=means3D,
         means2D=means2D,
         shs=shs,
-        colors_precomp=colors_precomp,
+        colors_precomp=None,
         features=features,
         opacities=opacity,
         scales=scales,
@@ -128,27 +122,32 @@ def render(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: torch.Te
 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
+    # return {
+    #     "viewspace_points": screenspace_points,
+    #     "visibility_filter": radii > 0,
+    #     "radii": radii,
+    #     "contrib": contrib,
+    #     "depth": rendered_depth[[1]] if cfg.median_depth else rendered_depth[[0]],
+    #     "depth_mean": rendered_depth[[0]],
+    #     "depth_median": rendered_depth[[1]],
+    #     "distortion": rendered_depth[[2]],
+    #     "depth_square": rendered_depth[[3]],
+    #     "alpha": rendered_opacity,
+    #     "feature": rendered_other,
+    #     "normal": rendered_normal,
+    #     "intensity_sh": rendered_intensity_sh,
+    #     "raydrop": rendered_raydrop.clamp(0, 1)
+    # }
     return {
-        "viewspace_points": screenspace_points,
-        "visibility_filter": radii > 0,
-        "radii": radii,
-        "contrib": contrib,
-        "depth": rendered_depth[[1]] if pipe.median_depth else rendered_depth[[0]],
-        "depth_mean": rendered_depth[[0]],
-        "depth_median": rendered_depth[[1]],
-        "distortion": rendered_depth[[2]],
-        "depth_square": rendered_depth[[3]],
-        "alpha": rendered_opacity,
-        "feature": rendered_other,
+        "depth": rendered_depth[[1]] if cfg.median_depth else rendered_depth[[0]],
         "normal": rendered_normal,
         "intensity_sh": rendered_intensity_sh,
         "raydrop": rendered_raydrop.clamp(0, 1)
     }
 
-
 def render_range_map(args, cam_front: Camera, cam_back: Camera, gaussians, renderFunc, renderArgs, env_map, hw):
-    assert cam_front.towards == "forward" and cam_back.towards == "backward"
-    assert cam_front.colmap_id + args.frames == cam_back.colmap_id
+    # assert cam_front.towards == "forward" and cam_back.towards == "backward"
+    # assert cam_front.colmap_id + args.frames == cam_back.colmap_id
 
     EPS = 1e-5
     h, w = hw
@@ -216,3 +215,68 @@ def render_range_map(args, cam_front: Camera, cam_back: Camera, gaussians, rende
             raydrop_pano[:, :, breaks[0]:breaks[1]] = raydrop_render[:, :, (w - breaks[1] + breaks[0]):w]
 
     return depth_pano, intensity_sh_pano, raydrop_pano, gt_depth_pano, gt_intensity_pano
+
+
+def get_position_at_t(b_result, t_val):
+    """
+    b_result  : GausTemp output의 배치 b 결과
+    t_val     : float, 0~1 timestamp
+    """
+    position          = b_result["position"]           # (Nb, 3)
+    fg_masks          = b_result["fg_masks"]           # {box_id: (Nb,) bool}
+    velocity_segments = b_result["velocity_segments"]  # List[dict]
+    ts                = b_result["input_timestamps"]   # (n_input,)
+    device            = position.device
+
+    pos_t = position.clone()
+
+    for box_id, fg_mask in fg_masks.items():
+        if fg_mask.sum() == 0:
+            continue
+
+        displacement = torch.zeros(3, device=device)
+        for seg in range(len(velocity_segments)):
+            t_start = ts[seg].item()
+            t_end   = ts[seg + 1].item()
+
+            if t_val <= t_start:
+                break
+            elif t_val >= t_end:
+                dt_seg = t_end - t_start
+            else:
+                dt_seg = t_val - t_start
+
+            if box_id in velocity_segments[seg]:
+                displacement += velocity_segments[seg][box_id] * dt_seg
+
+        pos_t[fg_mask] = position[fg_mask] + displacement
+
+
+def get_means3D(pc, t):
+    """
+    pc["position"]          : (N, 3)
+    pc["velocity_segments"] : List[Tensor(N, 3)]  구간별 velocity
+    pc["segment_ts"]        : Tensor(n_input,)    구간 경계 timestamps
+    t                       : float, 0~1
+    """
+    position     = pc["position"]           # (N, 3)
+    vel_segs     = pc["velocity_segments"]  # List[Tensor(N, 3)]
+    seg_ts       = pc["segment_ts"]         # (n_input,)
+    device       = position.device
+
+    displacement = torch.zeros_like(position)
+
+    for seg in range(len(vel_segs)):
+        t_start = seg_ts[seg].item()
+        t_end   = seg_ts[seg + 1].item()
+
+        if t <= t_start:
+            break
+        elif t >= t_end:
+            dt_seg = t_end - t_start
+        else:
+            dt_seg = t - t_start
+
+        displacement += vel_segs[seg] * dt_seg
+
+    return position + displacement   # (N, 3)

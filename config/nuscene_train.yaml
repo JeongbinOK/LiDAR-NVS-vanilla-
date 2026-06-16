@@ -1,15 +1,13 @@
-device: [5]
+device: [3,8]
 
 project_name: bbb 
 exp_name: aaa
 
 loss:
-  loss_w_range: 1.0
-  loss_w_intensity: 0.1
-  loss_alpha_eps: 0.5
-  loss_w_raydrop: 0.1
-  loss_w_distortion: 0.05   # 2DGS depth distortion regulariser
-  loss_w_normal: 0.05       # QGS curvature-aware normal consistency
+  w_chamfer: 0.002
+  w_depth: 1.0
+  w_intensity: 1.0 
+  w_raydrop: 0.1
 
 train:
   lr: 5e-4
@@ -34,10 +32,15 @@ data:
   version: "v1.0-trainval"
   train_split: "train"
   eval_split: "val"
-  max_frame_gap: 4                  # 1 → 0.5 s gap, 2 → 1.0 s gap (Phase B target)
+  max_input_extra: 0    # 0 => 2 frames
   mode: "bbox"          # "nvs" | "bbox" (Phase A=nvs; Phase B switches to bbox)
   bbox_json_path: "/data/jeongbin/qgs/bbox/tracking_train.json"
   num_workers: 4
+  vfov: [-30.67, 10.67] 
+  hfov: [-180, 180]  
+  image_height: 32
+  image_width: 1080
+
 
 logger:
   enable: true
@@ -85,32 +88,35 @@ p2g:
   agg_mlp: 
     in_dim: 640
     hidden_dim: 256
-    out_dim: 256
+    out_dim: 240
 
-loss:
-  w_chamfer: 0.002
-  w_depth: 1.0
-  w_intensity: 1.0 
-  w_raydrop: 1.0
+
 
   # QGS head
-  qgs_head:
-    head_hidden_dim: 128
-    lidar_latent_dim: null        # None → resolved from compiled rasterizer LIDAR_LATENT_DIM
-    head_alpha_bias_init: 0.0
-    head_intensity_residual: true
-    head_center_bound: 0.3
-    rot_tilt_deg: 10.0
-    rot_spin_deg: 30.0
-    scale_log_mean_bound: 0.6931471805599453  # ln(2)
-    scale_log_gap_bound: 0.4054651081081644   # ln(1.5)
-    s3_log_bound: 0.4054651081081644          # ln(1.5)
-    s3_fallback_abs: 0.05
-    init_feature_dim: 32
+  # qgs_head:
+  #   head_hidden_dim: 128
+  #   lidar_latent_dim: null        # None → resolved from compiled rasterizer LIDAR_LATENT_DIM
+  #   head_alpha_bias_init: 0.0
+  #   head_intensity_residual: true
+  #   head_center_bound: 0.3
+  #   rot_tilt_deg: 10.0
+  #   rot_spin_deg: 30.0
+  #   scale_log_mean_bound: 0.6931471805599453  # ln(2)
+  #   scale_log_gap_bound: 0.4054651081081644   # ln(1.5)
+  #   s3_log_bound: 0.4054651081081644          # ln(1.5)
+  #   s3_fallback_abs: 0.05
+  #   init_feature_dim: 32
 
   gs:
-    in_dim: 128
-    out_dim: 42
+    in_dim: 240
+    out_dim: 26 #3+1+2+4+16
+
+  gs_params:
+    position: 3
+    opacity: 1
+    scaling: 2
+    rotation: 4
+    shs: 16
   # Local quadric init / k-NN
   knn_k_target: 16
   knn_k_min: 8
@@ -153,4 +159,13 @@ loss:
 g2g:
   tbd: true
 g2p:
-  tbd: true
+  neg_fov: true
+  active_sh_degree: 0
+  sh_degree: 3
+  debug: false
+  scale_factor: 
+  dynamic: false
+  convert_SHs_python: true
+  compute_cov3D_python: true
+  max_sh_channels: true
+
