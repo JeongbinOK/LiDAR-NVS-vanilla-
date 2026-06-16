@@ -1,4 +1,5 @@
-
+import torch.nn as nn
+import torch
 class RoPE3D(nn.Module):
     def __init__(self, dim):
         super().__init__()

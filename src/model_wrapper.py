@@ -2,10 +2,10 @@ import torch
 import json
 from pathlib import Path
 
-from src.models_new.module import Point2Gaus
+from src.models_new.module import Point2Gaus, GausTemp, GausRender
 #from src.models_new.utils.eval_utils import evaluate_pair_sample, write_ply
 from lightning.pytorch import LightningModule
-from src.models_new.utils import Loss
+from src.models_new.utils.loss import Loss
 
 class ModelWrapper(LightningModule):
     def __init__(
@@ -23,50 +23,57 @@ class ModelWrapper(LightningModule):
 
         # Set up the model.
         self.p2g_model = Point2Gaus(self.p2g_cfg)
-        self.g2g_model = GausTemp(self.g2g)
-        self.g2p_model = GausRender(self.g2p)
+        self.g2g_model = GausTemp(self.g2g_cfg)
+        self.g2p_model = GausRender(self.g2p_cfg)
         self.loss = Loss(self.cfg.loss)
         self._eval_pair_summaries: dict[str, list[dict]] = {}
  
 
     def training_step(self, batch, batch_idx):
-        out = self.p2g_model(batch, batch_idx=batch_idx, mode="train")
-        out = self.g2g_model(out, batch["render_time"])
-        depth, points_position, intensity, raydrop_map = self.g2p_model(out, batch["render_view"])
+        _input, gt = batch["input"], batch["gt"]
+        out = self.p2g_model(_input, batch_idx=batch_idx, mode="train")
+        out = self.g2g_model(out, _input["timestamp"])
+        all_renders = self.g2p_model(out, gt)
 
-        loss = self.loss(batch, depth, points_position, intensity, raydrop_map)
-        out["loss"] = loss
+        loss = self.loss(all_renders)
+        out["loss"] = loss_dict["total"]  
+        self._log_losses(loss_dict, prefix="train")
 
-        self._log_losses(loss, prefix="train")
-
-        # Tell the data loader processes about the current step.
         if self.step_tracker is not None:
             self.step_tracker.set_step(self.global_step)
-        return out["total"]
+        return out
 
 
     def test_step(self, batch, batch_idx):
-        out = self.p2g_model(batch, batch_idx=batch_idx, mode="test")
-        out = self.g2g_model(out, batch["render_time"])
-        depth, points_position, intensity, raydrop_map = self.g2p_model(out, batch["render_view"])
+        _input, gt = batch["input"], batch["gt"]
+        out = self.p2g_model(_input, batch_idx=batch_idx, mode="test")
+        out = self.g2g_model(out, _input["timestamp"])
+        all_renders = self.g2p_model(out, gt)
 
-        loss = self.loss(batch, depth, points_position, intensity, raydrop_map)
-        out["loss"] = loss
-        self._log_losses(out, prefix="test")
-        #self._write_eval_artifacts(batch, batch_idx, prefix="test")
-        return out["total"]
+        loss = self.loss(all_renders)
+        out["loss"] = loss_dict["total"]  
+        self._log_losses(loss_dict, prefix="test")
+
+        if self.step_tracker is not None:
+            self.step_tracker.set_step(self.global_step)
+        return out
 
 
     def validation_step(self, batch, batch_idx):
-        out = self.p2g_model(batch, batch_idx=batch_idx, mode="val")
-        out = self.g2g_model(out, batch["render_time"])
-        depth, points_position, intensity, raydrop_map = self.g2p_model(out, batch["render_view"])
+        _input, gt = batch["input"], batch["gt"]
+        out = self.p2g_model(_input, batch_idx=batch_idx, mode="valid")
+        out = self.g2g_model(out, _input["timestamp"])
+        all_renders = self.g2p_model(out, gt)
 
-        loss = self.loss(batch, depth, points_position, intensity, raydrop_map)
-        out["loss"] = loss
-        self._log_losses(out, prefix="val")
-        #self._write_eval_artifacts(batch, batch_idx, prefix="val")
-        return out["total"]
+        loss = self.loss(all_renders)
+        out["loss"] = loss_dict["total"]  
+        self._log_losses(loss_dict, prefix="valid")
+
+        if self.step_tracker is not None:
+            self.step_tracker.set_step(self.global_step)
+        return out
+
+
 
     def on_validation_epoch_start(self) -> None:
         self._eval_pair_summaries["val"] = []
@@ -81,14 +88,6 @@ class ModelWrapper(LightningModule):
         self._write_eval_aggregate(prefix="test")
 
     def _log_losses(self, out: dict, *, prefix: str) -> None:
-        # self.log(
-        #     f"{prefix}/num_valid_pairs",
-        #     float(out.get("num_valid_pairs", 0)),
-        #     on_step=True,
-        #     on_epoch=True,
-        #     prog_bar=False,
-        #     sync_dist=True,
-        # )
         for key, value in out.get("losses", {}).items():
             self.log(
                 f"{prefix}/{key}",
@@ -237,6 +236,7 @@ class ModelWrapper(LightningModule):
 
     # def _is_rank_zero(self) -> bool:
     #     return int(getattr(self, "global_rank", 0)) == 0
+
 
     # @staticmethod
     # def _aggregate_pair_summaries(pair_summaries: list[dict]) -> dict:
