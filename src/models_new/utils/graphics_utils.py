@@ -86,18 +86,37 @@ def focal2fov(focal, pixels):
     return 2 * math.atan(pixels / (2 * focal))
 
 
-def pano_to_lidar(range_image, vfov, hfov):
-    mask = range_image > 0
-
+def _pano_theta_phi(range_image, vfov, hfov, row_to_theta=None):
     panorama_height, panorama_width = range_image.shape[-2:]
-    theta, phi = torch.meshgrid(torch.arange(panorama_height, device=range_image.device),
-                                torch.arange(panorama_width, device=range_image.device), indexing="ij")
-
-    vertical_degree_range = vfov[1] - vfov[0]
-    theta = (90 - vfov[1] + theta / panorama_height * vertical_degree_range) * torch.pi / 180
+    row, col = torch.meshgrid(
+        torch.arange(panorama_height, device=range_image.device),
+        torch.arange(panorama_width, device=range_image.device),
+        indexing="ij",
+    )
+    if row_to_theta is None:
+        vertical_degree_range = vfov[1] - vfov[0]
+        theta = (90 - vfov[1] + row / panorama_height * vertical_degree_range) * torch.pi / 180
+    else:
+        row_to_theta = torch.as_tensor(
+            row_to_theta,
+            device=range_image.device,
+            dtype=range_image.dtype,
+        )
+        if row_to_theta.numel() != panorama_height:
+            raise ValueError(
+                f"row_to_theta length {row_to_theta.numel()} does not match height {panorama_height}"
+            )
+        theta = row_to_theta.view(panorama_height, 1).expand(panorama_height, panorama_width)
 
     horizontal_degree_range = hfov[1] - hfov[0]
-    phi = (hfov[0] + phi / panorama_width * horizontal_degree_range) * torch.pi / 180
+    phi = (hfov[0] + col / panorama_width * horizontal_degree_range) * torch.pi / 180
+    return theta, phi
+
+
+def pano_to_lidar(range_image, vfov, hfov, row_to_theta=None):
+    mask = range_image > 0
+
+    theta, phi = _pano_theta_phi(range_image, vfov, hfov, row_to_theta)
 
     dx = torch.sin(theta) * torch.sin(phi)
     dz = torch.sin(theta) * torch.cos(phi)
@@ -111,20 +130,12 @@ def pano_to_lidar(range_image, vfov, hfov):
     return points_xyz
 
 
-def depth_to_normal(range_image, vfov, hfov):
+def depth_to_normal(range_image, vfov, hfov, row_to_theta=None):
     """
         view: view camera
         depth: depthmap
     """
-    panorama_height, panorama_width = range_image.shape[-2:]
-    theta, phi = torch.meshgrid(torch.arange(panorama_height, device=range_image.device),
-                                torch.arange(panorama_width, device=range_image.device), indexing="ij")
-
-    vertical_degree_range = vfov[1] - vfov[0]
-    theta = (90 - vfov[1] + theta / panorama_height * vertical_degree_range) * torch.pi / 180
-
-    horizontal_degree_range = hfov[1] - hfov[0]
-    phi = (hfov[0] + phi / panorama_width * horizontal_degree_range) * torch.pi / 180
+    theta, phi = _pano_theta_phi(range_image, vfov, hfov, row_to_theta)
 
     dx = torch.sin(theta) * torch.sin(phi)
     dz = torch.sin(theta) * torch.cos(phi)
@@ -142,18 +153,10 @@ def depth_to_normal(range_image, vfov, hfov):
     return output
 
 
-def pano_to_lidar(range_image, vfov, hfov):
+def pano_to_lidar(range_image, vfov, hfov, row_to_theta=None):
     mask = range_image > 0
 
-    panorama_height, panorama_width = range_image.shape[-2:]
-    theta, phi = torch.meshgrid(torch.arange(panorama_height, device=range_image.device),
-                                torch.arange(panorama_width, device=range_image.device), indexing="ij")
-
-    vertical_degree_range = vfov[1] - vfov[0]
-    theta = (90 - vfov[1] + theta / panorama_height * vertical_degree_range) * torch.pi / 180
-
-    horizontal_degree_range = hfov[1] - hfov[0]
-    phi = (hfov[0] + phi / panorama_width * horizontal_degree_range) * torch.pi / 180
+    theta, phi = _pano_theta_phi(range_image, vfov, hfov, row_to_theta)
 
     dx = torch.sin(theta) * torch.sin(phi)
     dz = torch.sin(theta) * torch.cos(phi)
