@@ -23,20 +23,52 @@ __device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::
 
 	glm::vec4 *sh = ((glm::vec4 *)shs) + idx * max_coeffs;
 
-	// Use PyTorch rule for clamping: if clamping was applied,
-	// gradient becomes 0.
+	float x = dir.x;
+	float y = dir.y;
+	float z = dir.z;
+
+	// forward와 동일하게 raw SH 결과를 재계산 (채널 z=intensity, w=raydrop의 sigmoid 미분용).
+	glm::vec4 result = SH_C0 * sh[0];
+	if (deg > 0)
+	{
+		result = result - SH_C1 * y * sh[1] + SH_C1 * z * sh[2] - SH_C1 * x * sh[3];
+		if (deg > 1)
+		{
+			float xx_ = x * x, yy_ = y * y, zz_ = z * z;
+			float xy_ = x * y, yz_ = y * z, xz_ = x * z;
+			result = result +
+					 SH_C2[0] * xy_ * sh[4] +
+					 SH_C2[1] * yz_ * sh[5] +
+					 SH_C2[2] * (2.0f * zz_ - xx_ - yy_) * sh[6] +
+					 SH_C2[3] * xz_ * sh[7] +
+					 SH_C2[4] * (xx_ - yy_) * sh[8];
+			if (deg > 2)
+			{
+				result = result +
+						 SH_C3[0] * y * (3.0f * xx_ - yy_) * sh[9] +
+						 SH_C3[1] * xy_ * z * sh[10] +
+						 SH_C3[2] * y * (4.0f * zz_ - xx_ - yy_) * sh[11] +
+						 SH_C3[3] * z * (2.0f * zz_ - 3.0f * xx_ - 3.0f * yy_) * sh[12] +
+						 SH_C3[4] * x * (4.0f * zz_ - xx_ - yy_) * sh[13] +
+						 SH_C3[5] * z * (xx_ - yy_) * sh[14] +
+						 SH_C3[6] * x * (xx_ - 3.0f * yy_) * sh[15];
+			}
+		}
+	}
+	float sig_z = 1.0f / (1.0f + expf(-result.z));
+	float sig_w = 1.0f / (1.0f + expf(-result.w));
+
+	// 미사용 채널 x,y는 PyTorch clamp 규칙(0이면 gradient 0).
+	// sigmoid 채널 z,w는 체인룰: dL/draw = dL/dout * sig*(1-sig).
 	glm::vec4 dL_dRGB = dL_dcolor[idx];
 	dL_dRGB.x *= clamped[4 * idx + 0] ? 0 : 1;
 	dL_dRGB.y *= clamped[4 * idx + 1] ? 0 : 1;
-	dL_dRGB.z *= clamped[4 * idx + 2] ? 0 : 1;
-	dL_dRGB.w *= clamped[4 * idx + 3] ? 0 : 1;
+	dL_dRGB.z *= sig_z * (1.0f - sig_z);
+	dL_dRGB.w *= sig_w * (1.0f - sig_w);
 
 	glm::vec4 dRGBdx(0, 0, 0, 0);
 	glm::vec4 dRGBdy(0, 0, 0, 0);
 	glm::vec4 dRGBdz(0, 0, 0, 0);
-	float x = dir.x;
-	float y = dir.y;
-	float z = dir.z;
 
 	// Target location for this Gaussian to write SH gradients to
 	glm::vec4 *dL_dsh = dL_dshs + idx * max_coeffs;
@@ -134,6 +166,32 @@ __device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::
 }
 
 // Backward version of the rendering procedure.
+__device__ float theta_to_row_slope_from_table(float theta, const float *row_to_theta, int H)
+{
+	if (theta <= row_to_theta[0])
+		return 1.0f / fmaxf(row_to_theta[1] - row_to_theta[0], 1e-8f);
+	if (theta >= row_to_theta[H - 1])
+		return 1.0f / fmaxf(row_to_theta[H - 1] - row_to_theta[H - 2], 1e-8f);
+
+	int lo = 0;
+	int hi = H - 1;
+	while (hi - lo > 1)
+	{
+		int mid = (lo + hi) / 2;
+		if (row_to_theta[mid] <= theta)
+			lo = mid;
+		else
+			hi = mid;
+	}
+	return 1.0f / fmaxf(row_to_theta[hi] - row_to_theta[lo], 1e-8f);
+}
+
+__device__ float theta_to_row_dtheta_from_table(float theta, const float *row_to_theta, int H)
+{
+	float row_slope = theta_to_row_slope_from_table(theta, row_to_theta, H);
+	return 1.0f / fmaxf(row_slope, 1e-8f);
+}
+
 template <uint32_t C>
 __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 	renderCUDA(
@@ -164,6 +222,7 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 		const float vfov_max,
 		const float hfov_min,
 		const float hfov_max,
+		const float *row_to_theta,
 		const float scale_factor)
 {
 	// We rasterize again. Compute necessary block info.
@@ -249,10 +308,6 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 	// const float ddelx_dx = 0.5 * W;
 	// const float ddely_dy = 0.5 * H;
 
-	// vfov 角度制转弧度制
-	const float VFOV_max = MY_PI / 2 - vfov_min * MY_PI / 180;
-	const float VFOV_min = MY_PI / 2 - vfov_max * MY_PI / 180;
-
 	// hfov 角度制转弧度制
 	const float HFOV_max = hfov_max * MY_PI / 180;
 	const float HFOV_min = hfov_min * MY_PI / 180;
@@ -300,7 +355,7 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 			const float3 Tw = collected_Tw[j];
 
 			const float phi = pixf.x * (HFOV_max - HFOV_min) / W + HFOV_min;
-			const float theta = pixf.y * (VFOV_max - VFOV_min) / H + VFOV_min;
+			const float theta = row_to_theta[pix.y];
 
 			float3 k = cos(phi) * Tu - sin(phi) * Tw;
 			float3 l = sin(phi) * cos(theta) * Tu + sin(theta) * Tv + cos(phi) * cos(theta) * Tw;
@@ -531,7 +586,8 @@ __device__ void compute_transmat_aabb(
 	const float VFOV_max,
 	const float VFOV_min,
 	const float HFOV_max,
-	const float HFOV_min)
+	const float HFOV_min,
+	const float *row_to_theta)
 {
 	glm::mat3 T;
 	float3 normal;
@@ -579,7 +635,6 @@ __device__ void compute_transmat_aabb(
 	if (dL_dmean2D.x != 0 || dL_dmean2D.y != 0)
 	{
 		const float Wrange = W / (HFOV_max - HFOV_min);
-		const float Hrange = H / (VFOV_max - VFOV_min);
 
 		const float u = T[0].z;
 		const float v = T[1].z;
@@ -587,7 +642,8 @@ __device__ void compute_transmat_aabb(
 		const float r2_uw = u * u + w * w;
 		const float r_uw = sqrt(u * u + w * w);
 		const float r2 = u * u + v * v + w * w;
-		const float r = sqrt(u * u + v * v + w * w);
+		const float theta = atan2f(r_uw, -v);
+		const float Hrange = theta_to_row_slope_from_table(theta, row_to_theta, H);
 
 		dL_dT[0].z += dL_dmean2D.x * Wrange * w / r2_uw - dL_dmean2D.y * Hrange * u * v / (r_uw * r2);
 		dL_dT[1].z += dL_dmean2D.y * Hrange * r_uw / r2;
@@ -649,7 +705,8 @@ __global__ void preprocessCUDA(
 	const float VFOV_max,
 	const float VFOV_min,
 	const float HFOV_max,
-	const float HFOV_min)
+	const float HFOV_min,
+	const float *row_to_theta)
 {
 	auto idx = cg::this_grid().thread_rank();
 	if (idx >= P || !(radii[idx] > 0))
@@ -671,7 +728,8 @@ __global__ void preprocessCUDA(
 		VFOV_max,
 		VFOV_min,
 		HFOV_max,
-		HFOV_min);
+		HFOV_min,
+		row_to_theta);
 
 	if (shs)
 		computeColorFromSH(idx, D, M, (glm::vec3 *)means3D, *campos, shs, clamped, (glm::vec4 *)dL_dcolors, (glm::vec3 *)dL_dmean3Ds, (glm::vec4 *)dL_dshs);
@@ -698,7 +756,7 @@ __global__ void preprocessCUDA(
 	// dL_dmean2Ds[idx].y = (dL_du / dy_du + dL_dv / dy_dv + dL_dw / dy_dw) * 0.5 * (VFOV_max - VFOV_min) * W / H;
 
 	const float phi = atan2f(u, w);
-	// const float theta = atan2f(sqrt(u * u + w * w), -v);
+	const float theta = atan2f(sqrt(u * u + w * w), -v);
 	// const float r = sqrt(u * u + v * v + w * w);
 
 	const float du_dphi = w;  // r * sin(theta) * cos(phi)
@@ -708,7 +766,7 @@ __global__ void preprocessCUDA(
 	const float du_dtheta = -v * sin(phi);		 // r * cos(theta) * sin(phi)
 	const float dv_dtheta = sqrt(u * u + w * w); // r * sin(theta)
 	const float dw_dtheta = -v * cos(phi);		 // r * cos(theta) * cos(phi)
-	dL_dmean2Ds[idx].y = (dL_du * du_dtheta + dL_dv * dv_dtheta + dL_dw * dw_dtheta) * 0.5 * (VFOV_max - VFOV_min) * W / H;
+	dL_dmean2Ds[idx].y = (dL_du * du_dtheta + dL_dv * dv_dtheta + dL_dw * dw_dtheta) * 0.5 * theta_to_row_dtheta_from_table(theta, row_to_theta, H) * W;
 }
 
 void BACKWARD::preprocess(
@@ -738,6 +796,7 @@ void BACKWARD::preprocess(
 	const float vfov_max,
 	const float hfov_min,
 	const float hfov_max,
+	const float *row_to_theta,
 	const int width, int height)
 {
 	// vfov 角度制转弧度制
@@ -776,7 +835,8 @@ void BACKWARD::preprocess(
 		VFOV_max,
 		VFOV_min,
 		HFOV_max,
-		HFOV_min);
+		HFOV_min,
+		row_to_theta);
 }
 
 void BACKWARD::render(
@@ -807,6 +867,7 @@ void BACKWARD::render(
 	const float vfov_max,
 	const float hfov_min,
 	const float hfov_max,
+	const float *row_to_theta,
 	const float scale_factor)
 {
 	renderCUDA<NUM_CHANNELS><<<grid, block>>>(
@@ -836,5 +897,6 @@ void BACKWARD::render(
 		vfov_max,
 		hfov_min,
 		hfov_max,
+		row_to_theta,
 		scale_factor);
 }

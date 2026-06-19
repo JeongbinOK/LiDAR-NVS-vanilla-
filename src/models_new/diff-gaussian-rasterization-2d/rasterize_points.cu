@@ -59,6 +59,7 @@ RasterizeGaussiansCUDA(
 	const float vfov_max,
 	const float hfov_min,
 	const float hfov_max,
+	const torch::Tensor &row_to_theta,
 	const float scale_factor)
 {
 	if (means3D.ndimension() != 2 || means3D.size(1) != 3)
@@ -99,26 +100,45 @@ RasterizeGaussiansCUDA(
 			M = sh.size(1);
 		}
 
+		auto background_contig = background.contiguous();
+		auto means3D_contig = means3D.contiguous();
+		auto sh_contig = sh.contiguous();
+		auto colors_contig = colors.contiguous();
+		auto features_contig = features.contiguous();
+		auto opacity_contig = opacity.contiguous();
+		auto scales_contig = scales.contiguous();
+		auto rotations_contig = rotations.contiguous();
+		auto cov3D_precomp_contig = cov3D_precomp.contiguous();
+		auto mask_contig = mask.contiguous();
+		auto viewmatrix_contig = viewmatrix.contiguous();
+		auto projmatrix_contig = projmatrix.contiguous();
+		auto campos_contig = campos.contiguous();
+		auto row_to_theta_contig = row_to_theta.contiguous();
+
+		const float *sh_ptr = sh_contig.numel() > 0 ? sh_contig.data_ptr<float>() : nullptr;
+		const float *colors_ptr = colors_contig.numel() > 0 ? colors_contig.data_ptr<float>() : nullptr;
+		const float *cov3D_ptr = cov3D_precomp_contig.numel() > 0 ? cov3D_precomp_contig.data_ptr<float>() : nullptr;
+
 		rendered = CudaRasterizer::Rasterizer::forward(
 			geomFunc,
 			binningFunc,
 			imgFunc,
 			P, S, degree, M,
-			background.contiguous().data_ptr<float>(),
+			background_contig.data_ptr<float>(),
 			W, H,
-			means3D.contiguous().data_ptr<float>(),
-			sh.contiguous().data_ptr<float>(),
-			colors.contiguous().data_ptr<float>(),
-			features.contiguous().data_ptr<float>(),
-			opacity.contiguous().data_ptr<float>(),
-			scales.contiguous().data_ptr<float>(),
+			means3D_contig.data_ptr<float>(),
+			sh_ptr,
+			colors_ptr,
+			features_contig.data_ptr<float>(),
+			opacity_contig.data_ptr<float>(),
+			scales_contig.data_ptr<float>(),
 			scale_modifier,
-			rotations.contiguous().data_ptr<float>(),
-			cov3D_precomp.contiguous().data_ptr<float>(),
-			mask.contiguous().data_ptr<bool>(),
-			viewmatrix.contiguous().data_ptr<float>(),
-			projmatrix.contiguous().data_ptr<float>(),
-			campos.contiguous().data_ptr<float>(),
+			rotations_contig.data_ptr<float>(),
+			cov3D_ptr,
+			mask_contig.data_ptr<bool>(),
+			viewmatrix_contig.data_ptr<float>(),
+			projmatrix_contig.data_ptr<float>(),
+			campos_contig.data_ptr<float>(),
 			tan_fovx,
 			tan_fovy,
 			prefiltered,
@@ -133,6 +153,7 @@ RasterizeGaussiansCUDA(
 			vfov_max,
 			hfov_min,
 			hfov_max,
+			row_to_theta_contig.data_ptr<float>(),
 			scale_factor);
 	}
 	return std::make_tuple(rendered, out_contrib, out_color, out_feature, out_depth, out_T, radii, geomBuffer, binningBuffer, imgBuffer);
@@ -170,6 +191,7 @@ RasterizeGaussiansBackwardCUDA(
 	const float vfov_max,
 	const float hfov_min,
 	const float hfov_max,
+	const torch::Tensor &row_to_theta,
 	const float scale_factor)
 {
 	const int P = means3D.size(0);
@@ -198,20 +220,37 @@ RasterizeGaussiansBackwardCUDA(
 
 	if (P != 0)
 	{
+		auto background_contig = background.contiguous();
+		auto means3D_contig = means3D.contiguous();
+		auto sh_contig = sh.contiguous();
+		auto colors_contig = colors.contiguous();
+		auto features_contig = features.contiguous();
+		auto scales_contig = scales.contiguous();
+		auto rotations_contig = rotations.contiguous();
+		auto cov3D_precomp_contig = cov3D_precomp.contiguous();
+		auto viewmatrix_contig = viewmatrix.contiguous();
+		auto projmatrix_contig = projmatrix.contiguous();
+		auto campos_contig = campos.contiguous();
+		auto row_to_theta_contig = row_to_theta.contiguous();
+
+		const float *sh_ptr = sh_contig.numel() > 0 ? sh_contig.data_ptr<float>() : nullptr;
+		const float *colors_ptr = colors_contig.numel() > 0 ? colors_contig.data_ptr<float>() : nullptr;
+		const float *cov3D_ptr = cov3D_precomp_contig.numel() > 0 ? cov3D_precomp_contig.data_ptr<float>() : nullptr;
+
 		CudaRasterizer::Rasterizer::backward(P, S, degree, M, R,
-											 background.contiguous().data_ptr<float>(),
+											 background_contig.data_ptr<float>(),
 											 W, H,
-											 means3D.contiguous().data_ptr<float>(),
-											 sh.contiguous().data_ptr<float>(),
-											 colors.contiguous().data_ptr<float>(),
-											 features.contiguous().data_ptr<float>(),
-											 scales.data_ptr<float>(),
+											 means3D_contig.data_ptr<float>(),
+											 sh_ptr,
+											 colors_ptr,
+											 features_contig.data_ptr<float>(),
+											 scales_contig.data_ptr<float>(),
 											 scale_modifier,
-											 rotations.data_ptr<float>(),
-											 cov3D_precomp.contiguous().data_ptr<float>(),
-											 viewmatrix.contiguous().data_ptr<float>(),
-											 projmatrix.contiguous().data_ptr<float>(),
-											 campos.contiguous().data_ptr<float>(),
+											 rotations_contig.data_ptr<float>(),
+											 cov3D_ptr,
+											 viewmatrix_contig.data_ptr<float>(),
+											 projmatrix_contig.data_ptr<float>(),
+											 campos_contig.data_ptr<float>(),
 											 tan_fovx,
 											 tan_fovy,
 											 radii.contiguous().data_ptr<int>(),
@@ -239,6 +278,7 @@ RasterizeGaussiansBackwardCUDA(
 											 vfov_max,
 											 hfov_min,
 											 hfov_max,
+											 row_to_theta_contig.data_ptr<float>(),
 											 scale_factor);
 	}
 

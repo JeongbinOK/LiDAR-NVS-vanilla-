@@ -8,7 +8,7 @@ from ..utils.render import Gaussianutil
 
  
 
-gu = Gaussianutil
+gu = Gaussianutil(None)
 
 
 
@@ -21,8 +21,11 @@ def render(viewpoint_camera, pc, cfg, bg_color, input_timestamp, scaling_modifie
     
     Background tensor (bg_color) must be on GPU!
     """
+    render_device = pc["position"].device
+    render_dtype = pc["position"].dtype
+
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
-    screenspace_points = torch.zeros((pc["position"].shape[0], 4), dtype=pc["position"].dtype, requires_grad=True, device="cuda") + 0
+    screenspace_points = torch.zeros((pc["position"].shape[0], 4), dtype=render_dtype, requires_grad=True, device=render_device) + 0
     try:
         screenspace_points.retain_grad()
     except:
@@ -42,17 +45,18 @@ def render(viewpoint_camera, pc, cfg, bg_color, input_timestamp, scaling_modifie
         image_width=int(viewpoint_camera.image_width),
         tanfovx=tanfovx,
         tanfovy=tanfovy,
-        bg=bg_color if env_map is not None else torch.zeros(3, device="cuda"),
+        bg=bg_color.to(device=render_device, dtype=render_dtype),
         scale_modifier=scaling_modifier,
-        viewmatrix=viewpoint_camera.world_view_transform,
-        projmatrix=viewpoint_camera.full_proj_transform,
+        viewmatrix=viewpoint_camera.world_view_transform.to(device=render_device, dtype=render_dtype),
+        projmatrix=viewpoint_camera.full_proj_transform.to(device=render_device, dtype=render_dtype),
         sh_degree=cfg.sh_degree,
-        campos=viewpoint_camera.camera_center,
+        campos=viewpoint_camera.camera_center.to(device=render_device, dtype=render_dtype),
         prefiltered=False,
         debug=cfg.debug,
         vfov=viewpoint_camera.vfov,
         hfov=viewpoint_camera.hfov,
-        scale_factor=cfg.scale_factor
+        row_to_theta=viewpoint_camera.row_to_theta.to(device=render_device, dtype=render_dtype),
+        scale_factor=float(1.0 if cfg.scale_factor is None else cfg.scale_factor)
     )
 
     assert raster_settings.bg.shape[0] == 4
@@ -63,11 +67,11 @@ def render(viewpoint_camera, pc, cfg, bg_color, input_timestamp, scaling_modifie
 
 
     #params
-    means3D = get_means3D(pc, input_timestamp)
+    means3D = pc["position"]
     opacity = gu.get_opacity(pc["opacity"])
     scales = gu.get_scaling(pc["scales"])
-    rotations = gu.get_rotations(pc["rotations"])
-    cov3D_precomp = gu.get_covariance(scales, scaling_modifier, rotations)
+    rotations = gu.get_rotation(pc["rotations"])
+    cov3D_precomp = None
     shs = pc["shs"]
 
     # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
@@ -139,7 +143,8 @@ def render(viewpoint_camera, pc, cfg, bg_color, input_timestamp, scaling_modifie
     #     "raydrop": rendered_raydrop.clamp(0, 1)
     # }
     return {
-        "depth": rendered_depth[[1]] if cfg.median_depth else rendered_depth[[0]],
+        "depth": rendered_depth[[0]],          # mean: 알파 가중 기대 depth (depth loss + metric)
+        "depth_median": rendered_depth[[1]],   # median: T가 0.5를 넘는 contributor의 depth (chamfer + median loss)
         "normal": rendered_normal,
         "intensity_sh": rendered_intensity_sh,
         "raydrop": rendered_raydrop.clamp(0, 1)

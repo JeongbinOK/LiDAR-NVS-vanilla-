@@ -57,15 +57,25 @@ __device__ glm::vec4 computeColorFromSH(int idx, int deg, int max_coeffs, const 
 			}
 		}
 	}
-	result += 0.5f;
+	// 채널 매핑: x,y = 미사용 / z = intensity / w = raydrop.
+	// intensity·raydrop은 raw SH값에 per-gaussian sigmoid를 적용해 [0,1]로 bound한다.
+	// (per-gaussian 값이 [0,1]이면 알파 합성 결과도 [0,1] 유지.)
+	// sigmoid는 +0.5(legacy DC offset) 이전의 raw SH값에 적용.
+	float sig_z = 1.0f / (1.0f + expf(-result.z));
+	float sig_w = 1.0f / (1.0f + expf(-result.w));
 
-	// RGB colors are clamped to positive values. If values are
-	// clamped, we need to keep track of this for the backward pass.
+	result += 0.5f;  // legacy DC offset: 미사용 채널 x,y 에만 적용
+	result.z = sig_z;
+	result.w = sig_w;
+
+	// x,y는 기존대로 0-clamp 추적, sigmoid 채널 z,w는 (0,1)이라 clamp 불필요(false).
 	clamped[4 * idx + 0] = (result.x < 0);
 	clamped[4 * idx + 1] = (result.y < 0);
-	clamped[4 * idx + 2] = (result.z < 0);
-	clamped[4 * idx + 3] = (result.w < 0);
-	return glm::max(result, 0.0f);
+	clamped[4 * idx + 2] = false;
+	clamped[4 * idx + 3] = false;
+	result.x = fmaxf(result.x, 0.0f);
+	result.y = fmaxf(result.y, 0.0f);
+	return result;
 }
 
 // Compute a 2D-to-2D mapping matrix from a tangent plane into a image plane
@@ -124,6 +134,29 @@ __device__ float3 computePanoramaCoordinate(const float3 &mean, const float *vie
 	return {theta, phi, r};
 }
 
+__device__ float theta_to_row_from_table(float theta, const float *row_to_theta, int H)
+{
+	if (theta <= row_to_theta[0])
+		return 0.0f;
+	if (theta >= row_to_theta[H - 1])
+		return float(H - 1);
+
+	int lo = 0;
+	int hi = H - 1;
+	while (hi - lo > 1)
+	{
+		int mid = (lo + hi) / 2;
+		if (row_to_theta[mid] <= theta)
+			lo = mid;
+		else
+			hi = mid;
+	}
+	float denom = row_to_theta[hi] - row_to_theta[lo];
+	if (fabsf(denom) < 1e-8f)
+		return float(lo);
+	return float(lo) + (theta - row_to_theta[lo]) / denom;
+}
+
 // Computing the bounding box of the 2D Gaussian and its center
 // The center of the bounding box is used to create a low pass filter
 __device__ bool compute_aabb(
@@ -136,7 +169,8 @@ __device__ bool compute_aabb(
 	float VFOV_min,
 	float VFOV_max,
 	float HFOV_min,
-	float HFOV_max)
+	float HFOV_max,
+	const float *row_to_theta)
 {
 	float3 Tu = {T[0][0], T[0][1], T[0][2]};
 	float3 Tv = {T[1][0], T[1][1], T[1][2]};
@@ -159,7 +193,7 @@ __device__ bool compute_aabb(
 		float theta = atan2f(sqrt(sample_point_image.x * sample_point_image.x + sample_point_image.z * sample_point_image.z), -sample_point_image.y);
 
 		float phi_pix = (phi - HFOV_min) * W / (HFOV_max - HFOV_min);
-		float theta_pix = (theta - VFOV_min) * H / (VFOV_max - VFOV_min);
+		float theta_pix = theta_to_row_from_table(theta, row_to_theta, H);
 
 		aabb_min.x = min(aabb_min.x, phi_pix);
 		aabb_max.x = max(aabb_max.x, phi_pix);
@@ -202,6 +236,7 @@ __global__ void preprocessCUDA(
 	const float vfov_max,
 	const float hfov_min,
 	const float hfov_max,
+	const float *row_to_theta,
 	const float scale_factor,
 	float *transMats)
 {
@@ -244,13 +279,13 @@ __global__ void preprocessCUDA(
 	float2 point_image;
 	float2 aabb_min;
 	float2 aabb_max;
-	bool ok = compute_aabb(T, cutoff, point_image, aabb_min, aabb_max, W, H, VFOV_min, VFOV_max, HFOV_min, HFOV_max);
+	bool ok = compute_aabb(T, cutoff, point_image, aabb_min, aabb_max, W, H, VFOV_min, VFOV_max, HFOV_min, HFOV_max, row_to_theta);
 	if (!ok)
 		return;
 
 	// 计算点在极坐标下的影响范围
 	float2 point_image_panorama = {(mean3D_panorama.y - HFOV_min) * W / (HFOV_max - HFOV_min),
-								   (mean3D_panorama.x - VFOV_min) * H / (VFOV_max - VFOV_min)};
+								   theta_to_row_from_table(mean3D_panorama.x, row_to_theta, H)};
 
 	float radii = max(max(aabb_max.x - point_image_panorama.x, point_image_panorama.x - aabb_min.x),
 					  max(aabb_max.y - point_image_panorama.y, point_image_panorama.y - aabb_min.y));
@@ -311,6 +346,7 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 		const float vfov_max,
 		const float hfov_min,
 		const float hfov_max,
+		const float *row_to_theta,
 		const float scale_factor)
 {
 	// Identify current tile and associated min/max pixel range.
@@ -355,10 +391,6 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 	float median_depth = {0};
 	int32_t median_contributor = 0;
 
-	// vfov 角度制转弧度制
-	const float VFOV_max = MY_PI / 2 - vfov_min * MY_PI / 180;
-	const float VFOV_min = MY_PI / 2 - vfov_max * MY_PI / 180;
-
 	// hfov 角度制转弧度制
 	const float HFOV_max = hfov_max * MY_PI / 180;
 	const float HFOV_min = hfov_min * MY_PI / 180;
@@ -402,7 +434,7 @@ __global__ void __launch_bounds__(BLOCK_X *BLOCK_Y)
 			const float3 Tw = collected_Tw[j];
 
 			float phi = pixf.x * (HFOV_max - HFOV_min) / W + HFOV_min;
-			float theta = pixf.y * (VFOV_max - VFOV_min) / H + VFOV_min;
+			float theta = row_to_theta[pix.y];
 
 			float3 k = cos(phi) * Tu - sin(phi) * Tw;
 			float3 l = sin(phi) * cos(theta) * Tu + sin(theta) * Tv + cos(phi) * cos(theta) * Tw;
@@ -525,6 +557,7 @@ void FORWARD::render(
 	const float vfov_max,
 	const float hfov_min,
 	const float hfov_max,
+	const float *row_to_theta,
 	const float scale_factor)
 {
 	renderCUDA<NUM_CHANNELS><<<grid, block>>>(
@@ -547,6 +580,7 @@ void FORWARD::render(
 		vfov_max,
 		hfov_min,
 		hfov_max,
+		row_to_theta,
 		scale_factor);
 }
 
@@ -581,6 +615,7 @@ void FORWARD::preprocess(
 	const float vfov_max,
 	const float hfov_min,
 	const float hfov_max,
+	const float *row_to_theta,
 	const float scale_factor,
 	float *transMats)
 {
@@ -615,6 +650,7 @@ void FORWARD::preprocess(
 		vfov_max,
 		hfov_min,
 		hfov_max,
+		row_to_theta,
 		scale_factor,
 		transMats);
 }

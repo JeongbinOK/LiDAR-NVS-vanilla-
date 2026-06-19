@@ -243,6 +243,7 @@ int CudaRasterizer::Rasterizer::forward(
 	const float vfov_max,
 	const float hfov_min,
 	const float hfov_max,
+	const float *row_to_theta,
 	const float scale_factor)
 {
 	const float focal_y = height / (2.0f * tan_fovy);
@@ -301,6 +302,7 @@ int CudaRasterizer::Rasterizer::forward(
 				   vfov_max,
 				   hfov_min,
 				   hfov_max,
+				   row_to_theta,
 				   scale_factor,
 				   geomState.transMat),
 			   debug)
@@ -376,6 +378,7 @@ int CudaRasterizer::Rasterizer::forward(
 				   vfov_max,
 				   hfov_min,
 				   hfov_max,
+				   row_to_theta,
 				   scale_factor),
 			   debug)
 
@@ -427,6 +430,7 @@ void CudaRasterizer::Rasterizer::backward(
 	const float vfov_max,
 	const float hfov_min,
 	const float hfov_max,
+	const float *row_to_theta,
 	const float scale_factor)
 {
 	GeometryState geomState = GeometryState::fromChunk(geom_buffer, P);
@@ -473,10 +477,11 @@ void CudaRasterizer::Rasterizer::backward(
 				   dL_dopacity,
 				   dL_dcolor, dL_dfeatures, dL_dnormals,
 				   vfov_min,
-				   vfov_max,
-				   hfov_min,
-				   hfov_max,
-				   scale_factor),
+					   vfov_max,
+					   hfov_min,
+					   hfov_max,
+					   row_to_theta,
+					   scale_factor),
 			   debug)
 	// Take care of the rest of preprocessing. Was the precomputed covariance
 	// given to us or a scales/rot pair? If precomputed, pass that. If not,
@@ -505,10 +510,11 @@ void CudaRasterizer::Rasterizer::backward(
 									(glm::vec3 *)dL_dscale,
 									(glm::vec4 *)dL_drot,
 									vfov_min,
-									vfov_max,
-									hfov_min,
-									hfov_max,
-									width,
-									height),
+										vfov_max,
+										hfov_min,
+										hfov_max,
+										row_to_theta,
+										width,
+										height),
 			   debug)
 }

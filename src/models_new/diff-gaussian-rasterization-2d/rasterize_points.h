@@ -39,6 +39,7 @@ RasterizeGaussiansCUDA(
 	const float vfov_max,
 	const float hfov_min,
 	const float hfov_max,
+	const torch::Tensor& row_to_theta,
 	const float scale_factor);
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
@@ -73,6 +74,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	const float vfov_max,
 	const float hfov_min,
 	const float hfov_max,
+	const torch::Tensor& row_to_theta,
 	const float scale_factor);
 		
 torch::Tensor markVisible(

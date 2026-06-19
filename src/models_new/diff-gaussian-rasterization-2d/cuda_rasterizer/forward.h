@@ -48,6 +48,7 @@ namespace FORWARD
 					const float vfov_max,
 					const float hfov_min,
 					const float hfov_max,
+					const float *row_to_theta,
 					const float scale_factor,
 					float *transMats);
 
@@ -73,6 +74,7 @@ namespace FORWARD
 		const float vfov_max,
 		const float hfov_min,
 		const float hfov_max,
+		const float *row_to_theta,
 		const float scale_factor);
 }
 

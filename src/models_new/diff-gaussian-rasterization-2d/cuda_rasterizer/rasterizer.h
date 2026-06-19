@@ -58,6 +58,7 @@ namespace CudaRasterizer
 			const float vfov_max = 90,
 			const float hfov_min = -180,
 			const float hfov_max = 180,
+			const float *row_to_theta = nullptr,
 			const float scale_factor = 1.0);
 
 		static void backward(
@@ -101,6 +102,7 @@ namespace CudaRasterizer
 			const float vfov_max,
 			const float hfov_min,
 			const float hfov_max,
+			const float *row_to_theta,
 			const float scale_factor);
 	};
 };

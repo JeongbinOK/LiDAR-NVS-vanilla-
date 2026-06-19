@@ -94,6 +94,7 @@ class _RasterizeGaussians(torch.autograd.Function):
             raster_settings.vfov[1],
             raster_settings.hfov[0],
             raster_settings.hfov[1],
+            raster_settings.row_to_theta,
             raster_settings.scale_factor
         )
 
@@ -153,6 +154,7 @@ class _RasterizeGaussians(torch.autograd.Function):
                 raster_settings.vfov[1],
                 raster_settings.hfov[0],
                 raster_settings.hfov[1],
+                raster_settings.row_to_theta,
                 raster_settings.scale_factor)
 
         # Compute gradients for relevant tensors by invoking backward method
@@ -199,6 +201,7 @@ class GaussianRasterizationSettings(NamedTuple):
     debug: bool
     vfov: tuple
     hfov: tuple
+    row_to_theta: torch.Tensor
     scale_factor: float
 
 
@@ -228,21 +231,36 @@ class GaussianRasterizer(nn.Module):
         if ((scales is None or rotations is None) and cov3D_precomp is None) or ((scales is not None or rotations is not None) and cov3D_precomp is not None):
             raise Exception('Please provide exactly one of either scale/rotation pair or precomputed 3D covariance!')
 
+        device = means3D.device
+        dtype = means3D.dtype
+
         if shs is None:
-            shs = torch.Tensor([])
+            shs = torch.empty((0,), device=device, dtype=dtype)
+        else:
+            shs = shs.contiguous()
         if colors_precomp is None:
-            colors_precomp = torch.Tensor([])
+            colors_precomp = torch.empty((0,), device=device, dtype=dtype)
+        else:
+            colors_precomp = colors_precomp.contiguous()
         if features is None:
             features = torch.empty_like(means3D[..., :0])
 
         if scales is None:
-            scales = torch.Tensor([])
+            scales = torch.empty((0,), device=device, dtype=dtype)
+        else:
+            scales = scales.contiguous()
         if rotations is None:
-            rotations = torch.Tensor([])
+            rotations = torch.empty((0,), device=device, dtype=dtype)
+        else:
+            rotations = rotations.contiguous()
         if cov3D_precomp is None:
-            cov3D_precomp = torch.Tensor([])
+            cov3D_precomp = torch.empty((0,), device=device, dtype=dtype)
+        else:
+            cov3D_precomp = cov3D_precomp.contiguous()
         if mask is None:
-            mask = torch.ones_like(means3D[:, :1], dtype=torch.bool)
+            mask = torch.ones((means3D.shape[0],), device=device, dtype=torch.bool)
+        else:
+            mask = mask.to(device=device, dtype=torch.bool).reshape(-1).contiguous()
 
         # Invoke C++/CUDA rasterization routine
         return rasterize_gaussians(

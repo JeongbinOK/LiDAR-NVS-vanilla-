@@ -45,6 +45,7 @@ namespace BACKWARD
 		const float vfov_max,
 		const float hfov_min,
 		const float hfov_max,
+		const float *row_to_theta,
 		const float scale_factor);
 
 	void preprocess(
@@ -74,6 +75,7 @@ namespace BACKWARD
 		const float vfov_max,
 		const float hfov_min,
 		const float hfov_max,
+		const float *row_to_theta,
 		const int width, int height);
 }
 
