@@ -8,6 +8,7 @@ import sys
 import time
 import warnings
 
+import torch
 from torch.utils.data import DataLoader
 from lightning.pytorch import Trainer
 from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
@@ -20,7 +21,25 @@ from src.models_new.utils.model_utils import StepTracker, DataModule
 from src.dataloader import dataset_dict
 
 import os
-os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+# Enable only when debugging CUDA stack traces; it slows normal training.
+# os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+warnings.filterwarnings(
+    "ignore",
+    message=r"Found .* module\(s\) in eval mode at the start of training.*",
+)
+torch.set_float32_matmul_precision("high")
+
+
+def print_run_summary(cfg):
+    print(
+        "Run: "
+        f"mode={cfg.mode}, "
+        f"devices={list(cfg.device)}, "
+        f"train_batch_size={cfg.train.batch_size}, "
+        f"val_check_interval={cfg.train.val_check_interval}, "
+        f"max_epochs={cfg.train.max_epochs}, "
+        f"max_steps={cfg.train.max_steps}"
+    )
 
 
 def main(cfg):
@@ -65,6 +84,7 @@ def main(cfg):
         val_check_interval=cfg.train.val_check_interval,
         enable_progress_bar=True,
         # gradient_clip_val=cfg.trainer.gradient_clip_val,
+        accumulate_grad_batches=cfg.train.grad_accum_steps,
         max_steps=cfg.train.max_steps,
         precision = "32"
     )
@@ -82,10 +102,10 @@ def main(cfg):
 
 
 if __name__ == '__main__':
-    base_conf = OmegaConf.load('/data1/hyuk/LiDAR-NVS-vanilla-/config/nuscene_train.yaml')
+    base_conf = OmegaConf.load('/data/jeongbin/utonia/config/nuscene_train.yaml')
     cli_conf = OmegaConf.from_cli()
     cfg = OmegaConf.merge(base_conf, cli_conf)
     if 'mode' not in cfg:
             cfg.mode = "eval"
-    print(cfg)
+    print_run_summary(cfg)
     main(cfg)

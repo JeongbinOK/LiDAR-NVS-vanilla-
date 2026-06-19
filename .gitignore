@@ -9,6 +9,10 @@ __pycache__/
 *.pth
 
 logs/
+.tmp/
+.cache/
+
+
 
 # Outputs / Logs / Visualization
 outputs/

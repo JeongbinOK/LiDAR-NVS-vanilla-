@@ -30,48 +30,33 @@ class ModelWrapper(LightningModule):
  
 
     def training_step(self, batch, batch_idx):
-        _input, gt = batch["input"], batch["gt"]
-        out = self.p2g_model(_input, batch_idx=batch_idx, mode="train")
-        out = self.g2g_model(out, _input["timestamp"])
-        all_renders = self.g2p_model(out, gt)
-
-        loss = self.loss(all_renders)
-        out["loss"] = loss_dict["total"]  
-        self._log_losses(loss_dict, prefix="train")
-
-        if self.step_tracker is not None:
-            self.step_tracker.set_step(self.global_step)
-        return out
+        return self._shared_step(batch, batch_idx, prefix="train")
 
 
     def test_step(self, batch, batch_idx):
-        _input, gt = batch["input"], batch["gt"]
-        out = self.p2g_model(_input, batch_idx=batch_idx, mode="test")
-        out = self.g2g_model(out, _input["timestamp"])
-        all_renders = self.g2p_model(out, gt)
-
-        loss = self.loss(all_renders)
-        out["loss"] = loss_dict["total"]  
-        self._log_losses(loss_dict, prefix="test")
-
-        if self.step_tracker is not None:
-            self.step_tracker.set_step(self.global_step)
-        return out
+        return self._shared_step(batch, batch_idx, prefix="test")
 
 
     def validation_step(self, batch, batch_idx):
+        return self._shared_step(batch, batch_idx, prefix="val")
+
+
+    def _shared_step(self, batch, batch_idx, *, prefix: str):
         _input, gt = batch["input"], batch["gt"]
-        out = self.p2g_model(_input, batch_idx=batch_idx, mode="valid")
-        out = self.g2g_model(out, _input["timestamp"])
+        out = self.p2g_model(_input, batch_idx=batch_idx, mode=prefix)
+        out = self.g2g_model(out, _input["timestamps"])
         all_renders = self.g2p_model(out, gt)
 
-        loss = self.loss(all_renders)
-        out["loss"] = loss_dict["total"]  
-        self._log_losses(loss_dict, prefix="valid")
+        loss_dict = self.loss(all_renders)
+        self._log_losses(loss_dict, prefix=prefix, batch_size=self._batch_size(_input))
 
         if self.step_tracker is not None:
             self.step_tracker.set_step(self.global_step)
-        return out
+
+        if prefix != "train":
+            self._record_eval_summary(loss_dict, batch_idx=batch_idx, prefix=prefix)
+
+        return loss_dict["total"]
 
 
 
@@ -87,16 +72,92 @@ class ModelWrapper(LightningModule):
     def on_test_epoch_end(self) -> None:
         self._write_eval_aggregate(prefix="test")
 
-    def _log_losses(self, out: dict, *, prefix: str) -> None:
-        for key, value in out.get("losses", {}).items():
+    @staticmethod
+    def _batch_size(_input: dict) -> int:
+        pose = _input.get("pose")
+        if isinstance(pose, list):
+            return len(pose)
+        if torch.is_tensor(pose) and pose.dim() > 0:
+            return int(pose.shape[0])
+        return 1
+
+    def _log_losses(self, losses: dict, *, prefix: str, batch_size: int) -> None:
+        for key, value in losses.items():
+            if not torch.is_tensor(value):
+                continue
             self.log(
                 f"{prefix}/{key}",
                 value,
                 on_step=True,
                 on_epoch=True,
-                prog_bar=(key == "total"),
+                prog_bar=(key == "total" or key.startswith("loss_")),
                 sync_dist=True,
+                batch_size=batch_size,
             )
+
+    def _record_eval_summary(self, losses: dict, *, batch_idx: int, prefix: str) -> None:
+        summary = {
+            "epoch": int(getattr(self, "current_epoch", 0)),
+            "global_step": int(getattr(self, "global_step", 0)),
+            "batch_idx": int(batch_idx),
+        }
+        for key, value in losses.items():
+            if torch.is_tensor(value):
+                summary[key] = float(value.detach().mean().cpu())
+        self._eval_pair_summaries.setdefault(prefix, []).append(summary)
+
+    def _write_eval_aggregate(self, *, prefix: str) -> None:
+        if not self._is_rank_zero():
+            return
+        summaries = self._eval_pair_summaries.get(prefix, [])
+        if not summaries:
+            return
+
+        metric_keys = sorted(
+            key
+            for key in summaries[0].keys()
+            if key not in {"epoch", "global_step", "batch_idx"}
+        )
+        aggregate = {}
+        for key in metric_keys:
+            values = [item[key] for item in summaries if key in item]
+            if values:
+                aggregate[key] = sum(values) / len(values)
+
+        out_dir = self._eval_output_dir(prefix)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "epoch": int(getattr(self, "current_epoch", 0)),
+            "global_step": int(getattr(self, "global_step", 0)),
+            "split": prefix,
+            "num_batches": len(summaries),
+            "aggregate": aggregate,
+            "batches": summaries,
+        }
+        with open(out_dir / "aggregate_summary.json", "w") as f:
+            json.dump(payload, f, indent=2)
+
+    def _eval_output_dir(self, prefix: str) -> Path:
+        logger_dir = self._cfg_get("logger.dir", "")
+        base = Path(str(logger_dir)) if logger_dir else Path("outputs")
+        return base / f"eval_{prefix}"
+
+    def _cfg_get(self, dotted_key: str, default=None):
+        cur = self.cfg
+        for part in dotted_key.split("."):
+            if cur is None:
+                return default
+            if isinstance(cur, dict):
+                cur = cur.get(part, default)
+            else:
+                try:
+                    cur = getattr(cur, part)
+                except (AttributeError, KeyError):
+                    return default
+        return cur
+
+    def _is_rank_zero(self) -> bool:
+        return int(getattr(self, "global_rank", 0)) == 0
 
     def configure_optimizers(self):
         opt_cfg = self.cfg.train
@@ -106,8 +167,9 @@ class ModelWrapper(LightningModule):
         # weight_decay = float(
         #     getattr(opt_cfg, "weight_decay", getattr(self.p2g_cfg, "weight_decay", 0.0))
         # )
+        trainable_params = [p for p in self.p2g_model.parameters() if p.requires_grad]
         optimizer = torch.optim.AdamW(
-            self.p2g_model.parameters(),
+            trainable_params,
             lr=lr,
             weight_decay=weight_decay,
         )
