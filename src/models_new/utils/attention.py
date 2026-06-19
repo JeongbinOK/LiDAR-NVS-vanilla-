@@ -1,5 +1,9 @@
 import torch.nn as nn
 import torch
+try:
+    from flash_attn import flash_attn_varlen_func
+except ImportError:
+    flash_attn_varlen_func = None
 class RoPE3D(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -36,6 +40,8 @@ class LocalAttentionFlash(nn.Module):
         self.norm      = nn.LayerNorm(dim)
 
     def forward(self, feat, pos, k):
+        if flash_attn_varlen_func is None:
+            raise ImportError("flash_attn is required by LocalAttentionFlash.")
         N, C = feat.shape
         H, D = self.num_heads, self.head_dim
         if N <= 1:

@@ -1,3 +1,4 @@
+import torch
 import torch.nn as nn
 
 
@@ -7,7 +8,9 @@ class GausTemp(nn.Module):
         self.cfg = cfg
 
     def forward(self, x, timestamps):
-        batch_gaussians = x["batch_gaussians"]
+        batch_gaussians = x.get("batch_gaussians", x.get("gaussians"))
+        if batch_gaussians is None:
+            raise KeyError("GausTemp expected 'batch_gaussians' or 'gaussians' in Point2Gaus output.")
         results = []
 
         for b, b_gs in enumerate(batch_gaussians):
@@ -16,48 +19,33 @@ class GausTemp(nn.Module):
                 continue
 
             frame_bboxes = b_gs["frame_bboxes"]
-            fg_masks     = b_gs["fg_masks"]
-            position     = b_gs["position"]        # (Nb, 3)
-            ts           = timestamps[b]           # (n_input,) 0~1
-            pose_b       = x["pose"][b]            # (n_input, 4, 4)
-            device       = position.device
-            n_input      = len(frame_bboxes)
+            device       = b_gs["position"].device
+            ts           = timestamps[b].to(device)           # (n_input,) 0~1
+            dynamic_ids = b_gs["instance_id"][b_gs["is_dynamic"]].unique().tolist()
+            object_trajectories = {}
 
-            # 구간별 velocity: (n_input-1)개, 각 (Nb, 3)
-            velocity_segments = []
-
-            for seg in range(n_input - 1):
-                vel_seg = torch.zeros_like(position)   # (Nb, 3)
-
-                bbox_fs  = frame_bboxes[seg]["bbox"]       # (B_f, 7) sensor
-                bbox_fe  = frame_bboxes[seg + 1]["bbox"]   # (B_f, 7) sensor
-                pose_fs  = pose_b[seg].to(device)
-                pose_fe  = pose_b[seg + 1].to(device)
-                dt       = (ts[seg + 1] - ts[seg]).item()
-                dt       = max(dt, 1e-6)
-
-                for box_id, fg_mask in fg_masks.items():
-                    if fg_mask.sum() == 0:
+            for inst_id in dynamic_ids:
+                inst_id = int(inst_id)
+                boxes_for_inst = []
+                times_for_inst = []
+                for frame_idx, frame_box in enumerate(frame_bboxes):
+                    iids = frame_box["instance_id"].to(device)
+                    matches = (iids == inst_id).nonzero(as_tuple=True)[0]
+                    if matches.numel() == 0:
                         continue
-                    if box_id >= bbox_fs.shape[0] or box_id >= bbox_fe.shape[0]:
-                        continue
+                    box_idx = int(matches[0])
+                    boxes_for_inst.append(frame_box["bbox_ref"][box_idx].to(device))
+                    times_for_inst.append(ts[frame_idx])
 
-                    c_start = apply_pose(
-                        bbox_fs[box_id, :3].unsqueeze(0), pose_fs
-                    ).squeeze(0)   # (3,)
-
-                    c_end = apply_pose(
-                        bbox_fe[box_id, :3].unsqueeze(0), pose_fe
-                    ).squeeze(0)   # (3,)
-
-                    v = (c_end - c_start) / dt   # (3,)
-                    vel_seg[fg_mask] = v
-
-                velocity_segments.append(vel_seg)
+                if len(boxes_for_inst) >= 2:
+                    object_trajectories[inst_id] = {
+                        "timestamps": torch.stack(times_for_inst),
+                        "bbox_ref": torch.stack(boxes_for_inst),
+                    }
 
             b_result = {**b_gs}
-            b_result["velocity_segments"] = velocity_segments  # List[Tensor(Nb, 3)]
-            b_result["segment_ts"]        = ts                 # (n_input,)
+            b_result["object_trajectories"] = object_trajectories
+            b_result["segment_ts"] = ts
             results.append(b_result)
 
         return results

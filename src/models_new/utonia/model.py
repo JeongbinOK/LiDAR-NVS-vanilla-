@@ -912,6 +912,11 @@ def load(
 
     model = PointTransformerV3(**ckpt["config"])
     model.load_state_dict(ckpt["state_dict"])
-    n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model params: {n_parameters / 1e6:.2f}M")
+    total_parameters = sum(p.numel() for p in model.parameters())
+    trainable_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(
+        "Model params: "
+        f"total={total_parameters / 1e6:.2f}M, "
+        f"trainable={trainable_parameters / 1e6:.2f}M"
+    )
     return model

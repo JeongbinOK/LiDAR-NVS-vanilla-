@@ -112,7 +112,7 @@ class Gaussianutil:
         self.scaling_t_activation = torch.exp
         self.scaling_t_inverse_activation = torch.log
 
-        self.covariance_activation = build_covariance_from_scaling_rotation
+        self.covariance_activation = self.build_covariance_from_scaling_rotation
 
         self.opacity_activation = torch.sigmoid
         self.inverse_opacity_activation = inverse_sigmoid
@@ -129,7 +129,7 @@ class Gaussianutil:
         return self.covariance_activation(self.get_scaling(scale), scaling_modifier, self.get_rotation(rotation))
     
     def get_opacity(self, opacity):
-        return self.opacity(opacity)
+        return self.opacity_activation(opacity)
     
     def get_rotation(self, rotation):
         return self.rotation_activation(rotation)

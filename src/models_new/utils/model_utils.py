@@ -5,7 +5,6 @@ from jaxtyping import Int64
 from torch import Tensor
 from torch.multiprocessing import Manager
 import lightning.pytorch as pl
-import warnings
 from torch.utils.data import DataLoader
 
 from ...dataloader.nuscene import multiframe_collate_fn
@@ -32,11 +31,15 @@ class DataModule(pl.LightningDataModule):
         super().__init__()  
         self.dataset = dataset
         self.cfg = cfg  
+
     def train_dataloader(self):
         return DataLoader(
-            dataset=self.dataset(cfg=self.cfg.data, split="train"),
+            dataset=self.dataset(
+                cfg=self.cfg.data,
+                split=getattr(self.cfg.data, "train_split", "train"),
+            ),
             batch_size=self.cfg.train.batch_size,  
-            num_workers=8,
+            num_workers=self.cfg.data.num_workers,
             shuffle=True,
             pin_memory=True,
             collate_fn = multiframe_collate_fn
@@ -44,23 +47,25 @@ class DataModule(pl.LightningDataModule):
 
     def val_dataloader(self):  
         return DataLoader(
-            dataset=self.dataset(cfg=self.cfg.data, split="val"),
+            dataset=self.dataset(
+                cfg=self.cfg.data,
+                split=getattr(self.cfg.data, "eval_split", "val"),
+            ),
             batch_size=self.cfg.test.batch_size,  
-            num_workers=8,
+            num_workers=int(getattr(self.cfg.data, "eval_num_workers", 0)),
             shuffle=False,
             pin_memory=True,
             collate_fn = multiframe_collate_fn
         )
 
     def test_dataloader(self):
-        warnings.warn(
-            "test_dataloader에 지금 valid넣어놓음. 추후 수정",
-            UserWarning,
-        )
         return DataLoader(
-            dataset=self.dataset(cfg=self.cfg.data, split="val"),
+            dataset=self.dataset(
+                cfg=self.cfg.data,
+                split=getattr(self.cfg.data, "test_split", "test"),
+            ),
             batch_size=self.cfg.test.batch_size,  
-            num_workers=8,
+            num_workers=int(getattr(self.cfg.data, "eval_num_workers", 0)),
             shuffle=False,
             pin_memory=True,
             collate_fn = multiframe_collate_fn

@@ -104,7 +104,18 @@ class Point2Gaus(nn.Module):
         self.cfg = cfg
 
         self.voxelizer = Voxelizer(cfg=self.cfg, max_frames=4)
-        self.feature_extractor = utonia.load("utonia", repo_id="Pointcept/Utonia")
+        self.freeze_utonia = bool(getattr(cfg, "freeze_utonia", True))
+        self.feature_extractor = utonia.load(
+            "utonia",
+            repo_id="Pointcept/Utonia",
+            custom_config={"freeze_encoder": True} if self.freeze_utonia else None,
+        )
+        if self.freeze_utonia:
+            self.feature_extractor.eval()
+        self.utonia_coord_scale = 0.2
+        self.utonia_input_grid_size = 0.01
+        self.utonia_stride_factor = self._infer_utonia_stride_factor()
+        self.utonia_feature_grid_size = self._infer_utonia_feature_grid_size()
         
 
         self.int_proj = cfg.int_proj
@@ -128,88 +139,124 @@ class Point2Gaus(nn.Module):
             nn.SiLU(),
             nn.Linear(self.gs.in_dim, self.gs.out_dim),
         )
-        self.gs_param_split = [cfg.gs_params.position, cfg.gs_params.shs, cfg.gs_params.opacity, cfg.gs_params.scaling, cfg.gs_params.rotation]
+        self.gs_param_sizes = [
+            cfg.gs_params.shs,
+            cfg.gs_params.opacity,
+            cfg.gs_params.scaling,
+            cfg.gs_params.rotation,
+        ]
         #self.feature_extractor = PointTransformerV3(cfg=self.cfg, finetune = True).from_pretrained("Pointcept/Utonia")
         #self.feature_condition = Conditionor(cfg=self.cfg)
         #self.gaussian_predictor = Predictor(cfg=self.cfg)
         # scene_id : {frame_id: {track_id(str), track_label: class(str), score: 3 float, xyz: float, size: 3 float, rotation: 4 float}}
         # yaw -> quat. code 
 
-    def utonia_cond(self, anchor_points, grid_coord, voxel_feats, voxel_coords, sparse_shape, grid_size=0.16):
-        
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if getattr(self, "freeze_utonia", False):
+            self.feature_extractor.eval()
+        return self
 
+    def _infer_utonia_stride_factor(self):
+        stride_factor = 1
+        if getattr(self.feature_extractor, "enc_mode", False):
+            for module in self.feature_extractor.modules():
+                if module.__class__.__name__ == "GridPooling":
+                    stride_factor *= int(module.stride)
+        return stride_factor
+
+    @staticmethod
+    def _utonia_input_min_grid(input_coord, input_grid_coord, input_grid_size):
+        raw_grid = torch.floor(input_coord / input_grid_size).to(dtype=torch.long)
+        min_grid_candidates = raw_grid - input_grid_coord.to(device=raw_grid.device, dtype=torch.long)
+        return min_grid_candidates.median(dim=0).values
+
+    def _utonia_metric_origin(self, input_coord, input_grid_coord):
+        input_min_grid = self._utonia_input_min_grid(
+            input_coord,
+            input_grid_coord,
+            self.utonia_input_grid_size,
+        )
+        return input_min_grid.to(dtype=input_coord.dtype) * (
+            self.utonia_input_grid_size / self.utonia_coord_scale
+        )
+
+    def _infer_utonia_feature_grid_size(self):
+        return (
+            self.utonia_input_grid_size
+            / self.utonia_coord_scale
+            * self.utonia_stride_factor
+        )
+
+    def _anchor_to_utonia_feature_grid(self, anchor_points, metric_origin):
+        metric_origin = metric_origin.to(device=anchor_points.device, dtype=anchor_points.dtype)
+        return (anchor_points - metric_origin.unsqueeze(0)) / self.utonia_feature_grid_size
+
+    def utonia_cond(
+        self,
+        anchor_points,
+        grid_coord,
+        voxel_feats,
+        metric_origin,
+    ):
         M = anchor_points.shape[0]
         D = voxel_feats.shape[1]
+        device = anchor_points.device
+        if M == 0 or voxel_feats.shape[0] == 0:
+            return voxel_feats.new_zeros((0, D)), torch.zeros((M,), dtype=torch.bool, device=device)
 
-        # 1. coord_min (sparsify 기준과 동일하게)
-        coord_min = voxel_coords.min(0)[0]  # (3,)
+        grid_coord = grid_coord.to(device=device, dtype=torch.long)
+        anchor_grid_f = self._anchor_to_utonia_feature_grid(anchor_points, metric_origin)
+        base_grid = torch.floor(anchor_grid_f).long()
+        frac = (anchor_grid_f - base_grid.to(anchor_points.dtype)).clamp(0.0, 1.0)
 
-        # 2. anchor를 grid index로 변환
-        anchor_grid = torch.div(
-            anchor_points - coord_min, grid_size, rounding_mode="trunc"
-        ).long()  # (M, 3)
+        offsets = torch.tensor(
+            [
+                [0, 0, 0], [0, 0, 1], [0, 1, 0], [0, 1, 1],
+                [1, 0, 0], [1, 0, 1], [1, 1, 0], [1, 1, 1],
+            ],
+            device=device,
+            dtype=torch.long,
+        )
+        neighbor_grids = base_grid[:, None, :] + offsets[None, :, :]
 
-        # 3. anchor의 voxel 내 상대 위치로 8방향 결정
-        anchor_local = (anchor_points - coord_min) / grid_size - anchor_grid.float()  # (M, 3), 0~1
-        sign = torch.sign(anchor_local - 0.5).long()  # (M, 3), -1 or +1
-        sx, sy, sz = sign[:, 0], sign[:, 1], sign[:, 2]
-        zero = torch.zeros(M, dtype=torch.long, device=anchor_points.device)
+        grid_max = grid_coord.max(dim=0).values
+        in_bounds = ((neighbor_grids >= 0) & (neighbor_grids <= grid_max.view(1, 1, 3))).all(dim=-1)
+        safe_neighbor_grids = neighbor_grids.clamp(min=0)
 
-        # (M, 8, 3) - 2x2x2 정육면체 offset
-        offsets_per_anchor = torch.stack([
-            torch.stack([ox, oy, oz], dim=-1)
-            for ox in [zero, sx]
-            for oy in [zero, sy]
-            for oz in [zero, sz]
-        ], dim=1)  # (M, 8, 3)
+        dims = (grid_max + 1).clamp_min(1)
+        stride_x = dims[1] * dims[2]
+        stride_y = dims[2]
 
-        # 4. sparse_shape 기반 lookup table
-        #sparse_shape = point.sparse_shape  # [SX, SY, SZ]
-        SX, SY, SZ = sparse_shape[0], sparse_shape[1], sparse_shape[2]
+        voxel_keys = grid_coord[:, 0] * stride_x + grid_coord[:, 1] * stride_y + grid_coord[:, 2]
+        sorted_keys, sorted_order = torch.sort(voxel_keys)
+        neighbor_keys = (
+            safe_neighbor_grids[:, :, 0] * stride_x
+            + safe_neighbor_grids[:, :, 1] * stride_y
+            + safe_neighbor_grids[:, :, 2]
+        )
 
-        linear_idx = (
-            grid_coord[:, 0] * SY * SZ +
-            grid_coord[:, 1] * SZ +
-            grid_coord[:, 2]
-        )  # (V,)
-        table = torch.full((SX * SY * SZ,), -1, dtype=torch.long, device=anchor_points.device)
-        table[linear_idx] = torch.arange(len(grid_coord), device=anchor_points.device)
+        flat_keys = neighbor_keys.reshape(-1)
+        pos = torch.searchsorted(sorted_keys, flat_keys)
+        pos_clamped = pos.clamp(max=sorted_keys.numel() - 1)
+        found = (pos < sorted_keys.numel()) & (sorted_keys[pos_clamped] == flat_keys)
+        found = found & in_bounds.reshape(-1)
+        neighbor_vi = sorted_order[pos_clamped].reshape(M, 8)
+        valid_mask = found.reshape(M, 8)
 
-        # 5. 8개 neighbor linear index
-        neighbor_grids = anchor_grid[:, None, :] + offsets_per_anchor  # (M, 8, 3)
-        nx = neighbor_grids[:, :, 0].clamp(0, SX - 1)
-        ny = neighbor_grids[:, :, 1].clamp(0, SY - 1)
-        nz = neighbor_grids[:, :, 2].clamp(0, SZ - 1)
-        neighbor_linear = nx * SY * SZ + ny * SZ + nz  # (M, 8)
+        offsets_f = offsets.to(dtype=anchor_points.dtype)
+        wx = torch.where(offsets_f[:, 0].view(1, 8) > 0, frac[:, 0:1], 1.0 - frac[:, 0:1])
+        wy = torch.where(offsets_f[:, 1].view(1, 8) > 0, frac[:, 1:2], 1.0 - frac[:, 1:2])
+        wz = torch.where(offsets_f[:, 2].view(1, 8) > 0, frac[:, 2:3], 1.0 - frac[:, 2:3])
+        weights = wx * wy * wz
+        weights = weights * valid_mask.to(dtype=weights.dtype)
+        weight_sum = weights.sum(dim=-1)
+        keep_mask = weight_sum > 1e-8
 
-        # 6. lookup: voxel index (-1이면 empty)
-        neighbor_vi = table[neighbor_linear]  # (M, 8)
-        valid_mask = neighbor_vi >= 0         # (M, 8)
-
-        # 7. anchor 중 8개 모두 empty인 것 제거
-        has_any = valid_mask.any(dim=-1)      # (M,)
-        keep_mask = has_any                   # (M,)
-
-        anchor_points = anchor_points[keep_mask]
-        neighbor_vi   = neighbor_vi[keep_mask]
-        valid_mask    = valid_mask[keep_mask]
-        M_new = anchor_points.shape[0]
-
-        # 8. 벡터화 IDW
-        safe_vi = neighbor_vi.clamp(min=0)                                 # (M_new, 8)
-        neighbor_centers = voxel_coords[safe_vi]                           # (M_new, 8, 3)
-        dist = torch.norm(
-            neighbor_centers - anchor_points[:, None, :], dim=-1
-        )                                                                   # (M_new, 8)
-
-        dist = dist.masked_fill(~valid_mask, float('inf'))
-        w = 1.0 / (dist + 1e-9)
-        w = w.masked_fill(~valid_mask, 0.0)
-        w = w / (w.sum(dim=-1, keepdim=True) + 1e-9)                        # (M_new, 8)
-
-        out = (w[:, :, None] * voxel_feats[safe_vi]).sum(dim=1)            # (M_new, D)
-
-        return out, keep_mask  # feature (M_new, D)
+        safe_vi = neighbor_vi.clamp(min=0)
+        out_all = (weights[:, :, None] * voxel_feats[safe_vi]).sum(dim=1)
+        out_all = out_all / weight_sum.clamp_min(1e-8).unsqueeze(-1)
+        return out_all[keep_mask], keep_mask  # feature (M_new, D)
     
 
     def intensity_agg(self, feat, intensity):
@@ -217,10 +264,9 @@ class Point2Gaus(nn.Module):
         agg_feat_i = self.intensity_agg_mlp(torch.cat([feat, self.intensity_norm(feat_i)],dim=1))
         return agg_feat_i
 
-    def gs_param_split(self, feat):
-        position, shs, opacity, scaling, rotation = torch.split(feat, self.gs_param_split)
+    def split_gs_params(self, feat):
+        shs, opacity, scaling, rotation = torch.split(feat, self.gs_param_sizes, dim=-1)
         return {
-            "position": position,
             "shs": shs,
             "opacity": opacity,
             "scaling": scaling,
@@ -228,7 +274,12 @@ class Point2Gaus(nn.Module):
         }
 
     def forward(self, _input, batch_idx, mode):
-        lidar_points, offset, batch_idx, pose, bbox = _input["lidar_points"], _input["offset"], _input["batch_idx"],  _input["pose"], _input["bbox"]
+        lidar_points = _input.get("lidar_points_sensor", _input["lidar_points"])
+        offset = _input["offset"]
+        batch_idx = _input["batch_idx"]
+        pose = _input["pose"]
+        bbox = _input["bbox"]
+        bbox_instance_ids = _input.get("bbox_instance_ids")
 
 
         voxelized_points  = self.voxelizer(lidar_points,offset,pose, mode="sphere")
@@ -236,14 +287,19 @@ class Point2Gaus(nn.Module):
         features = self.feature_extractor(_input["ptv3_input"]) 
         grid_coords = features["grid_coord"]   # (V, 3) int
         utonia_feat = features["feat"]         # (V, D)
-        feat_coord  = features["coord"] /0.2       # (V, 3)
         feat_offset = features["offset"]       # utonia offset
-        sparse_shape = features["sparse_shape"]
+        input_coord = _input["ptv3_input"]["coord"].to(device=utonia_feat.device)
+        input_grid_coord = _input["ptv3_input"]["grid_coord"].to(device=utonia_feat.device)
+        input_offset = _input["ptv3_input"]["offset"].to(device=utonia_feat.device)
 
         grid_coord_list = split_by_offset(grid_coords, feat_offset)  # List[Tensor(Vi, 3)]
         feat_list       = split_by_offset(utonia_feat, feat_offset)  # List[Tensor(Vi, D)]
-        coord_list      = split_by_offset(feat_coord,  feat_offset)  # List[Tensor(Vi, 3)]
-        #sparse_shape    = split_by_offset(sparse_shape, feat_offset)
+        input_coord_list = split_by_offset(input_coord, input_offset)
+        input_grid_coord_list = split_by_offset(input_grid_coord, input_offset)
+        metric_origin_list = [
+            self._utonia_metric_origin(coord, grid_coord)
+            for coord, grid_coord in zip(input_coord_list, input_grid_coord_list)
+        ]
         anchor_list     = voxelized_points["anchor_points"]                 # List[Tensor(Ui, 3)]
         mean_i_list     = voxelized_points["mean_i"]                        # List[Tensor(Ui,)]
         var_i_list      = voxelized_points["var_i"]     
@@ -261,6 +317,7 @@ class Point2Gaus(nn.Module):
         all_anchor      = []
         all_frame_batch = []
         all_bbox        = []   # List[Tensor(B_f, 7)], 프레임별
+        all_bbox_iids   = []
         local_frame_counter = {}
         cumsum = 0
 
@@ -268,7 +325,7 @@ class Point2Gaus(nn.Module):
             anchor = anchor_list[i]
 
             anchor_feat, keep_mask = self.utonia_cond(
-                anchor, grid_coord_list[i], feat_list[i], coord_list[i], sparse_shape
+                anchor, grid_coord_list[i], feat_list[i], metric_origin_list[i]
             )
 
             mean_i    = mean_i_list[i][keep_mask]
@@ -293,6 +350,8 @@ class Point2Gaus(nn.Module):
             all_anchor.append(valid_anchor)
             all_frame_batch.append(b)
             all_bbox.append(bbox[b][local_f])   # Tensor(B_f, 7)
+            if bbox_instance_ids is not None:
+                all_bbox_iids.append(bbox_instance_ids[b][local_f])
             cumsum += anchor_feat.shape[0]
             all_offset.append(torch.tensor(cumsum, device=anchor.device))
 
@@ -307,16 +366,16 @@ class Point2Gaus(nn.Module):
 
         agg_feat_i = self.intensity_agg(all_feat, all_intensity)  # (N_valid, C)
 
-        # time_agg: out_feat, out_coord, box_assign 반환
-        # box_assign: (N_valid,) -1=background, 0~B_f-1=box index
-        out_feat, out_coord, box_assign = self.time_agg(
+        # time_agg: out_coord is the Gaussian position coordinate. Dynamic points
+        # are represented in object-local coordinates; static points stay in ref frame.
+        out_feat, out_coord, agg_meta = self.time_agg(
             agg_feat_i, all_anchor, new_offset,
-            frame_batch_idx, x["pose"], all_bbox
+            frame_batch_idx, pose, bbox, bbox_instance_ids
         )
 
         # GS 예측
-        gs_feat = self.gs_predictor(out_feat, out_coord)
-        gs_raw = self.gs_param_split(gs_feat)
+        gs_feat = self.gs_predictor(out_feat)
+        gs_raw = self.split_gs_params(gs_feat)
         # gs_raw: dict of (N_valid, ...) tensors
 
         # 배치별로 분리 + box_assign 붙이기
@@ -336,29 +395,44 @@ class Point2Gaus(nn.Module):
             b_end   = int(new_offset[frame_indices[-1]])
             b_slice = torch.arange(b_start, b_end, device=out_feat.device)
 
-            b_box_assign = box_assign[b_slice]   # (Nb,) -1=bg, 0~B-1=box
+            b_box_assign = agg_meta["box_assign"][b_slice]   # (Nb,) -1=bg, 0~B-1=box
+            b_instance_id = agg_meta["instance_id"][b_slice]
+            b_is_dynamic = agg_meta["is_dynamic"][b_slice]
 
             b_gs = {k: v[b_slice] for k, v in gs_raw.items()}
+            b_gs["position"] = out_coord[b_slice]
             b_gs["box_assign"] = b_box_assign    # (Nb,) 어떤 bbox에서 나왔는지
             b_gs["coord"]      = out_coord[b_slice]  # (Nb, 3) frame_0 좌표계
+            b_gs["coord_ref"]  = agg_meta["coord_ref"][b_slice]
+            b_gs["instance_id"] = b_instance_id
+            b_gs["is_dynamic"] = b_is_dynamic
 
             # bg / fg 분리 인덱스
-            b_gs["bg_mask"]  = b_box_assign == -1          # (Nb,) bool
+            b_gs["bg_mask"]  = ~b_is_dynamic          # (Nb,) bool
             b_gs["fg_masks"] = {
-                int(box_i): (b_box_assign == box_i)
-                for box_i in b_box_assign[b_box_assign >= 0].unique().tolist()
-            }  # {box_id: (Nb,) bool}
+                int(inst_id): (b_instance_id == inst_id) & b_is_dynamic
+                for inst_id in b_instance_id[b_is_dynamic].unique().tolist()
+            }  # {instance_id: (Nb,) bool}
             b_gs["frame_bboxes"] = []
             for local_f, global_f in enumerate(frame_indices):
                 bbox_f = all_bbox[global_f]   # Tensor(B_f, 7)
+                bbox_ref_f = agg_meta["bbox_ref_by_frame"][global_f]
+                if bbox_instance_ids is not None:
+                    bbox_iids_f = all_bbox_iids[global_f]
+                else:
+                    bbox_iids_f = torch.arange(bbox_f.shape[0], device=out_feat.device, dtype=torch.long)
                 b_gs["frame_bboxes"].append({
                     "center": bbox_f[:, :3],   # (B_f, 3)
                     "size":   bbox_f[:, 3:6],  # (B_f, 3)
                     "yaw":    bbox_f[:, 6],    # (B_f,)
+                    "bbox":   bbox_f,
+                    "bbox_ref": bbox_ref_f,
+                    "instance_id": bbox_iids_f.to(device=out_feat.device),
                 })
             batch_gaussians.append(b_gs)
 
         return {
+            "batch_gaussians": batch_gaussians,
             "gaussians": batch_gaussians,  # List[dict], 배치별
             # batch_gaussians[b] 구조:
             #   "position"     : (Nb, 3)
@@ -377,6 +451,8 @@ class Point2Gaus(nn.Module):
             #       [local_f]["bbox"]   : (B_f, 7)
             # bbox바더서 linear 이동할 준비. 
             "batch":  new_batch,
+            "pose": pose,
+            "timestamps": _input["timestamps"],
         }
 
 
@@ -402,6 +478,34 @@ class TimeAgg(nn.Module):
         ones = torch.ones(N, 1, device=points.device, dtype=points.dtype)
         pts_h = torch.cat([points, ones], dim=-1)   # (N, 4)
         return (pose @ pts_h.T).T[:, :3]            # (N, 3)
+
+    def yaw_from_pose(self, pose):
+        return torch.atan2(pose[1, 0], pose[0, 0])
+
+    def transform_boxes_to_ref(self, boxes, pose):
+        if boxes.shape[0] == 0:
+            return boxes
+        out = boxes.clone()
+        out[:, :3] = self.apply_pose(boxes[:, :3], pose)
+        out[:, 6] = boxes[:, 6] + self.yaw_from_pose(pose)
+        return out
+
+    def points_to_box_local(self, points_ref, box_ref):
+        center = box_ref[:3]
+        yaw = box_ref[6]
+        shifted = points_ref - center.unsqueeze(0)
+        cos_y = torch.cos(-yaw)
+        sin_y = torch.sin(-yaw)
+        local_x = cos_y * shifted[:, 0] - sin_y * shifted[:, 1]
+        local_y = sin_y * shifted[:, 0] + cos_y * shifted[:, 1]
+        return torch.stack([local_x, local_y, shifted[:, 2]], dim=-1)
+
+    def _common_instance_ids(self, first_ids, last_ids):
+        if first_ids is None or last_ids is None:
+            return set()
+        first = {int(x) for x in first_ids.tolist()}
+        last = {int(x) for x in last_ids.tolist()}
+        return first & last
 
 
     def point_in_box(self, anchor, box):
@@ -440,7 +544,7 @@ class TimeAgg(nn.Module):
         return box_idx
 
 
-    def forward(self, feat, anchor, new_offset, frame_batch_idx, pose_list, bbox_list):
+    def forward(self, feat, anchor, new_offset, frame_batch_idx, pose_list, bbox_list, bbox_instance_ids_list=None):
         """
         feat            : (N_valid, C)
         anchor          : (N_valid, 3)  각 프레임의 sensor frame 좌표
@@ -453,6 +557,11 @@ class TimeAgg(nn.Module):
         N, C   = feat.shape
         out_feat  = torch.zeros_like(feat)
         out_coord = torch.zeros_like(anchor)
+        box_assign_out = torch.full((N,), -1, dtype=torch.long, device=device)
+        instance_id_out = torch.full((N,), -1, dtype=torch.long, device=device)
+        is_dynamic_out = torch.zeros((N,), dtype=torch.bool, device=device)
+        coord_ref_out = torch.zeros_like(anchor)
+        bbox_ref_by_frame = [None for _ in range(len(frame_batch_idx))]
 
         # 배치별로 처리
         batch_frame_map = {}
@@ -462,12 +571,20 @@ class TimeAgg(nn.Module):
         for b, frame_indices in batch_frame_map.items():
             pose_b = pose_list[b]    # Tensor(V, 4, 4)
             bbox_b = bbox_list[b]    # List[Tensor(B_f, 7)]
+            bbox_iids_b = bbox_instance_ids_list[b] if bbox_instance_ids_list is not None else None
+            if bbox_iids_b is not None and len(bbox_iids_b) >= 2:
+                common_ids = self._common_instance_ids(bbox_iids_b[0], bbox_iids_b[-1])
+            else:
+                common_ids = set()
 
             #1. 각 프레임 anchor를 frame_0 좌표계로 변환 
             frame_feats   = []
             frame_coords  = []  # frame_0 좌표계
+            frame_attn_coords = []
             frame_g_idx   = []  # global index
-            frame_bbox    = []  # 각 프레임의 bbox (sensor frame)
+            frame_is_dynamic = []
+            frame_box_assign = []
+            frame_instance_id = []
 
             for local_f, global_f in enumerate(frame_indices):
                 prev  = int(new_offset[global_f - 1]) if global_f > 0 and frame_batch_idx[global_f - 1] == b else 0
@@ -478,99 +595,89 @@ class TimeAgg(nn.Module):
                 anchor_f = anchor[prev:end]   # (Nf, 3) sensor frame
                 pose_f    = pose_b[local_f].to(device)   # (4, 4)
                 coord_f0  = self.apply_pose(anchor_f, pose_f)  # (Nf, 3) frame_0 좌표계
+                bbox_sensor_f = bbox_b[local_f].to(device)
+                bbox_ref_f = self.transform_boxes_to_ref(bbox_sensor_f, pose_f)
+                bbox_ref_by_frame[global_f] = bbox_ref_f
+
+                if bbox_iids_b is not None:
+                    bbox_iids_f = bbox_iids_b[local_f].to(device)
+                else:
+                    bbox_iids_f = torch.arange(bbox_sensor_f.shape[0], device=device, dtype=torch.long)
+
+                box_assign_f = self.point_in_box(anchor_f, bbox_sensor_f)
+                instance_id_f = torch.full((anchor_f.shape[0],), -1, dtype=torch.long, device=device)
+                valid_box = box_assign_f >= 0
+                if valid_box.any() and bbox_iids_f.numel() > 0:
+                    instance_id_f[valid_box] = bbox_iids_f[box_assign_f[valid_box]]
+
+                is_dynamic_f = torch.zeros_like(valid_box)
+                for inst_id in common_ids:
+                    is_dynamic_f |= instance_id_f == int(inst_id)
+
+                attn_coord_f = coord_f0.clone()
+                for box_i in box_assign_f[is_dynamic_f & (box_assign_f >= 0)].unique().tolist():
+                    box_i = int(box_i)
+                    mask = is_dynamic_f & (box_assign_f == box_i)
+                    if mask.any():
+                        attn_coord_f[mask] = self.points_to_box_local(coord_f0[mask], bbox_ref_f[box_i])
 
                 frame_feats.append(feat_f)
                 frame_coords.append(coord_f0)
+                frame_attn_coords.append(attn_coord_f)
                 frame_g_idx.append(g_idx)
-                frame_bbox.append(bbox_b[local_f].to(device))  # (B_f, 7) sensor frame
-
-            # frame_0 bbox (local_f=0 기준)
-            bbox_f0 = frame_bbox[0]   # (B_f0, 7) frame_0의 bbox
+                frame_is_dynamic.append(is_dynamic_f)
+                frame_box_assign.append(box_assign_f)
+                frame_instance_id.append(instance_id_f)
 
             #2. 전체 anchor를 bbox 기준으로 분류 (frame_0 좌표계) 
             all_feat_b   = torch.cat(frame_feats,  dim=0)   # (Nb, C)
             all_coord_b  = torch.cat(frame_coords, dim=0)   # (Nb, 3) frame_0
+            all_coord_attn_b = torch.cat(frame_attn_coords, dim=0)
             all_g_idx_b  = torch.cat(frame_g_idx,  dim=0)   # (Nb,)
+            all_dynamic_b = torch.cat(frame_is_dynamic, dim=0)
+            all_box_assign_b = torch.cat(frame_box_assign, dim=0)
+            all_instance_id_b = torch.cat(frame_instance_id, dim=0)
 
-            # frame_0 좌표계에서 bbox 분류
-            box_assign = self.point_in_box(all_coord_b, bbox_f0)  # (Nb,) -1 or box_idx
-
-            # 3. foreground: bbox 상대 좌표로 변환 
-            # 각 프레임의 anchor를 해당 프레임 bbox 중심 기준 offset으로 표현
-            all_coord_aligned = all_coord_b.clone()
-
-            if bbox_f0.shape[0] > 0:
-                # 프레임별로 처리
-                offset_start = 0
-                for local_f, (feat_f, coord_f0, g_idx) in enumerate(
-                    zip(frame_feats, frame_coords, frame_g_idx)
-                ):
-                    Nf = feat_f.shape[0]
-                    coord_slice = all_coord_b[offset_start:offset_start + Nf]  # frame_0 좌표
-
-                    if local_f == 0:
-                        offset_start += Nf
-                        continue
-
-                    # 이 프레임의 bbox (sensor frame)
-                    bbox_fi = frame_bbox[local_f]   # (B_fi, 7)
-
-                    # frame_i anchor의 sensor frame 좌표
-                    prev = int(new_offset[frame_indices[local_f] - 1]) if frame_indices[local_f] > 0 and frame_batch_idx[frame_indices[local_f] - 1] == b else 0
-                    end  = int(new_offset[frame_indices[local_f]])
-                    anchor_fi_sensor = anchor[prev:end]   # (Nf, 3) sensor frame
-
-                    # sensor frame에서 bbox 분류
-                    box_assign_fi = self.point_in_box(anchor_fi_sensor, bbox_fi)  # (Nf,)
-
-                    for box_i in box_assign_fi[box_assign_fi >= 0].unique().tolist():
-                        box_i    = int(box_i)
-                        fg_mask  = box_assign_fi == box_i
-
-                        if box_i >= bbox_f0.shape[0]:
-                            offset_start += Nf
-                            continue
-
-                        # frame_i bbox 중심 (sensor frame)
-                        center_fi = bbox_fi[box_i, :3]   # (3,)
-                        center_f0 = bbox_f0[box_i, :3].to(device)  # (3,)
-                        center_fi_in_f0 = self.apply_pose(
-                            center_fi.unsqueeze(0),
-                            pose_b[local_f].to(device)
-                        ).squeeze(0)  # (3,)
-
-                        # offset 보정: frame_i bbox → frame_0 bbox
-                        delta = center_f0 - center_fi_in_f0  # (3,)
-
-                        fg_global = offset_start + fg_mask.nonzero(as_tuple=True)[0]
-                        all_coord_aligned[fg_global] = coord_slice[fg_mask] + delta
-
-                    offset_start += Nf
+            coord_ref_out[all_g_idx_b] = all_coord_b
+            is_dynamic_out[all_g_idx_b] = all_dynamic_b
+            instance_id_out[all_g_idx_b] = all_instance_id_b
+            box_assign_out[all_g_idx_b] = torch.where(
+                all_dynamic_b,
+                all_box_assign_b,
+                torch.full_like(all_box_assign_b, -1),
+            )
 
             # 4. background / foreground KNN attention 
-            bg_mask  = box_assign == -1   # (Nb,)
+            bg_mask  = ~all_dynamic_b   # (Nb,)
 
             # background
             if bg_mask.any():
                 bg_feat  = all_feat_b[bg_mask]          # (N_bg, C)
-                bg_coord = all_coord_aligned[bg_mask]   # (N_bg, 3)
+                bg_coord = all_coord_attn_b[bg_mask]   # (N_bg, 3)
                 bg_g_idx = all_g_idx_b[bg_mask]
 
                 bg_out = self.bg_attn(bg_feat, bg_coord, k=self.k_bg)
                 out_feat[bg_g_idx]  = bg_out
                 out_coord[bg_g_idx] = bg_coord
 
-            # foreground: bbox별
-            for box_i in box_assign[box_assign >= 0].unique().tolist():
-                box_i   = int(box_i)
-                fg_mask = box_assign == box_i
+            # foreground: instance별
+            for inst_id in all_instance_id_b[all_dynamic_b].unique().tolist():
+                inst_id = int(inst_id)
+                fg_mask = all_dynamic_b & (all_instance_id_b == inst_id)
 
                 fg_feat  = all_feat_b[fg_mask]
-                fg_coord = all_coord_aligned[fg_mask]
+                fg_coord = all_coord_attn_b[fg_mask]
                 fg_g_idx = all_g_idx_b[fg_mask]
 
                 fg_out = self.fg_attn(fg_feat, fg_coord, k=self.k_fg)
                 out_feat[fg_g_idx]  = fg_out
                 out_coord[fg_g_idx] = fg_coord
 
-        return out_feat, out_coord   # (N_valid, C), (N_valid, 3)
+        meta = {
+            "box_assign": box_assign_out,
+            "instance_id": instance_id_out,
+            "is_dynamic": is_dynamic_out,
+            "coord_ref": coord_ref_out,
+            "bbox_ref_by_frame": bbox_ref_by_frame,
+        }
+        return out_feat, out_coord, meta   # (N_valid, C), (N_valid, 3), metadata

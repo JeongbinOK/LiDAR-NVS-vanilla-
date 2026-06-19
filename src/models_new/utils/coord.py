@@ -4,7 +4,6 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 import pytorch_lightning as L
-from torch_scatter import scatter_mean
 
 def ptv3_2_batch(points, offsets, batch_idx):
     # points (N,3), offset(B*V_i), batch_idx(N)
@@ -79,6 +78,7 @@ class Voxelizerargs:
     dphi_deg= 3.0
     dtheta_deg= 4.0
     dr_m= 3.0
+    max_radius_m = 100.0
     query_voxel_min_points= 1
     max_extent = 20.0
     voxel_size = 0.004  
@@ -100,6 +100,7 @@ class Voxelizer(L.LightningModule):
         self.dphi = math.radians(self.voxel_cfg.dphi_deg)
         self.dtheta = math.radians(self.voxel_cfg.dtheta_deg)
         self.dr = self.voxel_cfg.dr_m
+        self.max_radius = self.voxel_cfg.max_radius_m
         # if k_min is not None:
         #     query_voxel_min_points = k_min
         self.query_voxel_min_points = self.voxel_cfg.query_voxel_min_points
@@ -108,8 +109,10 @@ class Voxelizer(L.LightningModule):
         #For Spherical
         self.n_phi = math.ceil(2 * math.pi / self.dphi) + 1
         self.n_theta = math.ceil(math.pi / self.dtheta) + 1
+        self.n_r = math.ceil(self.max_radius / self.dr)
         self._stride_theta = self.n_phi # &&& 3도 + 4도 + 3m -> 실험으로 증명 말고 깔끔하게 얼버부리기?
         self._stride_r = self.n_phi * self.n_theta
+        self._sphere_bins_per_frame = self.n_r * self._stride_r
     
         #for Cartesian
         self.voxel_size = self.voxel_cfg.voxel_size # &&& 3도 + 4도 + 3m -> 실험으로 증명 말고 깔끔하게 얼버부리기?
@@ -128,6 +131,76 @@ class Voxelizer(L.LightningModule):
         voxel_hash = ir * self._stride_r + itheta * self._stride_theta + iphi
         return voxel_hash, r
 
+    def _empty_output(self, n_frames, device, dtype):
+        empty_xyz = torch.zeros((0, 3), device=device, dtype=dtype)
+        empty_scalar = torch.zeros((0,), device=device, dtype=dtype)
+        empty_hash = torch.zeros((0,), device=device, dtype=torch.long)
+        return {
+            "anchor_points": [empty_xyz for _ in range(n_frames)],
+            "counts": [empty_scalar for _ in range(n_frames)],
+            "mean_i": [empty_scalar for _ in range(n_frames)],
+            "var_i": [empty_scalar for _ in range(n_frames)],
+            "voxel_hash": [empty_hash for _ in range(n_frames)]
+        }
+
+    def _forward_sphere_dense(self, points, offset):
+        dtype = points.dtype
+        device = points.device
+        n_frames = int(offset.numel())
+        sizes = torch.diff(
+            torch.cat([torch.zeros(1, device=device, dtype=offset.dtype), offset])
+        )
+        if points.shape[0] == 0:
+            return self._empty_output(n_frames, device, dtype)
+
+        voxel_hash, r = self.sphere_bin_indices(points[:, :3])
+        frame_idx = torch.repeat_interleave(
+            torch.arange(n_frames, device=device, dtype=torch.long),
+            sizes.long(),
+        )
+
+        valid = (r < self.max_radius) & (voxel_hash >= 0) & (voxel_hash < self._sphere_bins_per_frame)
+        if not valid.any():
+            return self._empty_output(n_frames, device, dtype)
+
+        valid_points = points[valid]
+        valid_frame_idx = frame_idx[valid]
+        valid_hash = voxel_hash[valid]
+        dense_key = valid_frame_idx * self._sphere_bins_per_frame + valid_hash
+        total_bins = n_frames * self._sphere_bins_per_frame
+
+        counts = torch.zeros(total_bins, device=device, dtype=dtype)
+        ones = torch.ones_like(dense_key, dtype=dtype)
+        counts.scatter_add_(0, dense_key, ones)
+
+        sum_xyz = torch.zeros((total_bins, 3), device=device, dtype=dtype)
+        sum_xyz.index_add_(0, dense_key, valid_points[:, :3])
+
+        intensity = valid_points[:, 3]
+        sum_i = torch.zeros(total_bins, device=device, dtype=dtype)
+        sum_i.scatter_add_(0, dense_key, intensity)
+        sum_i2 = torch.zeros(total_bins, device=device, dtype=dtype)
+        sum_i2.scatter_add_(0, dense_key, intensity * intensity)
+
+        occupied = counts > 0
+        occupied_idx = occupied.nonzero(as_tuple=True)[0]
+        cnt_f = counts[occupied_idx]
+        mean_xyz = sum_xyz[occupied_idx] / cnt_f.unsqueeze(-1)
+        mean_i = sum_i[occupied_idx] / cnt_f
+        var_i = (sum_i2[occupied_idx] / cnt_f - mean_i * mean_i).clamp(min=0.0)
+
+        occupied_frame = torch.div(occupied_idx, self._sphere_bins_per_frame, rounding_mode="floor")
+        occupied_hash = occupied_idx - occupied_frame * self._sphere_bins_per_frame
+        frame_voxel_counts = torch.bincount(occupied_frame, minlength=n_frames).tolist()
+
+        return {
+            "anchor_points": list(torch.split(mean_xyz, frame_voxel_counts, dim=0)),
+            "counts": list(torch.split(cnt_f, frame_voxel_counts, dim=0)),
+            "mean_i": list(torch.split(mean_i, frame_voxel_counts, dim=0)),
+            "var_i": list(torch.split(var_i, frame_voxel_counts, dim=0)),
+            "voxel_hash": list(torch.split(occupied_hash, frame_voxel_counts, dim=0)),
+        }
+
     def cart_bin_indices(self, xyz: Tensor) -> Tensor:
         idx = torch.floor((xyz + self.max_extent) / self.voxel_size).long()
         idx = idx.clamp(min=0, max=self.n_grid - 1)
@@ -138,40 +211,55 @@ class Voxelizer(L.LightningModule):
         #순서: b1_f1, b1_f2, b2_f1, b2_f2, ... ,bn_fn
         dtype = points.dtype
         device = points.device
+        offset = offset.to(device=device)
+        n_frames = int(offset.numel())
         if mode == "sphere":
-            voxel_hash, _ = self.sphere_bin_indices(points[:,:3]) #N
-        else:
-            voxel_hash, _ = self.cart_bin_indices(points[:,:3]) #N
-        sizes = torch.diff(torch.cat([torch.tensor([0], device=offset.device), offset])).tolist()
-        hash_div_frames = torch.split(voxel_hash, sizes)
-        points_div_frames = torch.split(points, sizes)
+            return self._forward_sphere_dense(points, offset)
 
+        voxel_hash, _ = self.cart_bin_indices(points[:,:3]) #N
+        sizes = torch.diff(
+            torch.cat([torch.zeros(1, device=device, dtype=offset.dtype), offset])
+        )
+        if points.shape[0] == 0:
+            return self._empty_output(n_frames, device, dtype)
 
-        anchor_points_list = []
-        counts_list = [] 
-        intensity_mean_list = []
-        intensity_var_list = []
-        voxel_hash_list = []
-        for hash_div_frame, points_div_frame in zip(hash_div_frames, points_div_frames):
-            unique_hash, inverse, counts = torch.unique(hash_div_frame, return_inverse=True, return_counts=True)
-            mean_xyz = scatter_mean(points_div_frame[:, :3], inverse, dim=0)
-            U = unique_hash.shape[0]
-            cnt_f = counts.to(dtype=dtype)
+        frame_idx = torch.repeat_interleave(
+            torch.arange(n_frames, device=device, dtype=torch.long),
+            sizes.long(),
+        )
+        hash_stride = voxel_hash.max().clamp_min(0) + 1
+        frame_voxel_hash = frame_idx * hash_stride + voxel_hash
 
-            i = points_div_frame[:,3]
-            sum_i = torch.zeros(U, device=device, dtype=dtype)
-            sum_i.index_add_(0, inverse, i)
-            sum_i2 = torch.zeros(U, device=device, dtype=dtype)
-            sum_i2.index_add_(0, inverse, i * i)
-            mean_i = sum_i / cnt_f
-            var_i = (sum_i2 / cnt_f - mean_i * mean_i).clamp(min=0.0)
-            std_i = var_i.sqrt()
+        unique_frame_hash, inverse, counts = torch.unique(
+            frame_voxel_hash,
+            sorted=True,
+            return_inverse=True,
+            return_counts=True,
+        )
+        U = unique_frame_hash.shape[0]
+        cnt_f = counts.to(dtype=dtype)
 
-            anchor_points_list.append(mean_xyz)
-            counts_list.append(cnt_f)
-            intensity_mean_list.append(mean_i)
-            intensity_var_list.append(var_i)
-            voxel_hash_list.append(unique_hash)
+        sum_xyz = torch.zeros((U, 3), device=device, dtype=dtype)
+        sum_xyz.index_add_(0, inverse, points[:, :3])
+        mean_xyz = sum_xyz / cnt_f.unsqueeze(-1)
+
+        i = points[:, 3]
+        sum_i = torch.zeros(U, device=device, dtype=dtype)
+        sum_i.index_add_(0, inverse, i)
+        sum_i2 = torch.zeros(U, device=device, dtype=dtype)
+        sum_i2.index_add_(0, inverse, i * i)
+        mean_i = sum_i / cnt_f
+        var_i = (sum_i2 / cnt_f - mean_i * mean_i).clamp(min=0.0)
+
+        unique_frame_idx = torch.div(unique_frame_hash, hash_stride, rounding_mode="floor")
+        unique_hash = unique_frame_hash - unique_frame_idx * hash_stride
+        frame_voxel_counts = torch.bincount(unique_frame_idx, minlength=n_frames).tolist()
+
+        anchor_points_list = list(torch.split(mean_xyz, frame_voxel_counts, dim=0))
+        counts_list = list(torch.split(cnt_f, frame_voxel_counts, dim=0))
+        intensity_mean_list = list(torch.split(mean_i, frame_voxel_counts, dim=0))
+        intensity_var_list = list(torch.split(var_i, frame_voxel_counts, dim=0))
+        voxel_hash_list = list(torch.split(unique_hash, frame_voxel_counts, dim=0))
         return {
             "anchor_points": anchor_points_list,
             "counts": counts_list,
