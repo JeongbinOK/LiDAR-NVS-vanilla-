@@ -1,13 +1,17 @@
-device: [3,8]
+device: [1, 2, 3, 4]
 
 project_name: 2dgs-utonia 
-exp_name: aaa
+exp_name: fixed voxelize scale
+mode: train
+
 
 loss:
-  w_chamfer: 0.002
-  w_depth: 1.0
-  w_intensity: 1.0 
+  w_chamfer: 0.02
+  w_depth: 1.0          # mean depth only (median은 학습 제외, detached metric)
+  w_depth_median: 0.0   # 미사용 (median은 total에 들어가지 않음)
+  w_intensity: 0.1
   w_raydrop: 0.1
+  enable_lpips: false
 
 train:
   lr: 5e-4
@@ -17,11 +21,11 @@ train:
   weight_decay: 1e-4
   grad_clip: 1.0
   max_epochs: 30
-  batch_size: 2
-  val_check_interval: 1
+  batch_size: 1
+  val_check_interval: 1.0
   max_steps: 1000000
   ckpt_path: null
-
+  grad_accum_steps: 2
 test:
   batch_size: 1
   ckpt_path: null
@@ -30,16 +34,25 @@ data:
   dataset_name: "nuscenes"
   dataroot: "/data1/nuScenes"
   version: "v1.0-trainval"
+  test_version: "v1.0-test"
   train_split: "train"
   eval_split: "val"
-  max_input_extra: 0    # 0 => 2 frames
+  test_split: "test"
+  window_us: 1000000       # 1.0s window: 0.0s ... 1.0s
+  sample_gap_us: 100000    # choose every 0.1s from 0.05s sweeps
+  gt_middle_count: 3       # loss GT = 2 endpoint inputs + 3 middle sweeps
+  max_input_extra: 0    # kept for compatibility; input is fixed to 2 endpoints
   mode: "bbox"          # "nvs" | "bbox" (Phase A=nvs; Phase B switches to bbox)
-  bbox_json_path: "/data/jeongbin/qgs/bbox/tracking_train.json"
+  bbox_json_path: "/data/jeongbin/qgs/bbox/tracking_{split}.json"
   num_workers: 4
+  eval_num_workers: 0
+  verbose: false
   vfov: [-30.67, 10.67] 
   hfov: [-180, 180]  
   image_height: 32
-  image_width: 1080
+  image_width: 1085
+  ring_to_elevation_deg: ${p2g.ring_to_elevation_deg}
+  ego_radius: ${p2g.ego_radius}
 
 
 logger:
@@ -56,6 +69,7 @@ p2g:
   feature_dim: 64
   primitive_mode: "voxel_anchor"
   anchor_token_dim: 22
+  freeze_utonia: true
 
 
 
@@ -109,14 +123,13 @@ p2g:
 
   gs:
     in_dim: 240
-    out_dim: 26 #3+1+2+4+16
+    out_dim: 39 # 16 intensity SH + 16 raydrop SH + opacity + 2D scale + rotation
 
   gs_params:
-    position: 3
     opacity: 1
     scaling: 2
     rotation: 4
-    shs: 16
+    shs: 32
   # Local quadric init / k-NN
   knn_k_target: 16
   knn_k_min: 8
@@ -163,9 +176,8 @@ g2p:
   active_sh_degree: 0
   sh_degree: 3
   debug: false
-  scale_factor: 
+  scale_factor: 1.0
   dynamic: false
   convert_SHs_python: true
   compute_cov3D_python: true
   max_sh_channels: true
-
