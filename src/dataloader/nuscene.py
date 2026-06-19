@@ -14,8 +14,10 @@ from ..models_new.utils.camera import Camera
 # ────────────────────────────────────────────────────────────────────────────
  
 US_PER_SEC = 1_000_000          # nuScenes timestamps are in microseconds
+NUSCENES_SWEEP_US = 50_000      # LIDAR_TOP sample_data chain is 20Hz.
 MIN_GAP_US = 100_000            # 0.1 s minimum gap between sampled frames
 MAX_WIN_US = 1_000_000          # 1.0 s maximum window
+DEFAULT_GT_MIDDLE_COUNT = 3
  
  
 def _sensor_to_world(nusc, sample_data_token: str) -> np.ndarray:
@@ -35,17 +37,35 @@ def _sensor_to_world(nusc, sample_data_token: str) -> np.ndarray:
     return (e2w @ s2e).astype(np.float32)
  
  
-def _load_points(nusc, dataroot: str, sample_data_token: str) -> torch.Tensor:
-    """Returns Tensor(N, 4): x, y, z, intensity."""
+def _load_points(
+    nusc,
+    dataroot: str,
+    sample_data_token: str,
+    ego_radius: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Returns points Tensor(N, 4): x, y, z, intensity and ring Tensor(N,)."""
     sd  = nusc.get('sample_data', sample_data_token)
     raw = np.fromfile(os.path.join(dataroot, sd['filename']), dtype=np.float32)
     if raw.size % 5 == 0:
-        scan = raw.reshape(-1, 5)[:, :4]
+        scan5 = raw.reshape(-1, 5)
+        scan = scan5[:, :4]
+        ring = scan5[:, 4].astype(np.int64)
     elif raw.size % 4 == 0:
         scan = raw.reshape(-1, 4)
+        ring = np.full((scan.shape[0],), -1, dtype=np.int64)
     else:
         raise ValueError(f"Unexpected point cloud size {raw.size}")
-    return torch.from_numpy(scan)
+    pts = torch.from_numpy(np.ascontiguousarray(scan))
+    ring_t = torch.from_numpy(np.ascontiguousarray(ring))
+    # nuScenes LiDAR intensity는 0~255 정수 범위 → [0,1]로 정규화.
+    # 여기 한 곳에서 나누면 입력 point feature와 GT range image가 모두 같은 col 3에서
+    # 파생되므로 양쪽에 동시에 반영된다.
+    pts[:, 3] = pts[:, 3] / 255.0
+    if ego_radius > 0:
+        keep = torch.linalg.norm(pts[:, :3], dim=1) > float(ego_radius)
+        pts = pts[keep].contiguous()
+        ring_t = ring_t[keep].contiguous()
+    return pts, ring_t
  
  
 def _boxes_in_sensor_frame(nusc, sample_token, lidar_token):
@@ -175,14 +195,37 @@ def _point_iid_for_frame(points: torch.Tensor, boxes: torch.Tensor,
     return iid
  
  
+def _cfg_get(cfg, key: str, default=None):
+    return getattr(cfg, key, default)
+
+
+def _resolve_nuscenes_version(cfg, split: str) -> str:
+    test_split = _cfg_get(cfg, "test_split", "test")
+    if split == test_split or split == "test":
+        return _cfg_get(cfg, "test_version", _cfg_get(cfg, "version", "v1.0-test"))
+    return _cfg_get(cfg, "version", "v1.0-trainval")
+
+
+def _resolve_bbox_json_path(cfg, split: str):
+    bbox_json_paths = _cfg_get(cfg, "bbox_json_paths", None)
+    if bbox_json_paths is not None and split in bbox_json_paths:
+        return bbox_json_paths[split]
+
+    bbox_json_path = _cfg_get(cfg, "bbox_json_path", None)
+    if not bbox_json_path:
+        return None
+    return bbox_json_path.format(split=split)
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # Dataset
 # ────────────────────────────────────────────────────────────────────────────
  
 class NuScenesNVSDataset(Dataset):
     """
-    For each sample, randomly selects V frames (V in [2, max_frame_gap])
-    within a 1-second window, with at least 0.1 s between consecutive frames.
+    Builds a 1-second LiDAR_TOP window at 0.1-second spacing from sample_data
+    sweeps. Inputs are the two endpoints; loss GT uses both endpoints plus a
+    small subset of the middle sweep frames.
  
     Output keys
     -----------
@@ -200,38 +243,56 @@ class NuScenesNVSDataset(Dataset):
         self.dataroot      = cfg.dataroot
         self.split         = split
         self.mode          = getattr(cfg, 'mode', 'bbox')   # 'nvs' | 'bbox'
-        self.nusc          = NuScenes(version=cfg.version,
+        self.verbose       = bool(getattr(cfg, 'verbose', False))
+        self.version       = _resolve_nuscenes_version(cfg, split)
+        self.window_us     = int(_cfg_get(cfg, "window_us", MAX_WIN_US))
+        self.sample_gap_us = int(_cfg_get(cfg, "sample_gap_us", MIN_GAP_US))
+        self.gt_middle_count = int(_cfg_get(cfg, "gt_middle_count", DEFAULT_GT_MIDDLE_COUNT))
+        self.sample_hop = max(1, self.sample_gap_us // NUSCENES_SWEEP_US)
+        self.window_hop = self.window_us // NUSCENES_SWEEP_US
+        self.window_frame_count = self.window_us // self.sample_gap_us + 1
+        self.window_sample_hops = [
+            i * self.sample_hop for i in range(self.window_frame_count)
+        ]
+
+        self.nusc          = NuScenes(version=self.version,
                                       dataroot=cfg.dataroot, verbose=False)
  
         # Optional predicted BBox JSON
         self.bbox_data = None
-        bbox_json_path = getattr(cfg, 'bbox_json_path', None)
-        if bbox_json_path is not None:
+        bbox_json_path = _resolve_bbox_json_path(cfg, split)
+        if bbox_json_path is not None and os.path.exists(bbox_json_path):
             with open(bbox_json_path) as f:
                 self.bbox_data = json.load(f)['results']
-            print(f"Loaded predicted BBox from {bbox_json_path} "
-                  f"({len(self.bbox_data)} samples)")
+            if self.verbose:
+                print(f"Loaded predicted BBox from {bbox_json_path} "
+                      f"({len(self.bbox_data)} samples)")
+        elif bbox_json_path is not None:
+            if split == _cfg_get(cfg, "test_split", "test") or split == "test":
+                if self.verbose:
+                    print(f"[{split}] BBox JSON not found, using empty boxes: {bbox_json_path}")
+            else:
+                raise FileNotFoundError(f"BBox JSON not found: {bbox_json_path}")
  
         # ── Build scene index ───────────────────────────────────────────────
         splits        = create_splits_scenes()
         split_scenes  = splits[split]
         filtered      = [s for s in self.nusc.scene if s['name'] in split_scenes]
-        print(f"[{split}] {len(filtered)} scenes")
+        if self.verbose:
+            print(f"[{split}] {len(filtered)} scenes")
  
-        # For each scene, collect all sample_data tokens (key frames only)
-        # together with their timestamps.  We index by scene so __getitem__
-        # can do random sampling at runtime.
-        self.scene_frames = []    # List[List[(lidar_token, sample_token, timestamp_us)]]
+        # For each scene, follow the LIDAR_TOP sample_data chain.  This includes
+        # non-keyframe sweeps, unlike sample['next'] which only visits keyframes.
+        self.scene_frames = []    # List[List[(lidar_token, sample_token, timestamp_us, is_key_frame)]]
         for scene in filtered:
             frames = []
-            curr   = scene['first_sample_token']
+            first_sample = self.nusc.get('sample', scene['first_sample_token'])
+            curr = first_sample['data']['LIDAR_TOP']
             while curr:
-                sample      = self.nusc.get('sample', curr)
-                lidar_token = sample['data']['LIDAR_TOP']
-                ts          = self.nusc.get('sample_data', lidar_token)['timestamp']
-                frames.append((lidar_token, curr, ts))
-                curr = sample['next']
-            if len(frames) >= 2:
+                sd = self.nusc.get('sample_data', curr)
+                frames.append((curr, sd['sample_token'], sd['timestamp'], bool(sd['is_key_frame'])))
+                curr = sd['next']
+            if len(frames) >= self.window_frame_count:
                 self.scene_frames.append(frames)
  
         # Build a flat index: each entry is (scene_idx, anchor_frame_idx)
@@ -240,15 +301,13 @@ class NuScenesNVSDataset(Dataset):
         self.index = []
         for s_idx, frames in enumerate(self.scene_frames):
             for f_idx in range(len(frames)):
-                t0 = frames[f_idx][2]
-                available = [
-                    i for i in range(f_idx, len(frames))
-                    if frames[i][2] - t0 <= MAX_WIN_US
-                ]
-                if len(available) >= 2:
+                if not frames[f_idx][3]:
+                    continue
+                if f_idx + self.window_hop < len(frames):
                     self.index.append((s_idx, f_idx))
 
-        print(f"[{split}] {len(self.index)} anchors ")
+        if self.verbose:
+            print(f"[{split}] {len(self.index)} anchors")
 
         
  
@@ -257,39 +316,40 @@ class NuScenesNVSDataset(Dataset):
 
     def _sample_frames(self, scene_idx: int, anchor_idx: int):
         """
-        0.1초 간격으로 전체 프레임 선택.
+        0.05초 LIDAR_TOP sweep chain에서 두 칸씩 건너뛰어 0.1초 간격 window 선택.
         """
-        frames     = self.scene_frames[scene_idx]
-        t0         = frames[anchor_idx][2]
-        candidates = [
-            i for i in range(anchor_idx, len(frames))
-            if frames[i][2] - t0 <= MAX_WIN_US
-        ]
-
-        selected = [anchor_idx]
-        for i in candidates[1:]:
-            t_last = frames[selected[-1]][2]
-            if frames[i][2] - t_last >= MIN_GAP_US:
-                selected.append(i)
-
+        frames = self.scene_frames[scene_idx]
+        selected = [anchor_idx + hop for hop in self.window_sample_hops]
+        if selected[-1] >= len(frames):
+            raise RuntimeError("Indexed nuScenes window became invalid.")
         return [frames[i] for i in selected]
 
     def _select_input_indices(self, V: int) -> list:
         """
-        전체 V개 프레임 중 input으로 쓸 index 선택.
-        - 항상 포함: 0 (맨 앞), V-1 (맨 뒤)
-        - 중간에서 random으로 n_input_extra개 추가
+        전체 window 중 input으로 쓸 index 선택: 항상 양끝 2프레임.
         """
-        n_extra = np.random.randint(0, self.cfg.max_input_extra + 1)
-        middle  = list(range(1, V - 1))
-        if middle and n_extra > 0:
-            n_extra  = min(n_extra, len(middle))
-            extra    = sorted(np.random.choice(middle, n_extra, replace=False).tolist())
-        else:
-            extra = []
+        return [0, V - 1]
 
-        input_indices = sorted(set([0] + extra + [V - 1]))
-        return input_indices
+    def _select_gt_indices(self, V: int) -> list:
+        """
+        Loss GT index 선택.
+        - 항상 포함: input 양끝 2프레임
+        - train: 중간 9개 중 random 3개
+        - val/test: 재현성을 위해 중간에서 고정 3개
+        """
+        middle = list(range(1, V - 1))
+        n_middle = min(self.gt_middle_count, len(middle))
+        if n_middle <= 0:
+            selected_middle = []
+        elif self.split == _cfg_get(self.cfg, "train_split", "train"):
+            selected_middle = sorted(
+                np.random.choice(middle, n_middle, replace=False).tolist()
+            )
+        else:
+            positions = np.linspace(1, len(middle), n_middle + 2)[1:-1]
+            selected_middle = [middle[int(round(p)) - 1] for p in positions]
+
+        return sorted(set([0] + selected_middle + [V - 1]))
 
  
     # ── __getitem__ ──────────────────────────────────────────────────────────
@@ -299,12 +359,18 @@ class NuScenesNVSDataset(Dataset):
  
     def __getitem__(self, idx):
         scene_idx, anchor_idx = self.index[idx]
-        sampled = self._sample_frames(scene_idx, anchor_idx)
-        V       = len(sampled)
+        window = self._sample_frames(scene_idx, anchor_idx)
+        V_window = len(window)
+        input_window_indices = self._select_input_indices(V_window)
+        gt_window_indices = self._select_gt_indices(V_window)
+        used = [window[i] for i in gt_window_indices]
+        window_to_used = {window_idx: used_idx for used_idx, window_idx in enumerate(gt_window_indices)}
+        input_indices = [window_to_used[i] for i in input_window_indices]
 
-        lidar_tokens  = [f[0] for f in sampled]
-        sample_tokens = [f[1] for f in sampled]
-        timestamps_us = [f[2] for f in sampled]
+        lidar_tokens  = [f[0] for f in used]
+        sample_tokens = [f[1] for f in used]
+        timestamps_us = [f[2] for f in used]
+        source_window_indices = [int(i) for i in gt_window_indices]
  
         # ── Poses ────────────────────────────────────────────────────────────
         s2w_list  = [_sensor_to_world(self.nusc, t) for t in lidar_tokens]
@@ -316,15 +382,21 @@ class NuScenesNVSDataset(Dataset):
             poses.append(torch.from_numpy(rel))
         pose = torch.stack(poses)                               # (V, 4, 4)
  
-        # Normalised timestamps: 0 = frame 0, 1 = last frame
-        t0, t_last = timestamps_us[0], timestamps_us[-1]
-        span       = max(t_last - t0, 1)
+        # Normalised timestamps: 0 = window start, 1 = window end
+        t0 = window[0][2]
+        t_last = window[-1][2]
+        span = max(t_last - t0, 1)
         timestamps = torch.tensor(
-            [(t - t0) / span for t in timestamps_us], dtype=torch.float32)  # (V,)
+            [(t - t0) / span for t in timestamps_us], dtype=torch.float32)  # (V_gt,)
  
         # ── Points (transform each frame into ref frame) ──────────────────
-        all_pts_sensor = [_load_points(self.nusc, self.dataroot, t)
-                          for t in lidar_tokens]                # List[Tensor(N_i,4)]
+        ego_radius = float(_cfg_get(self.cfg, "ego_radius", 0.0) or 0.0)
+        loaded_points = [
+            _load_points(self.nusc, self.dataroot, t, ego_radius=ego_radius)
+            for t in lidar_tokens
+        ]
+        all_pts_sensor = [item[0] for item in loaded_points]     # List[Tensor(N_i,4)]
+        all_lidar_ring = [item[1] for item in loaded_points]     # List[Tensor(N_i,)]
  
         all_pts_ref = []
         for pts, rel_pose in zip(all_pts_sensor, poses):
@@ -341,12 +413,9 @@ class NuScenesNVSDataset(Dataset):
         for lidar_tok, sample_tok in zip(lidar_tokens, sample_tokens):
             if self.mode == 'bbox':
                 if self.bbox_data is not None:
-                    print("bbox is not none")
                     boxes, ids = _pred_boxes_in_sensor_frame(
                         self.nusc, self.bbox_data, sample_tok, lidar_tok)
-                    print(boxes)
                 else:
-                    print("bbox is none")
                     boxes, ids = _boxes_in_sensor_frame(
                         self.nusc, sample_tok, lidar_tok)
             else:
@@ -363,21 +432,22 @@ class NuScenesNVSDataset(Dataset):
         for pts_sensor, boxes, inst_ids in zip(all_pts_sensor, bbox_list, assigned):
             iid_list.append(_point_iid_for_frame(pts_sensor, boxes, inst_ids))
  
-        # ── input index 선택 ─────────────────────────────────────────────────
-        input_indices = self._select_input_indices(V)   # ex) [0, 2, V-1]
-
         # ── input frames ─────────────────────────────────────────────────────
         input_pts_ref    = [all_pts_ref[i]    for i in input_indices]
         input_pts_sensor = [all_pts_sensor[i] for i in input_indices]
         input_bbox       = [bbox_list[i]      for i in input_indices]
+        input_bbox_iids  = [torch.tensor(assigned[i], dtype=torch.long) for i in input_indices]
         input_iid        = [iid_list[i]       for i in input_indices]
+        input_ring       = [all_lidar_ring[i] for i in input_indices]
         input_pose       = pose[input_indices]                  # (n_input, 4, 4)
         input_timestamps = timestamps[input_indices]            # (n_input,)
         input_tokens     = [lidar_tokens[i]   for i in input_indices]
 
         input_frame_counts = torch.tensor([p.shape[0] for p in input_pts_ref])
+        ref_to_sensor = torch.linalg.inv(pose)
+        input_ref_to_sensor = ref_to_sensor[input_indices]
 
-        # ── gt = 전체 ────────────────────────────────────────────────────────
+        # ── gt = input endpoints + selected middle sweeps ───────────────────
         gt_frame_counts = torch.tensor([p.shape[0] for p in all_pts_ref])
 
         # ── Camera 객체 ──────────────────────────────────────────────────────
@@ -387,11 +457,13 @@ class NuScenesNVSDataset(Dataset):
                 lidar_token=lidar_tok,
                 timestamp_normalized=ts_norm,
                 pts_sensor=pts_sensor,
+                lidar_ring=ring,
                 cfg=self.cfg,
                 uid=uid,
+                ref_to_sensor=ref_pose.numpy(),
             )
-            for uid, (lidar_tok, pts_sensor, ts_norm) in enumerate(
-                zip(input_tokens, input_pts_sensor, input_timestamps.tolist())
+            for uid, (lidar_tok, pts_sensor, ring, ts_norm, ref_pose) in enumerate(
+                zip(input_tokens, input_pts_sensor, input_ring, input_timestamps.tolist(), input_ref_to_sensor)
             )
         ]
 
@@ -401,11 +473,13 @@ class NuScenesNVSDataset(Dataset):
                 lidar_token=lidar_tok,
                 timestamp_normalized=ts_norm,
                 pts_sensor=pts_sensor,
+                lidar_ring=ring,
                 cfg=self.cfg,
                 uid=uid,
+                ref_to_sensor=ref_pose.numpy(),
             )
-            for uid, (lidar_tok, pts_sensor, ts_norm) in enumerate(
-                zip(lidar_tokens, all_pts_sensor, timestamps.tolist())
+            for uid, (lidar_tok, pts_sensor, ring, ts_norm, ref_pose) in enumerate(
+                zip(lidar_tokens, all_pts_sensor, all_lidar_ring, timestamps.tolist(), ref_to_sensor)
             )
         ]
 
@@ -414,24 +488,30 @@ class NuScenesNVSDataset(Dataset):
             # ── input ────────────────────────────────────────────────────────
             'lidar_points':           torch.cat(input_pts_ref,    dim=0),  # (N_in, 4)
             'lidar_points_sensor':    torch.cat(input_pts_sensor, dim=0),  # (N_in, 4)
+            'lidar_ring':             torch.cat(input_ring, dim=0),
             'frame_counts':           input_frame_counts,                  # (n_input,)
             'bbox':                   input_bbox,
+            'bbox_instance_ids':       input_bbox_iids,
             'point_iid':              torch.cat(input_iid, dim=0),
             'pose':                   input_pose,                          # (n_input, 4, 4)
             'timestamps':             input_timestamps,                    # (n_input,)
             'cameras':                input_cameras,
-            'input_indices':          torch.tensor(input_indices),         # 어떤 프레임이 input인지
+            'input_indices':          torch.tensor(input_indices),         # selected GT 안에서 input 위치
+            'input_window_indices':   torch.tensor(input_window_indices),  # 11-frame window 안에서 input 위치
             },
             "gt":{
-            # ── gt (전체 프레임) ──────────────────────────────────────────────
+            # ── gt (input endpoints + selected middle sweeps) ───────────────
             'gt_lidar_points':        torch.cat(all_pts_ref,    dim=0),   # (N_all, 4)
             'gt_lidar_points_sensor': torch.cat(all_pts_sensor, dim=0),
+            'gt_lidar_ring':          torch.cat(all_lidar_ring, dim=0),
             'gt_frame_counts':        gt_frame_counts,                    # (V,)
             'gt_bbox':                bbox_list,
+            'gt_bbox_instance_ids':    [torch.tensor(ids, dtype=torch.long) for ids in assigned],
             'gt_point_iid':           torch.cat(iid_list, dim=0),
             'gt_pose':                pose,                               # (V, 4, 4)
             'gt_timestamps':          timestamps,                         # (V,)
             'gt_cameras':             gt_cameras,
+            'window_indices':         torch.tensor(source_window_indices),
             }
         }
 
@@ -444,33 +524,40 @@ transform = utonia.transform.default(0.2, apply_z_positive=False)
 
 def ptv3_mod(lidar_points, offset):
     coords = lidar_points[:, :3]
+    coords_np = coords.detach().cpu().numpy().copy()
     return {
-        "coord" : coords.numpy(),
-        "color" : torch.zeros_like(coords).numpy(),
-        "normal" : torch.zeros_like(coords).numpy(),
-        "batch": offset.numpy(),
+        "coord": coords_np,
+        "color": np.zeros_like(coords_np),
+        "normal": np.zeros_like(coords_np),
+        "batch": offset.detach().cpu().numpy().copy(),
     }
 
 def multiframe_collate_fn(batch):
     all_input_pts        = []
     all_input_sensor_pts = []
+    all_input_ring       = []
     all_input_iid        = []
     all_input_bidx       = []
     all_input_counts     = []
     all_input_bbox       = []
+    all_input_bbox_iids  = []
     all_input_pose       = []
     all_input_timestamps = []
     all_input_cameras    = []
     all_input_indices    = []
+    all_input_window_indices = []
 
     all_gt_pts        = []
     all_gt_sensor_pts = []
+    all_gt_ring       = []
     all_gt_iid        = []
     all_gt_counts     = []
     all_gt_bbox       = []
+    all_gt_bbox_iids  = []
     all_gt_pose       = []
     all_gt_timestamps = []
     all_gt_cameras    = []
+    all_gt_window_indices = []
 
     for b_idx, item in enumerate(batch):
         inp = item["input"]
@@ -479,27 +566,34 @@ def multiframe_collate_fn(batch):
         N_in = inp["lidar_points"].shape[0]
         all_input_pts.append(inp["lidar_points"])
         all_input_sensor_pts.append(inp["lidar_points_sensor"])
+        all_input_ring.append(inp["lidar_ring"])
         all_input_iid.append(inp["point_iid"])
         all_input_bidx.append(torch.full((N_in,), b_idx))
         all_input_counts.append(inp["frame_counts"])
         all_input_bbox.append(inp["bbox"])
+        all_input_bbox_iids.append(inp["bbox_instance_ids"])
         all_input_pose.append(inp["pose"])
         all_input_timestamps.append(inp["timestamps"])
         all_input_cameras.append(inp["cameras"])
         all_input_indices.append(inp["input_indices"])
+        all_input_window_indices.append(inp["input_window_indices"])
 
         all_gt_pts.append(gt["gt_lidar_points"])
         all_gt_sensor_pts.append(gt["gt_lidar_points_sensor"])
+        all_gt_ring.append(gt["gt_lidar_ring"])
         all_gt_iid.append(gt["gt_point_iid"])
         all_gt_counts.append(gt["gt_frame_counts"])
         all_gt_bbox.append(gt["gt_bbox"])
+        all_gt_bbox_iids.append(gt["gt_bbox_instance_ids"])
         all_gt_pose.append(gt["gt_pose"])
         all_gt_timestamps.append(gt["gt_timestamps"])
         all_gt_cameras.append(gt["gt_cameras"])
+        all_gt_window_indices.append(gt["window_indices"])
 
     # ── input concat ─────────────────────────────────────────────────────────
     lidar_points        = torch.cat(all_input_pts,        dim=0)
     lidar_points_sensor = torch.cat(all_input_sensor_pts, dim=0)
+    lidar_ring          = torch.cat(all_input_ring,       dim=0)
     point_iid           = torch.cat(all_input_iid,        dim=0)
     batch_idx           = torch.cat(all_input_bidx,       dim=0)
     flat_counts         = torch.cat(all_input_counts,     dim=0)
@@ -508,6 +602,7 @@ def multiframe_collate_fn(batch):
     # ── gt concat ────────────────────────────────────────────────────────────
     gt_lidar_points        = torch.cat(all_gt_pts,        dim=0)
     gt_lidar_points_sensor = torch.cat(all_gt_sensor_pts, dim=0)
+    gt_lidar_ring          = torch.cat(all_gt_ring,       dim=0)
     gt_point_iid           = torch.cat(all_gt_iid,        dim=0)
     gt_flat_counts         = torch.cat(all_gt_counts,     dim=0)
     gt_offset              = torch.cumsum(gt_flat_counts, dim=0)
@@ -519,11 +614,12 @@ def multiframe_collate_fn(batch):
     for start, end in zip(starts.tolist(), offset.tolist()):
         pts_slice_sensor = lidar_points_sensor[start:end]
         coords_sensor    = pts_slice_sensor[:, :3]
+        coords_np = coords_sensor.detach().cpu().numpy().copy()
         d = {
-            "coord":  coords_sensor.numpy(),
-            "color":  np.zeros_like(coords_sensor.numpy()),
-            "normal": np.zeros_like(coords_sensor.numpy()),
-            "batch":  offset.numpy()
+            "coord": coords_np,
+            "color": np.zeros_like(coords_np),
+            "normal": np.zeros_like(coords_np),
+            "batch": offset.detach().cpu().numpy().copy(),
         }
         d = transform(d)
         ptv3_coords.append(d["coord"])
@@ -547,24 +643,30 @@ def multiframe_collate_fn(batch):
         "input": {
             "lidar_points":        lidar_points,         # (N_in, 4)
             "lidar_points_sensor": lidar_points_sensor,  # (N_in, 4)
+            "lidar_ring":          lidar_ring,           # (N_in,)
             "point_iid":           point_iid,            # (N_in,)
             "batch_idx":           batch_idx,            # (N_in,)
             "offset":              offset,               # (n_input * B,)
             "bbox":                all_input_bbox,       # List[List[Tensor(B_f, 7)]]
+            "bbox_instance_ids":    all_input_bbox_iids,  # List[List[Tensor(B_f,)]]
             "pose":                all_input_pose,       # List[Tensor(n_input, 4, 4)]
             "timestamps":          all_input_timestamps, # List[Tensor(n_input,)]
             "cameras":             all_input_cameras,    # List[List[Camera]]
             "input_indices":       all_input_indices,    # List[Tensor]
+            "input_window_indices": all_input_window_indices,
             "ptv3_input":          ptv3_input,
         },
         "gt": {
             "lidar_points":        gt_lidar_points,         # (N_all, 4)
             "lidar_points_sensor": gt_lidar_points_sensor,  # (N_all, 4)
+            "lidar_ring":          gt_lidar_ring,           # (N_all,)
             "point_iid":           gt_point_iid,            # (N_all,)
             "offset":              gt_offset,               # (V * B,)
             "bbox":                all_gt_bbox,             # List[List[Tensor(B_f, 7)]]
+            "bbox_instance_ids":    all_gt_bbox_iids,        # List[List[Tensor(B_f,)]]
             "pose":                all_gt_pose,             # List[Tensor(V, 4, 4)]
             "timestamps":          all_gt_timestamps,       # List[Tensor(V,)]
             "cameras":             all_gt_cameras,          # List[List[Camera]]
+            "window_indices":      all_gt_window_indices,
         },
     }
