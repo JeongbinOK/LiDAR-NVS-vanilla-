@@ -1,7 +1,7 @@
 device: [1, 2, 3, 4]
 
-project_name: 2dgs-utonia 
-exp_name: fixed voxelize scale
+project_name: 2dgs-utonia
+exp_name: sched_clip
 mode: train
 
 
@@ -24,7 +24,7 @@ train:
   batch_size: 1
   val_check_interval: 1.0
   max_steps: 1000000
-  ckpt_path: null
+  ckpt_path: null   # train from scratch (scheduler + grad clipping stability fix)
   grad_accum_steps: 2
 test:
   batch_size: 1
@@ -163,10 +163,10 @@ p2g:
   # Preprocessing
   ego_radius: 2.5
 
-  # Debug
-  debug_finite_check: false
-  debug_anomaly_batch: -1
-  debug_bad_grad_trace: true
+  # Debug (NaN-collapse tracking — see scripts/nan_collapse_diagnosis.md)
+  debug_finite_check: true     # log raw gaussian/render absmax + report first non-finite fwd tensor
+  debug_anomaly_batch: -1      # >=0 -> torch.autograd.set_detect_anomaly (slow, raises on first NaN)
+  debug_bad_grad_trace: true   # on non-finite grad: list offending params, then SKIP the step
   debug_bad_grad_trace_max: 16
 
 g2g:

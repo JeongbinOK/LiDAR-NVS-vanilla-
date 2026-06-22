@@ -59,6 +59,12 @@ class Loss(nn.Module):
                    ((mu_x ** 2 + mu_y ** 2 + C1) * (sigma_x + sigma_y + C2))
         return ssim_map.mean()
 
+    @staticmethod
+    def _flatten_maps(*maps):
+        """[B, Cam, H, W] -> [B*Cam, 1, H, W] for image metrics."""
+        B, Cam, H, W = maps[0].shape
+        return [m.view(-1, 1, H, W) for m in maps]
+
     def _calculate_lpips(self, pred, gt):
         """[B, C, H, W] 텐서의 LPIPS 스코어 계산"""
         if self.lpips_fn is None:
@@ -80,7 +86,7 @@ class Loss(nn.Module):
             score = self.lpips_fn(p_img, g_img).mean()
         return score
 
-    def forward(self, all_renders):
+    def forward(self, all_renders, *, metric_mode="train"):
         losses = {}
 
         # 데이터 세팅
@@ -161,27 +167,65 @@ class Loss(nn.Module):
         # ----------------------------------------------------------
         # 2. 로그 및 평가 전용 Metrics 계산 (역전파 제외 / 단순 로깅용)
         # ----------------------------------------------------------
-        # 2D 이미지화 시키기 위해 고차원 구조 [B, Cam, H, W] -> [B*Cam, 1, H, W] 평탄화
-        B, Cam, H, W = pred_depth.shape
-        p_depth_2d = pred_depth.view(-1, 1, H, W)
-        g_depth_2d = gt_depth.view(-1, 1, H, W)
-        p_int_2d = pred_intensity.view(-1, 1, H, W)
-        g_int_2d = gt_intensity.view(-1, 1, H, W)
-        valid_2d = valid.view(-1, 1, H, W)
+        # valid metrics: depth/intensity 품질을 raydrop과 분리해서 보기 위한 train/debug 지표.
+        p_depth_2d, g_depth_2d, p_int_2d, g_int_2d, valid_2d = self._flatten_maps(
+            pred_depth,
+            gt_depth,
+            pred_intensity,
+            gt_intensity,
+            valid,
+        )
+
+        p_depth_valid_2d = p_depth_2d * valid_2d
+        g_depth_valid_2d = g_depth_2d * valid_2d
+        p_int_valid_2d = p_int_2d * valid_2d
+        g_int_valid_2d = g_int_2d * valid_2d
+
+        losses["intensity_psnr_valid"] = self._calculate_psnr(p_int_2d, g_int_2d, mask=valid_2d)
+        losses["intensity_ssim_valid"] = self._calculate_ssim(p_int_valid_2d, g_int_valid_2d)
+        losses["depth_psnr_valid"] = self._calculate_psnr(p_depth_2d, g_depth_2d, mask=valid_2d, peak=80.0)
+        losses["depth_ssim_valid"] = self._calculate_ssim(p_depth_valid_2d, g_depth_valid_2d, data_range=80.0)
+
+        # raydrop metrics: GS-LiDAR eval 방식처럼 predicted drop 픽셀을 no-return(0)으로 만든 뒤
+        # full-map PSNR/SSIM을 계산한다. val/test의 기본 metric alias로 사용한다.
+        pred_keep = (pred_raydrop.detach() <= 0.5).to(dtype=pred_depth.dtype)
+        pred_depth_raydrop = pred_depth * pred_keep
+        pred_intensity_raydrop = pred_intensity * pred_keep
+        p_depth_raydrop_2d, p_int_raydrop_2d = self._flatten_maps(
+            pred_depth_raydrop,
+            pred_intensity_raydrop,
+        )
+
+        losses["intensity_psnr_raydrop"] = self._calculate_psnr(p_int_raydrop_2d, g_int_2d)
+        losses["intensity_ssim_raydrop"] = self._calculate_ssim(p_int_raydrop_2d, g_int_2d)
+        losses["depth_psnr_raydrop"] = self._calculate_psnr(p_depth_raydrop_2d, g_depth_2d, peak=80.0)
+        losses["depth_ssim_raydrop"] = self._calculate_ssim(p_depth_raydrop_2d, g_depth_2d, data_range=80.0)
+
+        use_raydrop_metrics = metric_mode in {"val", "test", "eval"}
+        if use_raydrop_metrics:
+            primary_intensity_pred = p_int_raydrop_2d
+            primary_depth_pred = p_depth_raydrop_2d
+            losses["intensity_psnr"] = losses["intensity_psnr_raydrop"]
+            losses["intensity_ssim"] = losses["intensity_ssim_raydrop"]
+            losses["depth_psnr"] = losses["depth_psnr_raydrop"]
+            losses["depth_ssim"] = losses["depth_ssim_raydrop"]
+        else:
+            primary_intensity_pred = p_int_valid_2d
+            primary_depth_pred = p_depth_valid_2d
+            losses["intensity_psnr"] = losses["intensity_psnr_valid"]
+            losses["intensity_ssim"] = losses["intensity_ssim_valid"]
+            losses["depth_psnr"] = losses["depth_psnr_valid"]
+            losses["depth_ssim"] = losses["depth_ssim_valid"]
 
         # Intensity Metrics
-        losses["intensity_psnr"] = self._calculate_psnr(p_int_2d, g_int_2d, mask=valid_2d)
-        losses["intensity_ssim"] = self._calculate_ssim(p_int_2d, g_int_2d)
         if self.enable_lpips:
-            intensity_lpips = self._calculate_lpips(p_int_2d, g_int_2d)
+            intensity_lpips = self._calculate_lpips(primary_intensity_pred, g_int_2d)
             if intensity_lpips is not None:
                 losses["intensity_lpips"] = intensity_lpips
 
         # Depth Metrics (depth는 raw 미터값이므로 peak/data_range를 실제 범위 80m로 지정)
-        losses["depth_psnr"] = self._calculate_psnr(p_depth_2d, g_depth_2d, mask=valid_2d, peak=80.0)
-        losses["depth_ssim"] = self._calculate_ssim(p_depth_2d, g_depth_2d, data_range=80.0)
         if self.enable_lpips:
-            depth_lpips = self._calculate_lpips(p_depth_2d, g_depth_2d)
+            depth_lpips = self._calculate_lpips(primary_depth_pred, g_depth_2d)
             if depth_lpips is not None:
                 losses["depth_lpips"] = depth_lpips
 

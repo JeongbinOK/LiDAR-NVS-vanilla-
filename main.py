@@ -80,10 +80,11 @@ def main(cfg):
             if len(cfg.device) > 1
             else "auto"
         ),
-        callbacks=[checkpoint_callback],
+        callbacks=callbacks + [checkpoint_callback],
         val_check_interval=cfg.train.val_check_interval,
         enable_progress_bar=True,
-        # gradient_clip_val=cfg.trainer.gradient_clip_val,
+        gradient_clip_val=cfg.train.grad_clip,
+        gradient_clip_algorithm="norm",
         accumulate_grad_batches=cfg.train.grad_accum_steps,
         max_steps=cfg.train.max_steps,
         precision = "32"

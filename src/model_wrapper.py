@@ -1,11 +1,18 @@
 import torch
 import json
+import math
 from pathlib import Path
 
 from src.models_new.module import Point2Gaus, GausTemp, GausRender
 #from src.models_new.utils.eval_utils import evaluate_pair_sample, write_ply
 from lightning.pytorch import LightningModule
 from src.models_new.utils.loss import Loss
+from src.models_new.utils.debug_finite import (
+    first_nonfinite,
+    gaussian_health_stats,
+    gaussian_param_absmax,
+    tensor_report,
+)
 
 class ModelWrapper(LightningModule):
     def __init__(
@@ -27,7 +34,26 @@ class ModelWrapper(LightningModule):
         self.g2p_model = GausRender(self.g2p_cfg)
         self.loss = Loss(self.cfg.loss)
         self._eval_pair_summaries: dict[str, list[dict]] = {}
- 
+
+        # --- NaN-collapse diagnostics (see scripts/nan_collapse_diagnosis.md) ---
+        self._dbg_finite = bool(getattr(self.p2g_cfg, "debug_finite_check", False))
+        self._dbg_grad_trace = bool(getattr(self.p2g_cfg, "debug_bad_grad_trace", False))
+        self._dbg_grad_trace_max = int(getattr(self.p2g_cfg, "debug_bad_grad_trace_max", 16))
+        self._dbg_anomaly_batch = int(getattr(self.p2g_cfg, "debug_anomaly_batch", -1))
+        self._nonfinite_skips = 0
+        self._last_dbg = {}
+        self._last_batch_idx = -1
+        # per-attribute non-finite *gradient* counts since last optimizer step
+        self._attr_grad_nf = {}
+
+
+    def on_fit_start(self):
+        # Precise backward-op localization (slow; raises on first NaN). Opt-in.
+        if self._dbg_anomaly_batch >= 0:
+            torch.autograd.set_detect_anomaly(True)
+            if self._is_rank_zero():
+                print("[debug] torch.autograd.set_detect_anomaly(True) enabled")
+
 
     def training_step(self, batch, batch_idx):
         return self._shared_step(batch, batch_idx, prefix="train")
@@ -47,8 +73,11 @@ class ModelWrapper(LightningModule):
         out = self.g2g_model(out, _input["timestamps"])
         all_renders = self.g2p_model(out, gt)
 
-        loss_dict = self.loss(all_renders)
+        loss_dict = self.loss(all_renders, metric_mode=prefix)
         self._log_losses(loss_dict, prefix=prefix, batch_size=self._batch_size(_input))
+
+        if self._dbg_finite and prefix == "train":
+            self._debug_forward(out, all_renders, loss_dict, batch_idx)
 
         if self.step_tracker is not None:
             self.step_tracker.set_step(self.global_step)
@@ -58,7 +87,57 @@ class ModelWrapper(LightningModule):
 
         return loss_dict["total"]
 
+    def _debug_forward(self, out, all_renders, loss_dict, batch_idx):
+        """Log raw gaussian/render magnitudes and report the first non-finite
+        forward tensor. `out` is the GausTemp output (list of per-batch b_gs)."""
+        self._last_batch_idx = int(batch_idx)
+        batch_gaussians = out if isinstance(out, list) else out.get("batch_gaussians", [])
 
+        stats = gaussian_param_absmax(batch_gaussians)
+        self._last_dbg = dict(stats)
+        for k, v in stats.items():
+            self.log(f"train/dbg_{k}_absmax", float(v), on_step=True, on_epoch=False,
+                     batch_size=1, rank_zero_only=True)
+
+        # Health metrics absmax misses (median scale, MIN quat norm).
+        for k, v in gaussian_health_stats(batch_gaussians).items():
+            self.log(f"train/dbg_{k}", float(v), on_step=True, on_epoch=False,
+                     batch_size=1, rank_zero_only=True)
+
+        # Per-attribute gradient hooks: isolate WHICH gaussian attribute's grad
+        # goes non-finite (scaling vs rotation vs opacity vs ...). The hook fires
+        # during Lightning's backward, before on_before_optimizer_step reads it.
+        for b_gs in batch_gaussians:
+            if not isinstance(b_gs, dict):
+                continue
+            for attr in ("scaling", "rotation", "opacity", "shs", "position"):
+                t = b_gs.get(attr)
+                if torch.is_tensor(t) and t.requires_grad:
+                    t.register_hook(self._make_grad_check_hook(attr))
+
+        # First non-finite tensor, scanned forward -> backward order.
+        named = []
+        for b, b_gs in enumerate(batch_gaussians):
+            if isinstance(b_gs, dict):
+                for k in ("scaling", "opacity", "rotation", "position", "shs"):
+                    named.append((f"gauss[{b}].{k}", b_gs.get(k)))
+        for k in ("depth", "depth_median", "intensity_sh", "raydrop"):
+            named.append((f"render.{k}", all_renders.get(k)))
+        for k, v in loss_dict.items():
+            named.append((f"loss.{k}", v))
+
+        name, t = first_nonfinite(named)
+        if name is not None and self._is_rank_zero():
+            print(f"[NONFINITE-FWD] step={self.global_step} epoch={self.current_epoch} "
+                  f"batch={batch_idx} first={name} :: {tensor_report(t)} | "
+                  f"raw_gauss_absmax={ {k: round(v, 3) for k, v in stats.items()} }", flush=True)
+
+    def _make_grad_check_hook(self, attr):
+        def hook(grad):
+            if grad is not None and not torch.isfinite(grad).all():
+                self._attr_grad_nf[attr] = self._attr_grad_nf.get(attr, 0) + 1
+            return grad
+        return hook
 
     def on_validation_epoch_start(self) -> None:
         self._eval_pair_summaries["val"] = []
@@ -173,7 +252,81 @@ class ModelWrapper(LightningModule):
             lr=lr,
             weight_decay=weight_decay,
         )
-        return optimizer
+
+        # Linear warmup (over warmup_iters optimizer steps) -> cosine decay to 0
+        # over the full run. Stepped per-optimizer-step (interval="step"), so the
+        # warmup count is in optimizer steps (matches config warmup_iters).
+        warmup = int(getattr(opt_cfg, "warmup_iters", 0) or 0)
+        total_steps = int(self.trainer.estimated_stepping_batches)
+        total_steps = max(total_steps, warmup + 1)
+        if self._is_rank_zero():
+            print(f"[sched] AdamW lr={lr} warmup_iters={warmup} "
+                  f"total_optimizer_steps={total_steps} (cosine decay)", flush=True)
+
+        def lr_lambda(step):
+            if warmup > 0 and step < warmup:
+                return float(step + 1) / float(warmup)
+            progress = float(step - warmup) / float(max(1, total_steps - warmup))
+            progress = min(max(progress, 0.0), 1.0)
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {"scheduler": scheduler, "interval": "step", "frequency": 1},
+        }
+
+    def on_before_optimizer_step(self, optimizer, *args):
+        """Skip the step if any gradient is non-finite, instead of letting a
+        single bad batch poison every parameter + AdamW moment buffer forever.
+
+        Under DDP, gradients are already all-reduced here, so every rank sees
+        the same (NaN-propagated) grads and makes the same skip decision -> the
+        ranks stay in sync. This is a SAFETY NET, not the cure: a chronic
+        trigger degrades into silently skipping many steps (watch the counter).
+        """
+        nonfinite = False
+        bad = []
+        sq = 0.0  # sum of squared grad norms over finite grads (pre-clip)
+        for name, p in self.named_parameters():
+            g = p.grad
+            if g is None:
+                continue
+            if torch.isfinite(g).all():
+                sq += float(g.detach().norm()) ** 2
+            else:
+                nonfinite = True
+                if self._dbg_grad_trace and len(bad) < self._dbg_grad_trace_max:
+                    bad.append((name, int(torch.isnan(g).sum()),
+                                int(torch.isinf(g).sum()), tuple(g.shape)))
+
+        # Pre-clip global grad norm — to judge whether grad_clip max_norm is sane
+        # (clips only when this exceeds max_norm; want typical < max_norm < spikes).
+        self.log("train/grad_norm", float(sq ** 0.5), on_step=True, on_epoch=False,
+                 batch_size=1, rank_zero_only=True)
+
+        # Which gaussian attribute(s) produced the non-finite grad (from hooks).
+        attr_nf = dict(self._attr_grad_nf)
+        for attr in ("scaling", "rotation", "opacity", "shs", "position"):
+            self.log(f"train/dbg_gradnf_{attr}", float(attr_nf.get(attr, 0)),
+                     on_step=True, on_epoch=False, batch_size=1, rank_zero_only=True)
+        self._attr_grad_nf = {}  # reset for next optimizer step
+
+        if not nonfinite:
+            return
+
+        self._nonfinite_skips += 1
+        if self._is_rank_zero():
+            print(f"[NONFINITE-GRAD] step={self.global_step} epoch={self.current_epoch} "
+                  f"batch={self._last_batch_idx} total_skips={self._nonfinite_skips} "
+                  f"| culprit_attr={attr_nf} "
+                  f"| last_raw_gauss_absmax={ {k: round(v, 3) for k, v in self._last_dbg.items()} }",
+                  flush=True)
+            for nm, nan, inf, sh in bad:
+                print(f"    grad {nm}: nan={nan} inf={inf} shape={sh}", flush=True)
+        self.log("train/nonfinite_grad_skips", float(self._nonfinite_skips),
+                 on_step=True, on_epoch=False, batch_size=1, rank_zero_only=True)
+        optimizer.zero_grad(set_to_none=True)
 
     # def _write_eval_artifacts(self, batch, batch_idx: int, *, prefix: str) -> None:
     #     if not self._is_rank_zero():

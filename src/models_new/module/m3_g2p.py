@@ -7,7 +7,9 @@ class GausRender(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
-        self.background = torch.tensor([1, 1, 1, 1], dtype=torch.float32)
+        # Channels are [unused, unused, intensity, raydrop]. No-return background
+        # should carry zero intensity/depth support and raydrop probability 1.
+        self.background = torch.tensor([0, 0, 0, 1], dtype=torch.float32)
 
     def pack_lidar_shs(self, shs):
         if shs.dim() == 3:
