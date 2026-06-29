@@ -1,0 +1,288 @@
+"""LiDAR4D / GS-LiDAR-style temporal NVS evaluation on the 5 Table S6 nuScenes
+sequences (v1.0-trainval).
+
+Protocol (1-second temporal novel-view synthesis):
+  per sequence, for each target second T in {1,2,3,4}:
+      input  = LiDAR at (T-0.5)s and (T+0.5)s
+      render = predict the panorama at T s and compare to the GT frame at T s.
+
+Metrics follow the official GS-LiDAR code (utils/metrics_utils.py):
+  depth / intensity : RMSE, MedAE, LPIPS(alex), SSIM, PSNR  (raydrop-masked, full map)
+  raydrop           : RMSE, Acc, F1
+  points            : Chamfer distance, F-score@0.05
+Our depth is already in meters (g2p.scale_factor == 1.0), so GS-LiDAR's
+`scale_factor` rescale is NOT applied (scale=1.0).
+
+Usage:
+  python test_lidar4d_nvs.py test.ckpt_path=/path/to/epoch=XX.ckpt \
+      [data.mode=bbox] [out_dir=outputs/lidar4d_eval] [device='[4]']
+"""
+from __future__ import annotations
+
+import json
+import os
+from collections import defaultdict
+from pathlib import Path
+
+import numpy as np
+import torch
+from omegaconf import OmegaConf
+from torch.utils.data import DataLoader
+from torchvision.utils import make_grid, save_image
+
+from src.model_wrapper import ModelWrapper
+from src.dataloader.nuscene import multiframe_collate_fn
+from src.dataloader.nuscene_lidar4d_test import LiDAR4DNuScenesTestDataset
+from src.eval.gslidar_metrics import (
+    MetricBackends, depth_errors, intensity_errors, raydrop_errors, point_metrics,
+)
+from src.eval.gaussian_viz import (
+    gaussians_from_output, save_sequence_html,
+    surfels_from_output, save_sequence_surfel_html,
+)
+from src.eval.gaussian_stats import collect_window_stats, analyze_gaussian_sizes
+from src.models_new.utils.render import visualize_depth
+
+CONFIG_PATH = "/data/jeongbin/utonia/config/nuscene_train.yaml"
+
+
+# ---------------------------------------------------------------------------
+def to_device(obj, device):
+    """Move all tensors (leave Camera/other objects untouched -- render moves
+    their tensors internally)."""
+    if torch.is_tensor(obj):
+        return obj.to(device)
+    if isinstance(obj, dict):
+        return {k: to_device(v, device) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [to_device(v, device) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(to_device(v, device) for v in obj)
+    return obj
+
+
+def load_model(cfg, ckpt_path, device):
+    model = ModelWrapper(cfg, step_tracker=None)
+    if ckpt_path:
+        blob = torch.load(ckpt_path, map_location="cpu")
+        state = blob.get("state_dict", blob) if isinstance(blob, dict) else blob
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        print(f"[ckpt] {ckpt_path}\n       loaded "
+              f"(missing={len(missing)}, unexpected={len(unexpected)})")
+    else:
+        print("[ckpt] WARNING: no checkpoint -> randomly initialized weights")
+    model.eval().to(device)
+    return model
+
+
+def _viz_depth_black_holes(depth_1hw, near=2, far=50):
+    """Colorize depth (turbo), but paint no-return pixels (depth==0) BLACK so
+    they are not confused with near-range red (the -log curve maps both 0 and
+    near depth to turbo's red end)."""
+    vis = visualize_depth(depth_1hw, near=near, far=far)      # [3,H,W]
+    keep = (depth_1hw[0] > 0).to(vis.dtype).to(vis.device)   # [H,W]
+    return vis * keep
+
+
+def save_viz(out_png, depth_keep, gt_depth, intensity_keep, gt_intensity, raydrop):
+    rows = [
+        _viz_depth_black_holes(depth_keep),                   # pred depth  [3,H,W]
+        _viz_depth_black_holes(gt_depth),                     # gt depth (holes=black)
+        intensity_keep.clamp(0, 1).repeat(3, 1, 1),           # pred intensity
+        gt_intensity.clamp(0, 1).repeat(3, 1, 1),             # gt intensity
+        visualize_depth(raydrop, near=0.01, far=1),           # pred raydrop prob
+    ]
+    grid = make_grid(torch.stack([r.detach().cpu() for r in rows], dim=0), nrow=1)
+    save_image(grid, str(out_png))
+
+
+def _agg(window_metrics, key, sub):
+    vals = [w[key][sub] for w in window_metrics if not np.isnan(w[key][sub])]
+    return float(np.mean(vals)) if vals else float("nan")
+
+
+def summarize(window_metrics):
+    out = {}
+    for key, subs in (("depth", ["rmse", "medae", "lpips", "ssim", "psnr"]),
+                      ("intensity", ["rmse", "medae", "lpips", "ssim", "psnr"]),
+                      ("raydrop", ["rmse", "acc", "f1"]),
+                      ("points", ["cd", "fscore"])):
+        out[key] = {s: _agg(window_metrics, key, s) for s in subs}
+    return out
+
+
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def main(cfg):
+    device = f"cuda:{int(cfg.device[0])}" if len(cfg.device) else "cuda:0"
+    torch.cuda.set_device(device)
+    out_dir = Path(str(cfg.get("out_dir", os.path.join(cfg.logger.dir, "lidar4d_eval"))))
+    viz_dir = out_dir / "viz"
+    viz_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"[setup] device={device} mode={cfg.data.mode} out_dir={out_dir}")
+    print("[setup] scale_factor=1.0 (depth already in meters; GS-LiDAR rescale N/A)")
+
+    model = load_model(cfg, cfg.test.ckpt_path, device)
+    backends = MetricBackends(lpips_net="alex")
+
+    dataset = LiDAR4DNuScenesTestDataset(cfg.data, split=cfg.data.test_split)
+    target_cam = dataset.target_cam_index
+    loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0,
+                        collate_fn=multiframe_collate_fn)
+
+    vfov = tuple(cfg.data.vfov)
+    window_metrics = []  # list of dicts (with seq_name / target_s)
+    seq_gauss = defaultdict(list)   # seq_name -> [{label, static, dynamic}] center-point HTML
+    seq_surfel = defaultdict(list)  # seq_name -> [{label, static, dynamic, boxes}] 1σ-surfel HTML
+    gauss_dir = viz_dir / "gaussians"
+    gauss_dir.mkdir(parents=True, exist_ok=True)
+    size_records = []                     # per-window Gaussian-size stats (all)
+    size_by_split = defaultdict(list)     # per nuScenes split
+
+    limit = int(cfg.get("limit", 0)) or len(dataset)
+    for i, batch in enumerate(loader):
+        if i >= limit:
+            break
+        meta = dataset.index_meta[i]
+        seq_name, target_s = meta["seq_name"], meta["target_s"]
+        scene, nuscenes_split = meta["scene"], meta["nuscenes_split"]
+        batch = to_device(batch, device)
+        _input, gt = batch["input"], batch["gt"]
+
+        out = model.p2g_model(_input, batch_idx=i, mode="test")
+        out = model.g2g_model(out, _input["timestamps"])
+        renders = model.g2p_model(out, gt)
+
+        b = 0
+        depth = renders["depth"][b, target_cam]            # [1,H,W]
+        intensity = renders["intensity_sh"][b, target_cam]
+        raydrop = renders["raydrop"][b, target_cam]
+        gt_depth = renders["gt_depth"][b, target_cam]
+        gt_intensity = renders["gt_intensity_sh"][b, target_cam]
+
+        # GS-LiDAR: zero out predicted-drop pixels before depth/intensity/points.
+        keep = (raydrop <= 0.5).to(depth.dtype)
+        depth_keep = depth * keep
+        intensity_keep = intensity * keep
+        gt_raydrop = (gt_depth <= 0).to(depth.dtype)  # 1 = dropped
+
+        gt_cam = gt["cameras"][b][target_cam]
+        row_to_theta = gt_cam.row_to_theta
+
+        wm = {
+            "seq_name": seq_name,
+            "target_s": target_s,
+            "scene": scene,
+            "nuscenes_split": nuscenes_split,
+            "depth": depth_errors(depth_keep, gt_depth, backends),
+            "intensity": intensity_errors(intensity_keep, gt_intensity, backends),
+            "raydrop": raydrop_errors(raydrop, gt_raydrop),
+            "points": point_metrics(depth_keep, gt_depth, row_to_theta, backends,
+                                    vfov=vfov),
+        }
+        window_metrics.append(wm)
+        save_viz(viz_dir / f"{seq_name}_T{target_s}s.png",
+                 depth_keep, gt_depth, intensity_keep, gt_intensity, raydrop)
+
+        # Gaussian centers + 1σ surfels at this window's target time (per-seq HTML).
+        static_xyz, dynamic_xyz = gaussians_from_output(
+            model.g2p_model, out[b], float(gt_cam.timestamp))
+        seq_gauss[seq_name].append({
+            "label": f"T={target_s}s", "static": static_xyz, "dynamic": dynamic_xyz})
+        surf = surfels_from_output(model.g2p_model, out[b], float(gt_cam.timestamp))
+        seq_surfel[seq_name].append({
+            "label": f"T={target_s}s", "static": surf["static"],
+            "dynamic": surf["dynamic"], "boxes": surf["boxes"]})
+
+        # per-window Gaussian-size statistics (effective radius vs geometry)
+        st = collect_window_stats(model.g2p_model, out[b], float(gt_cam.timestamp))
+        size_records.append(st)
+        size_by_split[nuscenes_split].append(st)
+
+        print(f"[{i+1:02d}/{len(dataset)}] {seq_name} T={target_s}s | "
+              f"depth RMSE={wm['depth']['rmse']:.3f} PSNR={wm['depth']['psnr']:.2f} | "
+              f"int RMSE={wm['intensity']['rmse']:.3f} | "
+              f"CD={wm['points']['cd']:.4f} F={wm['points']['fscore']:.3f}")
+
+    # ── per-sequence 3D Gaussian HTML (buttons 1..4 = target seconds) ───────
+    for seq_name, frames in seq_gauss.items():
+        sp = next((w["nuscenes_split"] for w in window_metrics
+                   if w["seq_name"] == seq_name), "")
+        save_sequence_html(gauss_dir / f"{seq_name}.html",
+                           title=f"{seq_name}  ({sp})  — Gaussian centers", frames=frames)
+        save_sequence_surfel_html(gauss_dir / f"{seq_name}_surfel.html",
+                                  title=f"{seq_name}  ({sp})", frames=seq_surfel[seq_name])
+    print(f"[gaussians] wrote {len(seq_gauss)} center + {len(seq_surfel)} surfel HTML -> {gauss_dir}")
+
+    # ── Gaussian-size statistical analysis (overall + per nuScenes split) ────
+    print("\n" + "-" * 70)
+    print(analyze_gaussian_sizes(size_records, out_dir, tag="all"))
+    for sp in sorted(size_by_split):
+        print(analyze_gaussian_sizes(size_by_split[sp], out_dir, tag=sp))
+
+    # ── aggregate (overall + per nuScenes split + per sequence) ─────────────
+    overall = summarize(window_metrics)
+    per_seq = {}
+    by_seq = defaultdict(list)
+    for wm in window_metrics:
+        by_seq[wm["seq_name"]].append(wm)
+    for name, wms in by_seq.items():
+        per_seq[name] = summarize(wms)
+
+    # val = clean held-out; train = seen during training (leakage) for a
+    # feed-forward model trained on the nuScenes train split.
+    per_split = {}
+    by_split = defaultdict(list)
+    for wm in window_metrics:
+        by_split[wm["nuscenes_split"]].append(wm)
+    for sp, wms in by_split.items():
+        per_split[sp] = summarize(wms)
+        per_split[sp]["sequences"] = sorted({w["seq_name"] for w in wms})
+        per_split[sp]["num_windows"] = len(wms)
+
+    payload = {
+        "config": {"ckpt": cfg.test.ckpt_path, "mode": cfg.data.mode,
+                   "version": cfg.data.version, "scale_factor": 1.0,
+                   "vfov": list(vfov), "target_seconds": [1, 2, 3, 4]},
+        "overall": overall,
+        "per_nuscenes_split": per_split,
+        "per_sequence": per_seq,
+        "windows": window_metrics,
+    }
+    with open(out_dir / "metrics.json", "w") as f:
+        json.dump(payload, f, indent=2)
+
+    # ── print table ─────────────────────────────────────────────────────────
+    def fmt(s):
+        d, it, rd, pt = s["depth"], s["intensity"], s["raydrop"], s["points"]
+        return (f"  depth : RMSE={d['rmse']:.3f} MedAE={d['medae']:.3f} "
+                f"LPIPS={d['lpips']:.3f} SSIM={d['ssim']:.3f} PSNR={d['psnr']:.2f}\n"
+                f"  inten : RMSE={it['rmse']:.3f} MedAE={it['medae']:.3f} "
+                f"LPIPS={it['lpips']:.3f} SSIM={it['ssim']:.3f} PSNR={it['psnr']:.2f}\n"
+                f"  raydp : RMSE={rd['rmse']:.3f} Acc={rd['acc']:.3f} F1={rd['f1']:.3f}\n"
+                f"  point : CD={pt['cd']:.4f} F-score@0.05={pt['fscore']:.3f}")
+
+    seq_split = {wm["seq_name"]: wm["nuscenes_split"] for wm in window_metrics}
+    print("\n" + "=" * 70)
+    print("PER-SEQUENCE")
+    for name in sorted(per_seq):
+        print(f"[{name}  ({seq_split[name]})]\n{fmt(per_seq[name])}")
+    print("-" * 70)
+    print("PER nuScenes SPLIT  (val = clean held-out; train = SEEN during training)")
+    for sp in sorted(per_split):
+        print(f"<{sp}>  seqs={per_split[sp]['sequences']}  "
+              f"n={per_split[sp]['num_windows']}\n{fmt(per_split[sp])}")
+    print("-" * 70)
+    print(f"OVERALL (mean over {len(window_metrics)} windows)")
+    print(fmt(overall))
+    print("=" * 70)
+    print(f"\nsaved: {out_dir/'metrics.json'}  |  viz: {viz_dir}")
+
+
+if __name__ == "__main__":
+    base = OmegaConf.load(CONFIG_PATH)
+    cli = OmegaConf.from_cli()
+    cfg = OmegaConf.merge(base, cli)
+    cfg.mode = "test"
+    main(cfg)
