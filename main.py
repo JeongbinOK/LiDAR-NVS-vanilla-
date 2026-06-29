@@ -11,7 +11,7 @@ import warnings
 import torch
 from torch.utils.data import DataLoader
 from lightning.pytorch import Trainer
-from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
+from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers.wandb import WandbLogger
 from lightning.pytorch.plugins.environments import SLURMEnvironment
 from omegaconf import DictConfig, OmegaConf
@@ -54,7 +54,6 @@ def main(cfg):
             save_dir=cfg.logger.dir,
             config=OmegaConf.to_container(cfg),
         )
-        callbacks.append(LearningRateMonitor("step", True))
 
         # On rank != 0, wandb.run is None.
         # if wandb.run is not None:

@@ -9,10 +9,27 @@ from lightning.pytorch import LightningModule
 from src.models_new.utils.loss import Loss
 from src.models_new.utils.debug_finite import (
     first_nonfinite,
-    gaussian_health_stats,
     gaussian_param_absmax,
     tensor_report,
 )
+
+WANDB_COMMON_LOSS_KEYS = {
+    "loss_depth",
+    "loss_depth_median",
+    "loss_intensity",
+    "loss_raydrop",
+    "loss_chamfer",
+    "render_points_mean",
+    "intensity_psnr_valid",
+    "intensity_ssim_valid",
+    "depth_psnr_valid",
+    "depth_ssim_valid",
+    "intensity_psnr_raydrop",
+    "intensity_ssim_raydrop",
+    "depth_psnr_raydrop",
+    "depth_ssim_raydrop",
+    "total",
+}
 
 class ModelWrapper(LightningModule):
     def __init__(
@@ -95,14 +112,6 @@ class ModelWrapper(LightningModule):
 
         stats = gaussian_param_absmax(batch_gaussians)
         self._last_dbg = dict(stats)
-        for k, v in stats.items():
-            self.log(f"train/dbg_{k}_absmax", float(v), on_step=True, on_epoch=False,
-                     batch_size=1, rank_zero_only=True)
-
-        # Health metrics absmax misses (median scale, MIN quat norm).
-        for k, v in gaussian_health_stats(batch_gaussians).items():
-            self.log(f"train/dbg_{k}", float(v), on_step=True, on_epoch=False,
-                     batch_size=1, rank_zero_only=True)
 
         # Per-attribute gradient hooks: isolate WHICH gaussian attribute's grad
         # goes non-finite (scaling vs rotation vs opacity vs ...). The hook fires
@@ -162,6 +171,8 @@ class ModelWrapper(LightningModule):
 
     def _log_losses(self, losses: dict, *, prefix: str, batch_size: int) -> None:
         for key, value in losses.items():
+            if key not in WANDB_COMMON_LOSS_KEYS:
+                continue
             if not torch.is_tensor(value):
                 continue
             self.log(
@@ -287,46 +298,33 @@ class ModelWrapper(LightningModule):
         """
         nonfinite = False
         bad = []
-        sq = 0.0  # sum of squared grad norms over finite grads (pre-clip)
         for name, p in self.named_parameters():
             g = p.grad
             if g is None:
                 continue
-            if torch.isfinite(g).all():
-                sq += float(g.detach().norm()) ** 2
-            else:
+            if not torch.isfinite(g).all():
                 nonfinite = True
                 if self._dbg_grad_trace and len(bad) < self._dbg_grad_trace_max:
                     bad.append((name, int(torch.isnan(g).sum()),
                                 int(torch.isinf(g).sum()), tuple(g.shape)))
 
-        # Pre-clip global grad norm — to judge whether grad_clip max_norm is sane
-        # (clips only when this exceeds max_norm; want typical < max_norm < spikes).
-        self.log("train/grad_norm", float(sq ** 0.5), on_step=True, on_epoch=False,
-                 batch_size=1, rank_zero_only=True)
-
-        # Which gaussian attribute(s) produced the non-finite grad (from hooks).
         attr_nf = dict(self._attr_grad_nf)
-        for attr in ("scaling", "rotation", "opacity", "shs", "position"):
-            self.log(f"train/dbg_gradnf_{attr}", float(attr_nf.get(attr, 0)),
-                     on_step=True, on_epoch=False, batch_size=1, rank_zero_only=True)
         self._attr_grad_nf = {}  # reset for next optimizer step
 
-        if not nonfinite:
-            return
-
-        self._nonfinite_skips += 1
-        if self._is_rank_zero():
-            print(f"[NONFINITE-GRAD] step={self.global_step} epoch={self.current_epoch} "
-                  f"batch={self._last_batch_idx} total_skips={self._nonfinite_skips} "
-                  f"| culprit_attr={attr_nf} "
-                  f"| last_raw_gauss_absmax={ {k: round(v, 3) for k, v in self._last_dbg.items()} }",
-                  flush=True)
-            for nm, nan, inf, sh in bad:
-                print(f"    grad {nm}: nan={nan} inf={inf} shape={sh}", flush=True)
+        if nonfinite:
+            self._nonfinite_skips += 1
+            if self._is_rank_zero():
+                print(f"[NONFINITE-GRAD] step={self.global_step} epoch={self.current_epoch} "
+                      f"batch={self._last_batch_idx} total_skips={self._nonfinite_skips} "
+                      f"| culprit_attr={attr_nf} "
+                      f"| last_raw_gauss_absmax={ {k: round(v, 3) for k, v in self._last_dbg.items()} }",
+                      flush=True)
+                for nm, nan, inf, sh in bad:
+                    print(f"    grad {nm}: nan={nan} inf={inf} shape={sh}", flush=True)
         self.log("train/nonfinite_grad_skips", float(self._nonfinite_skips),
                  on_step=True, on_epoch=False, batch_size=1, rank_zero_only=True)
-        optimizer.zero_grad(set_to_none=True)
+        if nonfinite:
+            optimizer.zero_grad(set_to_none=True)
 
     # def _write_eval_artifacts(self, batch, batch_idx: int, *, prefix: str) -> None:
     #     if not self._is_rank_zero():
