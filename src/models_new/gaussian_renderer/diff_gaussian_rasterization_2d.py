@@ -1,20 +1,47 @@
 import os
+import importlib.util
 from typing import NamedTuple
 import torch.nn as nn
 import torch
 from torch.utils.cpp_extension import load
 
 parent_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "diff-gaussian-rasterization-2d")
-_C = load(
-    name='diff_gaussian_rasterization',
-    extra_cuda_cflags=["-I " + os.path.join(parent_dir, "third_party/glm/"), "-g", "-gencode=arch=compute_89,code=sm_89", "--compiler-bindir", "/usr/bin/gcc-12"],
-    sources=[
-        os.path.join(parent_dir, "cuda_rasterizer/rasterizer_impl.cu"),
-        os.path.join(parent_dir, "cuda_rasterizer/forward.cu"),
-        os.path.join(parent_dir, "cuda_rasterizer/backward.cu"),
-        os.path.join(parent_dir, "rasterize_points.cu"),
-        os.path.join(parent_dir, "ext.cpp")],
-    verbose=True)
+
+
+def _load_prebuilt_extension():
+    extension_root = os.environ.get("TORCH_EXTENSIONS_DIR")
+    if not extension_root:
+        return None
+
+    extension_path = os.path.join(
+        extension_root,
+        "diff_gaussian_rasterization",
+        "diff_gaussian_rasterization.so",
+    )
+    if not os.path.isfile(extension_path):
+        return None
+
+    spec = importlib.util.spec_from_file_location("diff_gaussian_rasterization", extension_path)
+    if spec is None or spec.loader is None:
+        return None
+
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_C = _load_prebuilt_extension()
+if _C is None:
+    _C = load(
+        name='diff_gaussian_rasterization',
+        extra_cuda_cflags=["-I " + os.path.join(parent_dir, "third_party/glm/"), "-g", "-gencode=arch=compute_89,code=sm_89", "--compiler-bindir", "/usr/bin/gcc-12"],
+        sources=[
+            os.path.join(parent_dir, "cuda_rasterizer/rasterizer_impl.cu"),
+            os.path.join(parent_dir, "cuda_rasterizer/forward.cu"),
+            os.path.join(parent_dir, "cuda_rasterizer/backward.cu"),
+            os.path.join(parent_dir, "rasterize_points.cu"),
+            os.path.join(parent_dir, "ext.cpp")],
+        verbose=True)
 
 
 def cpu_deep_copy_tuple(input_tuple):
