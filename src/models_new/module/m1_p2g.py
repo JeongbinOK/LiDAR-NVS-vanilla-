@@ -23,9 +23,8 @@ from torch import Tensor
 # )
 #from ..utonia.model import PointTransformerV3
 from .. import utonia
-from ..utils.coord import Voxelizer
-from ..utils.camera import intensity_dir
 from ..utils.attention import LocalAttentionFlash
+from .builders.common import UtoniaGridMapper
 import numpy as np
 import os
 import torch
@@ -103,10 +102,17 @@ class Point2Gaus(nn.Module):
         super().__init__()
         self.cfg = cfg
 
-        self.voxelizer = Voxelizer(cfg=self.cfg, max_frames=4)
         self.freeze_utonia = bool(getattr(cfg, "freeze_utonia", True))
+        # Load the frozen Utonia encoder from a repo-local checkpoint so the weights
+        # and their embedded architecture config live under the project (not ~/.cache).
+        # The architecture config is also dumped to config/utonia_pretrained.yaml for
+        # inspection. Falls back to a HuggingFace download if the local file is absent.
+        _repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+        _default_ckpt = os.path.join(_repo_root, "checkpoints", "utonia", "utonia.pth")
+        utonia_ckpt = getattr(cfg, "utonia_ckpt", None) or _default_ckpt
+        utonia_name = utonia_ckpt if os.path.isfile(utonia_ckpt) else "utonia"
         self.feature_extractor = utonia.load(
-            "utonia",
+            utonia_name,
             repo_id="Pointcept/Utonia",
             custom_config={"freeze_encoder": True} if self.freeze_utonia else None,
         )
@@ -116,11 +122,20 @@ class Point2Gaus(nn.Module):
         self.utonia_input_grid_size = 0.01
         self.utonia_stride_factor = self._infer_utonia_stride_factor()
         self.utonia_feature_grid_size = self._infer_utonia_feature_grid_size()
-        
 
-        self.int_proj = cfg.int_proj
-        self.intensity_proj = nn.Linear(self.int_proj.in_dim, self.int_proj.out_dim) # 5-> 64
-        self.intensity_norm = nn.LayerNorm(self.int_proj.out_dim) 
+        # Utonia bottleneck grid mapper (shared by both builders).
+        self.grid_mapper = UtoniaGridMapper(
+            self.utonia_coord_scale, self.utonia_input_grid_size, self.utonia_stride_factor
+        )
+        # Anchor/primitive builder, selected by config (only the active one imported).
+        # Each builder owns its IntensityEncoder (5D->64D) and utonia injection, and
+        # returns per-frame (position[xyz], utonia_feat[576], intensity_feat[64]).
+        self.anchor_mode = str(getattr(cfg, "anchor_mode", "spherical"))
+        if self.anchor_mode == "grid":
+            from .builders.grid_intensity import GridIntensityBuilder as _Builder
+        else:
+            from .builders.spherical_anchor import SphericalAnchorBuilder as _Builder
+        self.anchor_builder = _Builder(cfg)
 
         self.agg_mlp = cfg.agg_mlp
         self.intensity_agg_mlp = nn.Sequential(
@@ -134,17 +149,24 @@ class Point2Gaus(nn.Module):
         self.time_agg = TimeAgg(dim=self.agg_mlp.out_dim, num_heads= 8, k_bg= 8, k_fg= 16)
 
         self.gs = cfg.gs
+        # Gaussian head size is derived purely from gs_params (shs+opacity+scaling+
+        # rotation [+offset]); cfg.gs.out_dim is unused. Edit gs_params to control the
+        # head. offset>0 adds the position-offset head (set 3 for grid); 0 = none (spherical).
+        self.offset_size = int(getattr(cfg.gs_params, "offset", 0) or 0)
+        self.use_offset = self.offset_size > 0
+        self.offset_bound = float(getattr(cfg, "head_offset_bound", 0.8))
+        self.gs_param_sizes = [
+            int(cfg.gs_params.shs),
+            int(cfg.gs_params.opacity),
+            int(cfg.gs_params.scaling),
+            int(cfg.gs_params.rotation),
+        ] + ([self.offset_size] if self.use_offset else [])
+        gs_out_dim = sum(self.gs_param_sizes)
         self.gs_predictor = nn.Sequential(
             nn.Linear(self.gs.in_dim, self.gs.in_dim),
             nn.SiLU(),
-            nn.Linear(self.gs.in_dim, self.gs.out_dim),
+            nn.Linear(self.gs.in_dim, gs_out_dim),
         )
-        self.gs_param_sizes = [
-            cfg.gs_params.shs,
-            cfg.gs_params.opacity,
-            cfg.gs_params.scaling,
-            cfg.gs_params.rotation,
-        ]
         #self.feature_extractor = PointTransformerV3(cfg=self.cfg, finetune = True).from_pretrained("Pointcept/Utonia")
         #self.feature_condition = Conditionor(cfg=self.cfg)
         #self.gaussian_predictor = Predictor(cfg=self.cfg)
@@ -165,22 +187,6 @@ class Point2Gaus(nn.Module):
                     stride_factor *= int(module.stride)
         return stride_factor
 
-    @staticmethod
-    def _utonia_input_min_grid(input_coord, input_grid_coord, input_grid_size):
-        raw_grid = torch.floor(input_coord / input_grid_size).to(dtype=torch.long)
-        min_grid_candidates = raw_grid - input_grid_coord.to(device=raw_grid.device, dtype=torch.long)
-        return min_grid_candidates.median(dim=0).values
-
-    def _utonia_metric_origin(self, input_coord, input_grid_coord):
-        input_min_grid = self._utonia_input_min_grid(
-            input_coord,
-            input_grid_coord,
-            self.utonia_input_grid_size,
-        )
-        return input_min_grid.to(dtype=input_coord.dtype) * (
-            self.utonia_input_grid_size / self.utonia_coord_scale
-        )
-
     def _infer_utonia_feature_grid_size(self):
         return (
             self.utonia_input_grid_size
@@ -188,90 +194,12 @@ class Point2Gaus(nn.Module):
             * self.utonia_stride_factor
         )
 
-    def _anchor_to_utonia_feature_grid(self, anchor_points, metric_origin):
-        metric_origin = metric_origin.to(device=anchor_points.device, dtype=anchor_points.dtype)
-        return (anchor_points - metric_origin.unsqueeze(0)) / self.utonia_feature_grid_size
-
-    def utonia_cond(
-        self,
-        anchor_points,
-        grid_coord,
-        voxel_feats,
-        metric_origin,
-    ):
-        M = anchor_points.shape[0]
-        D = voxel_feats.shape[1]
-        device = anchor_points.device
-        if M == 0 or voxel_feats.shape[0] == 0:
-            return voxel_feats.new_zeros((0, D)), torch.zeros((M,), dtype=torch.bool, device=device)
-
-        grid_coord = grid_coord.to(device=device, dtype=torch.long)
-        anchor_grid_f = self._anchor_to_utonia_feature_grid(anchor_points, metric_origin)
-        base_grid = torch.floor(anchor_grid_f).long()
-        frac = (anchor_grid_f - base_grid.to(anchor_points.dtype)).clamp(0.0, 1.0)
-
-        offsets = torch.tensor(
-            [
-                [0, 0, 0], [0, 0, 1], [0, 1, 0], [0, 1, 1],
-                [1, 0, 0], [1, 0, 1], [1, 1, 0], [1, 1, 1],
-            ],
-            device=device,
-            dtype=torch.long,
-        )
-        neighbor_grids = base_grid[:, None, :] + offsets[None, :, :]
-
-        grid_max = grid_coord.max(dim=0).values
-        in_bounds = ((neighbor_grids >= 0) & (neighbor_grids <= grid_max.view(1, 1, 3))).all(dim=-1)
-        safe_neighbor_grids = neighbor_grids.clamp(min=0)
-
-        dims = (grid_max + 1).clamp_min(1)
-        stride_x = dims[1] * dims[2]
-        stride_y = dims[2]
-
-        voxel_keys = grid_coord[:, 0] * stride_x + grid_coord[:, 1] * stride_y + grid_coord[:, 2]
-        sorted_keys, sorted_order = torch.sort(voxel_keys)
-        neighbor_keys = (
-            safe_neighbor_grids[:, :, 0] * stride_x
-            + safe_neighbor_grids[:, :, 1] * stride_y
-            + safe_neighbor_grids[:, :, 2]
-        )
-
-        flat_keys = neighbor_keys.reshape(-1)
-        pos = torch.searchsorted(sorted_keys, flat_keys)
-        pos_clamped = pos.clamp(max=sorted_keys.numel() - 1)
-        found = (pos < sorted_keys.numel()) & (sorted_keys[pos_clamped] == flat_keys)
-        found = found & in_bounds.reshape(-1)
-        neighbor_vi = sorted_order[pos_clamped].reshape(M, 8)
-        valid_mask = found.reshape(M, 8)
-
-        offsets_f = offsets.to(dtype=anchor_points.dtype)
-        wx = torch.where(offsets_f[:, 0].view(1, 8) > 0, frac[:, 0:1], 1.0 - frac[:, 0:1])
-        wy = torch.where(offsets_f[:, 1].view(1, 8) > 0, frac[:, 1:2], 1.0 - frac[:, 1:2])
-        wz = torch.where(offsets_f[:, 2].view(1, 8) > 0, frac[:, 2:3], 1.0 - frac[:, 2:3])
-        weights = wx * wy * wz
-        weights = weights * valid_mask.to(dtype=weights.dtype)
-        weight_sum = weights.sum(dim=-1)
-        keep_mask = weight_sum > 1e-8
-
-        safe_vi = neighbor_vi.clamp(min=0)
-        out_all = (weights[:, :, None] * voxel_feats[safe_vi]).sum(dim=1)
-        out_all = out_all / weight_sum.clamp_min(1e-8).unsqueeze(-1)
-        return out_all[keep_mask], keep_mask  # feature (M_new, D)
-    
-
-    def intensity_agg(self, feat, intensity):
-        feat_i = self.intensity_proj(intensity)
-        agg_feat_i = self.intensity_agg_mlp(torch.cat([feat, self.intensity_norm(feat_i)],dim=1))
-        return agg_feat_i
-
     def split_gs_params(self, feat):
-        shs, opacity, scaling, rotation = torch.split(feat, self.gs_param_sizes, dim=-1)
-        return {
-            "shs": shs,
-            "opacity": opacity,
-            "scaling": scaling,
-            "rotation": rotation
-        }
+        parts = torch.split(feat, self.gs_param_sizes, dim=-1)
+        keys = ["shs", "opacity", "scaling", "rotation"]
+        if self.use_offset:
+            keys.append("offset")
+        return dict(zip(keys, parts))
 
     def forward(self, _input, batch_idx, mode):
         lidar_points = _input.get("lidar_points_sensor", _input["lidar_points"])
@@ -282,39 +210,24 @@ class Point2Gaus(nn.Module):
         bbox_instance_ids = _input.get("bbox_instance_ids")
 
 
-        voxelized_points  = self.voxelizer(lidar_points,offset,pose, mode="sphere")
+        features = self.feature_extractor(_input["ptv3_input"])
 
-        features = self.feature_extractor(_input["ptv3_input"]) 
-        grid_coords = features["grid_coord"]   # (V, 3) int
-        utonia_feat = features["feat"]         # (V, D)
-        feat_offset = features["offset"]       # utonia offset
-        input_coord = _input["ptv3_input"]["coord"].to(device=utonia_feat.device)
-        input_grid_coord = _input["ptv3_input"]["grid_coord"].to(device=utonia_feat.device)
-        input_offset = _input["ptv3_input"]["offset"].to(device=utonia_feat.device)
+        # Builder -> per-frame (position[Mi,3], utonia_feat[Mi,576], intensity_feat[Mi,64])
+        pos_list, ufeat_list, ifeat_list = self.anchor_builder(
+            lidar_points, offset, pose, features, _input["ptv3_input"], self.grid_mapper
+        )
 
-        grid_coord_list = split_by_offset(grid_coords, feat_offset)  # List[Tensor(Vi, 3)]
-        feat_list       = split_by_offset(utonia_feat, feat_offset)  # List[Tensor(Vi, D)]
-        input_coord_list = split_by_offset(input_coord, input_offset)
-        input_grid_coord_list = split_by_offset(input_grid_coord, input_offset)
-        metric_origin_list = [
-            self._utonia_metric_origin(coord, grid_coord)
-            for coord, grid_coord in zip(input_coord_list, input_grid_coord_list)
-        ]
-        anchor_list     = voxelized_points["anchor_points"]                 # List[Tensor(Ui, 3)]
-        mean_i_list     = voxelized_points["mean_i"]                        # List[Tensor(Ui,)]
-        var_i_list      = voxelized_points["var_i"]     
-
-        n_frames = len(anchor_list)
+        n_frames = len(pos_list)
 
         # 프레임별 batch index
         frame_starts    = torch.cat([torch.tensor([0], device=offset.device), offset[:-1]])
         frame_batch_idx = batch_idx[frame_starts.long()]  # (n_frames,)
 
-        all_feat        = []
-        all_intensity   = []
+        all_pos         = []
+        all_ufeat       = []
+        all_ifeat       = []
         all_offset      = []
         all_batch       = []
-        all_anchor      = []
         all_frame_batch = []
         all_bbox        = []   # List[Tensor(B_f, 7)], 프레임별
         all_bbox_iids   = []
@@ -322,54 +235,40 @@ class Point2Gaus(nn.Module):
         cumsum = 0
 
         for i in range(n_frames):
-            anchor = anchor_list[i]
-
-            anchor_feat, keep_mask = self.utonia_cond(
-                anchor, grid_coord_list[i], feat_list[i], metric_origin_list[i]
-            )
-
-            mean_i    = mean_i_list[i][keep_mask]
-            var_i     = var_i_list[i][keep_mask]
-            direction = intensity_dir(anchor, keep_mask)
+            pos_i = pos_list[i]
+            n_i   = pos_i.shape[0]
 
             b         = frame_batch_idx[i].item()
             local_f   = local_frame_counter.get(b, 0)
             local_frame_counter[b] = local_f + 1
 
-            b_tensor     = torch.full(
-                (anchor_feat.shape[0],), b,
-                dtype=torch.long, device=anchor.device
-            )
-            valid_anchor = anchor[keep_mask]
-
-            all_feat.append(anchor_feat)
-            all_intensity.append(
-                torch.cat([mean_i.unsqueeze(-1), var_i.unsqueeze(-1), direction], dim=1)
-            )
-            all_batch.append(b_tensor)
-            all_anchor.append(valid_anchor)
+            all_pos.append(pos_i)
+            all_ufeat.append(ufeat_list[i])
+            all_ifeat.append(ifeat_list[i])
+            all_batch.append(torch.full((n_i,), b, dtype=torch.long, device=pos_i.device))
             all_frame_batch.append(b)
             all_bbox.append(bbox[b][local_f])   # Tensor(B_f, 7)
             if bbox_instance_ids is not None:
                 all_bbox_iids.append(bbox_instance_ids[b][local_f])
-            cumsum += anchor_feat.shape[0]
-            all_offset.append(torch.tensor(cumsum, device=anchor.device))
+            cumsum += n_i
+            all_offset.append(torch.tensor(cumsum, device=pos_i.device))
 
-        all_feat      = torch.cat(all_feat,      dim=0)   # (N_valid, D)
-        all_intensity = torch.cat(all_intensity, dim=0)   # (N_valid, 5)
-        new_batch     = torch.cat(all_batch,     dim=0)   # (N_valid,)
-        new_offset    = torch.stack(all_offset)            # (n_frames,)
-        all_anchor    = torch.cat(all_anchor,    dim=0)   # (N_valid, 3)
+        all_pos       = torch.cat(all_pos,   dim=0)   # (N_valid, 3)
+        all_ufeat     = torch.cat(all_ufeat, dim=0)   # (N_valid, 576)
+        all_ifeat     = torch.cat(all_ifeat, dim=0)   # (N_valid, 64)
+        new_batch     = torch.cat(all_batch, dim=0)   # (N_valid,)
+        new_offset    = torch.stack(all_offset)        # (n_frames,)
         frame_batch_idx = torch.tensor(
-            all_frame_batch, dtype=torch.long, device=all_feat.device
+            all_frame_batch, dtype=torch.long, device=all_ufeat.device
         )  # (n_frames,)
 
-        agg_feat_i = self.intensity_agg(all_feat, all_intensity)  # (N_valid, C)
+        # concat[utonia 576, intensity 64] = 640 -> agg_mlp -> 240
+        agg_feat_i = self.intensity_agg_mlp(torch.cat([all_ufeat, all_ifeat], dim=1))
 
         # time_agg: out_coord is the Gaussian position coordinate. Dynamic points
         # are represented in object-local coordinates; static points stay in ref frame.
         out_feat, out_coord, agg_meta = self.time_agg(
-            agg_feat_i, all_anchor, new_offset,
+            agg_feat_i, all_pos, new_offset,
             frame_batch_idx, pose, bbox, bbox_instance_ids
         )
 
@@ -377,6 +276,9 @@ class Point2Gaus(nn.Module):
         gs_feat = self.gs_predictor(out_feat)
         gs_raw = self.split_gs_params(gs_feat)
         # gs_raw: dict of (N_valid, ...) tensors
+
+        if self.use_offset:
+            out_coord = out_coord + self.offset_bound * torch.tanh(gs_raw.pop("offset"))
 
         # 배치별로 분리 + box_assign 붙이기
         n_batch = max(all_frame_batch) + 1

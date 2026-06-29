@@ -1,7 +1,7 @@
-device: [1, 2, 3, 4]
+device: [4]
 
 project_name: 2dgs-utonia
-exp_name: sched_clip
+exp_name: offset_sphe_softplus_scale #${p2g.anchor_mode}_offset_softplus_scale 
 mode: train
 
 
@@ -70,30 +70,33 @@ p2g:
   primitive_mode: "voxel_anchor"
   anchor_token_dim: 22
   freeze_utonia: true
+  utonia_ckpt: null   # optional abs path override; null -> checkpoints/utonia/utonia.pth (config dump: config/utonia_pretrained.yaml)
+  anchor_mode: spherical   # "spherical" | "grid"  (grid auto-adds a 3D offset head; gs head size is derived from gs_params, gs.out_dim is only a sanity check for spherical)
+  head_offset_bound: 0.8    # grid mode only: gaussian pos = utonia_pos + bound*tanh(offset)
 
 
 
   # PTv3 backbone
-  ptv3_backbone: 
-    grid_size: 0.1
-    model_in_channels: ${p2g.anchor_token_dim}
-    enable_flash: true
-    conv_algo: "native"
-    batch_norm_eval: true
-    decoupled_stem: true
-    pdnorm_bn: true
-    pdnorm_ln: true
-    pdnorm_decouple: true
-    condition_names: ["static", "dynamic"]
-    stride: [2, 2]
-    enc_depths: [2, 2, 4]
-    enc_channels: [32, 64, 128]
-    enc_num_head: [2, 4, 8]
-    enc_patch_size: [1024, 1024, 1024]
-    dec_depths: [2, 2]
-    dec_channels: [64, 128]
-    dec_num_head: [4, 8]
-    dec_patch_size: [1024, 1024]
+  #ptv3_backbone: 
+  # grid_size: 0.1
+  #  model_in_channels: ${p2g.anchor_token_dim}
+  #  enable_flash: true
+  #  conv_algo: "native"
+  #  batch_norm_eval: true
+  #  decoupled_stem: true
+  #  pdnorm_bn: true
+  #  pdnorm_ln: true
+  #  pdnorm_decouple: true
+  #  condition_names: ["static", "dynamic"]
+  #  stride: [2, 2]
+  #  enc_depths: [2, 2, 4]
+  #  enc_channels: [32, 64, 128]
+  #  enc_num_head: [2, 4, 8]
+  #  enc_patch_size: [1024, 1024, 1024]
+  #  dec_depths: [2, 2]
+  #  dec_channels: [64, 128]
+  #  dec_num_head: [4, 8]
+  # dec_patch_size: [1024, 1024]
 
   int_proj:
     in_dim: 5
@@ -123,13 +126,14 @@ p2g:
 
   gs:
     in_dim: 240
-    out_dim: 39 # 16 intensity SH + 16 raydrop SH + opacity + 2D scale + rotation
+    out_dim: 39 # UNUSED — head size is derived from gs_params (sum); kept for reference
 
-  gs_params:
+  gs_params:               # source of truth for the gaussian head size (= sum)
     opacity: 1
     scaling: 2
     rotation: 4
-    shs: 32
+    shs: 32                # 16 intensity SH + 16 raydrop SH
+    offset: 3              # position-offset head: 3 for grid (utonia_pos+offset), 0 for spherical
   # Local quadric init / k-NN
   knn_k_target: 16
   knn_k_min: 8
