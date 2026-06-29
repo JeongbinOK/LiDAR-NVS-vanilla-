@@ -41,6 +41,10 @@ data:
   window_us: 1000000       # 1.0s window: 0.0s ... 1.0s
   sample_gap_us: 100000    # choose every 0.1s from 0.05s sweeps
   gt_middle_count: 3       # loss GT = 2 endpoint inputs + 3 middle sweeps
+  pair_mode: "keyframe"    # "sweep" | "keyframe". keyframe: both inputs are
+                           # exact-time keyframes pair_kf_stride apart (no box
+                           # staleness); GT = 0.1s sweeps between them.
+  pair_kf_stride: 2        # keyframe gap for window endpoints (2 ~= 1.0s)
   max_input_extra: 0    # kept for compatibility; input is fixed to 2 endpoints
   mode: "bbox"          # "nvs" | "bbox" (Phase A=nvs; Phase B switches to bbox)
   bbox_json_path: "/data/jeongbin/qgs/bbox/tracking_{split}.json"

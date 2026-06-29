@@ -113,8 +113,20 @@ def _pred_boxes_in_sensor_frame(nusc, bbox_data, sample_token, lidar_token):
     Returns predicted boxes in the LiDAR sensor frame.
     boxes    : Tensor(B, 7)
     track_ids: List[str]
+
+    Lookup key depends on the tracking-json cadence:
+      * val/test predictions are at 0.1 s (every 2nd sweep) and are keyed by the
+        LiDAR sample_data token (`lidar_token`);
+      * train predictions are keyframe-only and keyed by the keyframe
+        `sample_token`.
+    Try lidar_token first, then sample_token, so both formats resolve.
     """
-    entries = bbox_data.get(sample_token, [])
+    if lidar_token in bbox_data:
+        entries = bbox_data[lidar_token]
+    elif sample_token in bbox_data:
+        entries = bbox_data[sample_token]
+    else:
+        entries = []
     if not entries:
         return torch.zeros((0, 7), dtype=torch.float32), []
  
@@ -254,6 +266,16 @@ class NuScenesNVSDataset(Dataset):
         self.window_sample_hops = [
             i * self.sample_hop for i in range(self.window_frame_count)
         ]
+        # Window pairing mode:
+        #   "sweep"    (default) -- anchor at a keyframe, take fixed 0.1s hops.
+        #              The 2nd input is usually a non-keyframe sweep, so in train
+        #              it inherits *stale* parent-keyframe boxes (up to ~0.45s).
+        #   "keyframe" -- BOTH inputs are exact-time keyframes `pair_kf_stride`
+        #              apart (~0.5s/step); GT/middle frames are the 0.1s-grid
+        #              sweeps between them (~9 candidates, like sweep mode). No
+        #              box staleness; pair count is ~unchanged (+0.6% on val).
+        self.pair_mode = str(_cfg_get(cfg, "pair_mode", "sweep"))
+        self.pair_kf_stride = int(_cfg_get(cfg, "pair_kf_stride", 2))
 
         self.nusc          = NuScenes(version=self.version,
                                       dataroot=cfg.dataroot, verbose=False)
@@ -295,16 +317,31 @@ class NuScenesNVSDataset(Dataset):
             if len(frames) >= self.window_frame_count:
                 self.scene_frames.append(frames)
  
-        # Build a flat index: each entry is (scene_idx, anchor_frame_idx)
-        # The anchor is the first frame in the 1-second window.
+        # Phase-align off-grid frames to predicted tracking. val/test tracking is
+        # keyed by lidar_token on a 0.1s even-sweep grid aligned to the scene
+        # start; dropped sweeps make some frames (incl. keyframes) land on an odd
+        # chain index that is absent from the file -> borrow the nearest tracked
+        # sweep's boxes (<= 2 sweeps / 0.1s away). Train frames resolve via the
+        # keyframe sample_token and are skipped, so this is a no-op for train.
+        if self.bbox_data is not None:
+            self._alias_offgrid_frames()
 
+        # Build a flat index.
+        #   sweep mode    : entry = (scene_idx, anchor_keyframe_idx)
+        #   keyframe mode : entry = (scene_idx, kf_start_idx, kf_end_idx)
         self.index = []
-        for s_idx, frames in enumerate(self.scene_frames):
-            for f_idx in range(len(frames)):
-                if not frames[f_idx][3]:
-                    continue
-                if f_idx + self.window_hop < len(frames):
-                    self.index.append((s_idx, f_idx))
+        if self.pair_mode == "keyframe":
+            for s_idx, frames in enumerate(self.scene_frames):
+                kf = [i for i in range(len(frames)) if frames[i][3]]
+                for a in range(len(kf) - self.pair_kf_stride):
+                    self.index.append((s_idx, kf[a], kf[a + self.pair_kf_stride]))
+        else:
+            for s_idx, frames in enumerate(self.scene_frames):
+                for f_idx in range(len(frames)):
+                    if not frames[f_idx][3]:
+                        continue
+                    if f_idx + self.window_hop < len(frames):
+                        self.index.append((s_idx, f_idx))
 
         if self.verbose:
             print(f"[{split}] {len(self.index)} anchors")
@@ -314,14 +351,58 @@ class NuScenesNVSDataset(Dataset):
     # ── Core sampling ────────────────────────────────────────────────────────
     
 
-    def _sample_frames(self, scene_idx: int, anchor_idx: int):
-        """
-        0.05초 LIDAR_TOP sweep chain에서 두 칸씩 건너뛰어 0.1초 간격 window 선택.
+    def _alias_offgrid_frames(self):
+        """Make every chain frame resolvable against the predicted tracking.
+
+        For each frame whose lidar_token (val/test cadence) and sample_token
+        (train cadence) are both missing from `self.bbox_data`, alias its
+        lidar_token to the boxes of the nearest tracked sweep in the same chain
+        (<= 2 sweeps away). Fixes val windows anchored at an odd-parity keyframe,
+        which otherwise get zero predicted boxes for the whole window."""
+        bd = self.bbox_data
+        n_alias = 0
+        for frames in self.scene_frames:
+            n = len(frames)
+            for i, (lid, samp, ts, isk) in enumerate(frames):
+                if lid in bd or samp in bd:
+                    continue
+                hit = None
+                for d in (1, 2):
+                    for j in (i - d, i + d):
+                        if 0 <= j < n and frames[j][0] in bd:
+                            hit = frames[j][0]
+                            break
+                    if hit is not None:
+                        break
+                if hit is not None:
+                    bd[lid] = bd[hit]
+                    n_alias += 1
+        if self.verbose:
+            print(f"[{self.split}] phase-aliased {n_alias} off-grid frames "
+                  f"to nearest tracked sweep (<=0.1s)")
+
+    def _sample_frames(self, scene_idx: int, start_idx: int, end_idx: int = None):
+        """0.1초(2 sweep) 간격 window 선택.
+
+        sweep mode (end_idx=None): 키프레임 앵커에서 고정 hop.
+        keyframe mode (end_idx 주어짐): [start, end] 사이의 모든 키프레임을
+        반드시 포함(=항상 GT 후보)하고, 인접 키프레임 half-interval마다 0.1s
+        (2 sweep) 그리드로 subsample.
         """
         frames = self.scene_frames[scene_idx]
-        selected = [anchor_idx + hop for hop in self.window_sample_hops]
-        if selected[-1] >= len(frames):
-            raise RuntimeError("Indexed nuScenes window became invalid.")
+        if end_idx is None:
+            selected = [start_idx + hop for hop in self.window_sample_hops]
+            if selected[-1] >= len(frames):
+                raise RuntimeError("Indexed nuScenes window became invalid.")
+            return [frames[i] for i in selected]
+        # start/end are keyframes (by index construction); add any interior ones.
+        kfs = ([start_idx]
+               + [j for j in range(start_idx + 1, end_idx) if frames[j][3]]
+               + [end_idx])
+        selected = []
+        for a in range(len(kfs) - 1):
+            selected += list(range(kfs[a], kfs[a + 1], self.sample_hop))
+        selected.append(kfs[-1])
         return [frames[i] for i in selected]
 
     def _select_input_indices(self, V: int) -> list:
@@ -330,26 +411,54 @@ class NuScenesNVSDataset(Dataset):
         """
         return [0, V - 1]
 
-    def _select_gt_indices(self, V: int) -> list:
+    def _select_gt_indices(self, window) -> list:
+        """Loss GT window-index 선택 (항상 input 양끝 2프레임 포함).
+
+        keyframe mode: 중간 keyframe(들)을 GT로 반드시 포함하고, 그 좌/우
+          half-interval에서 나머지를 뽑음 (train=random, val/test=구간 중앙 고정).
+          예) input=(k_i, k_{i+2}) → GT중 1개는 항상 k_{i+1}, 나머지는 (k_i,k_{i+1})
+          과 (k_{i+1},k_{i+2}) 사이 sweep에서 각각.
+        sweep mode: 중간에서 train=random / val=균등 고정.
         """
-        Loss GT index 선택.
-        - 항상 포함: input 양끝 2프레임
-        - train: 중간 9개 중 random 3개
-        - val/test: 재현성을 위해 중간에서 고정 3개
-        """
+        V = len(window)
+        is_train = (self.split == _cfg_get(self.cfg, "train_split", "train"))
+
+        if self.pair_mode == "keyframe":
+            interior_kf = [p for p in range(1, V - 1) if window[p][3]]
+            if interior_kf:
+                p_mid = interior_kf[len(interior_kf) // 2]   # central keyframe
+                left = list(range(1, p_mid))
+                right = list(range(p_mid + 1, V - 1))
+                n_rest = max(0, self.gt_middle_count - 1)
+                n_left = n_rest // 2 + (n_rest % 2)
+                sel = ([p_mid]
+                       + self._pick_from(left, n_left, is_train)
+                       + self._pick_from(right, n_rest - n_left, is_train))
+                return sorted(set([0] + sel + [V - 1]))
+
         middle = list(range(1, V - 1))
         n_middle = min(self.gt_middle_count, len(middle))
         if n_middle <= 0:
             selected_middle = []
-        elif self.split == _cfg_get(self.cfg, "train_split", "train"):
+        elif is_train:
             selected_middle = sorted(
-                np.random.choice(middle, n_middle, replace=False).tolist()
-            )
+                np.random.choice(middle, n_middle, replace=False).tolist())
         else:
             positions = np.linspace(1, len(middle), n_middle + 2)[1:-1]
             selected_middle = [middle[int(round(p)) - 1] for p in positions]
-
         return sorted(set([0] + selected_middle + [V - 1]))
+
+    def _pick_from(self, seg, k, is_train):
+        """Pick k indices from segment `seg`: random for train, evenly-spaced
+        and reproducible for val/test."""
+        if k <= 0 or not seg:
+            return []
+        if k >= len(seg):
+            return list(seg)
+        if is_train:
+            return sorted(np.random.choice(seg, k, replace=False).tolist())
+        pos = np.linspace(0, len(seg) - 1, k + 2)[1:-1]
+        return [seg[int(round(p))] for p in pos]
 
  
     # ── __getitem__ ──────────────────────────────────────────────────────────
@@ -358,11 +467,11 @@ class NuScenesNVSDataset(Dataset):
         return len(self.index)
  
     def __getitem__(self, idx):
-        scene_idx, anchor_idx = self.index[idx]
-        window = self._sample_frames(scene_idx, anchor_idx)
+        scene_idx, *span = self.index[idx]      # (anchor,) sweep | (start,end) keyframe
+        window = self._sample_frames(scene_idx, *span)
         V_window = len(window)
         input_window_indices = self._select_input_indices(V_window)
-        gt_window_indices = self._select_gt_indices(V_window)
+        gt_window_indices = self._select_gt_indices(window)
         used = [window[i] for i in gt_window_indices]
         window_to_used = {window_idx: used_idx for used_idx, window_idx in enumerate(gt_window_indices)}
         input_indices = [window_to_used[i] for i in input_window_indices]
