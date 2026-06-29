@@ -1,7 +1,8 @@
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
+from skimage.metrics import structural_similarity
 
 #from pytorch3d import chamfer_loss
 from ..utils.chamfer.chamfer3D.dist_chamfer_3D import chamfer_3DDist
@@ -32,32 +33,52 @@ class Loss(nn.Module):
             self.lpips_fn = None
 
     def _calculate_psnr(self, pred, gt, mask=None, peak=1.0):
-        """MSE 기반의 PSNR 계산. peak = 데이터의 최대값(intensity=1.0, depth=80m 등).
-        PSNR = 20*log10(peak) - 10*log10(mse) 이므로 peak가 맞아야 dB 스케일이 의미를 가진다."""
-        if mask is not None:
-            if not mask.any(): return torch.tensor(0.0, device=pred.device)
-            mse = F.mse_loss(pred[mask], gt[mask])
-        else:
-            mse = F.mse_loss(pred, gt)
+        """GS-LiDAR eval-style PSNR.
 
-        mse = torch.clamp(mse, min=1e-10)
-        return 20 * math.log10(peak) - 10 * torch.log10(mse)
+        GS-LiDAR clamps depth/intensity to [1e-6, peak] before computing
+        10*log10(peak^2 / MSE). `mask` preserves this repo's valid-only variants.
+        """
+        with torch.no_grad():
+            out_device = pred.device
+            out_dtype = pred.dtype
+            if mask is not None:
+                mask = mask.bool()
+                if not bool(mask.any()):
+                    return torch.tensor(0.0, device=out_device, dtype=out_dtype)
+                pred = pred[mask]
+                gt = gt[mask]
+            pred = pred.clamp(1e-6, peak)
+            gt = gt.clamp(1e-6, peak)
+            pred_np = pred.detach().cpu().numpy()
+            gt_np = gt.detach().cpu().numpy()
+            psnr = 10.0 * np.log10(peak ** 2 / np.mean((pred_np - gt_np) ** 2))
+            return torch.tensor(float(psnr), device=out_device, dtype=out_dtype)
 
-    def _calculate_ssim(self, pred, gt, data_range=1.0):
-        """[B, C, H, W] 차원 대응 경량화 2D SSIM.
-        data_range = 데이터의 dynamic range(L). 안정화 상수 C1=(0.01L)^2, C2=(0.03L)^2 이
-        값의 크기에 비례해야 의미를 갖는다(아래 설명 참고)."""
-        mu_x = pred.mean(dim=[-2, -1], keepdim=True)
-        mu_y = gt.mean(dim=[-2, -1], keepdim=True)
-        sigma_x = pred.var(dim=[-2, -1], keepdim=True)
-        sigma_y = gt.var(dim=[-2, -1], keepdim=True)
-        sigma_xy = ((pred - mu_x) * (gt - mu_y)).mean(dim=[-2, -1], keepdim=True)
+    def _calculate_ssim(self, pred, gt, peak=1.0):
+        """GS-LiDAR eval-style SSIM.
 
-        C1 = (0.01 * data_range) ** 2
-        C2 = (0.03 * data_range) ** 2
-        ssim_map = ((2 * mu_x * mu_y + C1) * (2 * sigma_xy + C2)) / \
-                   ((mu_x ** 2 + mu_y ** 2 + C1) * (sigma_x + sigma_y + C2))
-        return ssim_map.mean()
+        Uses the same skimage.metrics.structural_similarity call as GS-LiDAR
+        eval, after the same [1e-6, max] clamp.
+        """
+        with torch.no_grad():
+            out_device = pred.device
+            out_dtype = pred.dtype
+            pred = pred.clamp(1e-6, peak)
+            gt = gt.clamp(1e-6, peak)
+            pred_np = pred.detach().cpu().numpy()
+            gt_np = gt.detach().cpu().numpy()
+            scores = []
+            for pred_item, gt_item in zip(pred_np, gt_np):
+                pred_img = np.squeeze(pred_item, axis=0)
+                gt_img = np.squeeze(gt_item, axis=0)
+                scores.append(
+                    structural_similarity(
+                        pred_img,
+                        gt_img,
+                        data_range=np.max(gt_img) - np.min(gt_img),
+                    )
+                )
+            return torch.tensor(float(np.mean(scores)), device=out_device, dtype=out_dtype)
 
     @staticmethod
     def _flatten_maps(*maps):
@@ -182,9 +203,9 @@ class Loss(nn.Module):
         g_int_valid_2d = g_int_2d * valid_2d
 
         losses["intensity_psnr_valid"] = self._calculate_psnr(p_int_2d, g_int_2d, mask=valid_2d)
-        losses["intensity_ssim_valid"] = self._calculate_ssim(p_int_valid_2d, g_int_valid_2d)
+        losses["intensity_ssim_valid"] = self._calculate_ssim(p_int_valid_2d, g_int_valid_2d, peak=1.0)
         losses["depth_psnr_valid"] = self._calculate_psnr(p_depth_2d, g_depth_2d, mask=valid_2d, peak=80.0)
-        losses["depth_ssim_valid"] = self._calculate_ssim(p_depth_valid_2d, g_depth_valid_2d, data_range=80.0)
+        losses["depth_ssim_valid"] = self._calculate_ssim(p_depth_valid_2d, g_depth_valid_2d, peak=80.0)
 
         # raydrop metrics: GS-LiDAR eval 방식처럼 predicted drop 픽셀을 no-return(0)으로 만든 뒤
         # full-map PSNR/SSIM을 계산한다. val/test의 기본 metric alias로 사용한다.
@@ -197,9 +218,9 @@ class Loss(nn.Module):
         )
 
         losses["intensity_psnr_raydrop"] = self._calculate_psnr(p_int_raydrop_2d, g_int_2d)
-        losses["intensity_ssim_raydrop"] = self._calculate_ssim(p_int_raydrop_2d, g_int_2d)
+        losses["intensity_ssim_raydrop"] = self._calculate_ssim(p_int_raydrop_2d, g_int_2d, peak=1.0)
         losses["depth_psnr_raydrop"] = self._calculate_psnr(p_depth_raydrop_2d, g_depth_2d, peak=80.0)
-        losses["depth_ssim_raydrop"] = self._calculate_ssim(p_depth_raydrop_2d, g_depth_2d, data_range=80.0)
+        losses["depth_ssim_raydrop"] = self._calculate_ssim(p_depth_raydrop_2d, g_depth_2d, peak=80.0)
 
         use_raydrop_metrics = metric_mode in {"val", "test", "eval"}
         if use_raydrop_metrics:
