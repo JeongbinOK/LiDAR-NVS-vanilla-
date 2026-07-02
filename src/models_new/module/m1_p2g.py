@@ -24,7 +24,7 @@ from torch import Tensor
 #from ..utonia.model import PointTransformerV3
 from .. import utonia
 from ..utils.attention import LocalAttentionFlash
-from .builders.common import UtoniaGridMapper
+from .builders.common import UtoniaGridMapper, UtoniaResidualAdapter
 import numpy as np
 import os
 import torch
@@ -95,6 +95,8 @@ def save_all_batches(x, voxelized_points, features, save_dir):
         save_pcd(coord_np,  [0, 1, 0], f"{save_dir}/batch_{i}_coord.ply")
 
         print(f"[Saved] batch {i} | lidar={lidar_np.shape[0]} anchor={anchor_np.shape[0]} coord={coord_np.shape[0]}")
+
+
 class Point2Gaus(nn.Module):
     """Point to Gaussian."""
 
@@ -120,8 +122,13 @@ class Point2Gaus(nn.Module):
             self.feature_extractor.eval()
         self.utonia_coord_scale = 0.2
         self.utonia_input_grid_size = 0.01
+        self.utonia_feature_stage = int(
+            getattr(cfg, "utonia_feature_stage", len(self.feature_extractor.enc) - 1)
+        )
+        self._validate_utonia_feature_stage()
         self.utonia_stride_factor = self._infer_utonia_stride_factor()
         self.utonia_feature_grid_size = self._infer_utonia_feature_grid_size()
+        self.utonia_feature_dim = self._infer_utonia_feature_dim()
 
         # Utonia bottleneck grid mapper (shared by both builders).
         self.grid_mapper = UtoniaGridMapper(
@@ -129,7 +136,7 @@ class Point2Gaus(nn.Module):
         )
         # Anchor/primitive builder, selected by config (only the active one imported).
         # Each builder owns its IntensityEncoder (5D->64D) and utonia injection, and
-        # returns per-frame (position[xyz], utonia_feat[576], intensity_feat[64]).
+        # returns per-frame (position[xyz], utonia_feat[C_stage], intensity_feat[64]).
         self.anchor_mode = str(getattr(cfg, "anchor_mode", "spherical"))
         if self.anchor_mode == "grid":
             from .builders.grid_intensity import GridIntensityBuilder as _Builder
@@ -138,20 +145,35 @@ class Point2Gaus(nn.Module):
         self.anchor_builder = _Builder(cfg)
 
         self.agg_mlp = cfg.agg_mlp
+        self.agg_in_dim = self.utonia_feature_dim + int(cfg.int_proj.out_dim)
+        cfg_agg_in_dim = int(getattr(self.agg_mlp, "in_dim", self.agg_in_dim) or self.agg_in_dim)
+        if cfg_agg_in_dim != self.agg_in_dim:
+            self.agg_mlp.in_dim = self.agg_in_dim
+
+        # Residual adapter on the frozen Utonia features (dim-preserving; see class
+        # docstring). bottleneck from cfg.utonia_adapter.bottleneck, else dim//4.
+        adapter_cfg = getattr(cfg, "utonia_adapter", None)
+        adapter_bottleneck = (
+            int(getattr(adapter_cfg, "bottleneck", 0) or 0) if adapter_cfg is not None else 0
+        )
+        self.utonia_adapter = UtoniaResidualAdapter(
+            self.utonia_feature_dim, bottleneck=adapter_bottleneck or None
+        )
+
+        # in: [adapted utonia C_stage + intensity int_proj.out_dim] -> trunk agg_mlp.out_dim (192)
         self.intensity_agg_mlp = nn.Sequential(
-            nn.Linear(self.agg_mlp.in_dim, self.agg_mlp.hidden_dim), # 576 + 64 (640) -> 256  
+            nn.Linear(self.agg_in_dim, self.agg_mlp.hidden_dim),
             nn.SiLU(),
-            nn.Linear(self.agg_mlp.hidden_dim, self.agg_mlp.hidden_dim), #256 -> 256
+            nn.Linear(self.agg_mlp.hidden_dim, self.agg_mlp.hidden_dim),
             nn.SiLU(),
-            nn.Linear(self.agg_mlp.hidden_dim, self.agg_mlp.out_dim), # 256 -> 128 
+            nn.Linear(self.agg_mlp.hidden_dim, self.agg_mlp.out_dim),
         )
 
         self.time_agg = TimeAgg(dim=self.agg_mlp.out_dim, num_heads= 8, k_bg= 8, k_fg= 16)
 
-        self.gs = cfg.gs
         # Gaussian head size is derived purely from gs_params (shs+opacity+scaling+
-        # rotation [+offset]); cfg.gs.out_dim is unused. Edit gs_params to control the
-        # head. offset>0 adds the position-offset head (set 3 for grid); 0 = none (spherical).
+        # rotation [+offset]). Edit gs_params to control the head. offset>0 adds the
+        # position-offset head (set 3 for grid); 0 = none (spherical).
         self.offset_size = int(getattr(cfg.gs_params, "offset", 0) or 0)
         self.use_offset = self.offset_size > 0
         self.offset_bound = float(getattr(cfg, "head_offset_bound", 0.8))
@@ -162,10 +184,13 @@ class Point2Gaus(nn.Module):
             int(cfg.gs_params.rotation),
         ] + ([self.offset_size] if self.use_offset else [])
         gs_out_dim = sum(self.gs_param_sizes)
+        # Input dim is dictated by the trunk width (agg_mlp.out_dim; TimeAgg preserves
+        # dim), so the gs head can never desync when the trunk width changes.
+        trunk_dim = int(self.agg_mlp.out_dim)
         self.gs_predictor = nn.Sequential(
-            nn.Linear(self.gs.in_dim, self.gs.in_dim),
+            nn.Linear(trunk_dim, trunk_dim),
             nn.SiLU(),
-            nn.Linear(self.gs.in_dim, gs_out_dim),
+            nn.Linear(trunk_dim, gs_out_dim),
         )
         #self.feature_extractor = PointTransformerV3(cfg=self.cfg, finetune = True).from_pretrained("Pointcept/Utonia")
         #self.feature_condition = Conditionor(cfg=self.cfg)
@@ -179,12 +204,22 @@ class Point2Gaus(nn.Module):
             self.feature_extractor.eval()
         return self
 
-    def _infer_utonia_stride_factor(self):
+    def _validate_utonia_feature_stage(self):
+        max_stage = len(self.feature_extractor.enc) - 1
+        if self.utonia_feature_stage < 0 or self.utonia_feature_stage > max_stage:
+            raise ValueError(
+                f"p2g.utonia_feature_stage must be in [0, {max_stage}], "
+                f"got {self.utonia_feature_stage}"
+            )
+
+    def _infer_utonia_stride_factor(self, stage: int = None):
+        stage = self.utonia_feature_stage if stage is None else int(stage)
         stride_factor = 1
         if getattr(self.feature_extractor, "enc_mode", False):
-            for module in self.feature_extractor.modules():
-                if module.__class__.__name__ == "GridPooling":
-                    stride_factor *= int(module.stride)
+            for stage_idx in range(1, stage + 1):
+                down = getattr(self.feature_extractor.enc[stage_idx], "down", None)
+                if down is not None:
+                    stride_factor *= int(down.stride)
         return stride_factor
 
     def _infer_utonia_feature_grid_size(self):
@@ -193,6 +228,32 @@ class Point2Gaus(nn.Module):
             / self.utonia_coord_scale
             * self.utonia_stride_factor
         )
+
+    def _infer_utonia_feature_dim(self):
+        stage_module = self.feature_extractor.enc[self.utonia_feature_stage]
+        for module in reversed(list(stage_module.modules())):
+            if hasattr(module, "channels"):
+                return int(module.channels)
+            if hasattr(module, "out_channels"):
+                return int(module.out_channels)
+        raise RuntimeError(f"Could not infer Utonia feature dim for stage {self.utonia_feature_stage}")
+
+    def _forward_utonia_features(self, ptv3_input):
+        max_stage = len(self.feature_extractor.enc) - 1
+        if self.utonia_feature_stage == max_stage:
+            return self.feature_extractor(ptv3_input)
+
+        point = utonia.structure.Point(ptv3_input)
+        point = self.feature_extractor.embedding(point)
+        point.serialization(
+            order=self.feature_extractor.order,
+            shuffle_orders=self.feature_extractor.shuffle_orders,
+        )
+        point.sparsify()
+
+        for stage_idx in range(self.utonia_feature_stage + 1):
+            point = self.feature_extractor.enc[stage_idx](point)
+        return point
 
     def split_gs_params(self, feat):
         parts = torch.split(feat, self.gs_param_sizes, dim=-1)
@@ -210,9 +271,9 @@ class Point2Gaus(nn.Module):
         bbox_instance_ids = _input.get("bbox_instance_ids")
 
 
-        features = self.feature_extractor(_input["ptv3_input"])
+        features = self._forward_utonia_features(_input["ptv3_input"])
 
-        # Builder -> per-frame (position[Mi,3], utonia_feat[Mi,576], intensity_feat[Mi,64])
+        # Builder -> per-frame (position[Mi,3], utonia_feat[Mi,C_stage], intensity_feat[Mi,64])
         pos_list, ufeat_list, ifeat_list = self.anchor_builder(
             lidar_points, offset, pose, features, _input["ptv3_input"], self.grid_mapper
         )
@@ -254,7 +315,7 @@ class Point2Gaus(nn.Module):
             all_offset.append(torch.tensor(cumsum, device=pos_i.device))
 
         all_pos       = torch.cat(all_pos,   dim=0)   # (N_valid, 3)
-        all_ufeat     = torch.cat(all_ufeat, dim=0)   # (N_valid, 576)
+        all_ufeat     = torch.cat(all_ufeat, dim=0)   # (N_valid, C_stage)
         all_ifeat     = torch.cat(all_ifeat, dim=0)   # (N_valid, 64)
         new_batch     = torch.cat(all_batch, dim=0)   # (N_valid,)
         new_offset    = torch.stack(all_offset)        # (n_frames,)
@@ -262,8 +323,15 @@ class Point2Gaus(nn.Module):
             all_frame_batch, dtype=torch.long, device=all_ufeat.device
         )  # (n_frames,)
 
-        # concat[utonia 576, intensity 64] = 640 -> agg_mlp -> 240
-        agg_feat_i = self.intensity_agg_mlp(torch.cat([all_ufeat, all_ifeat], dim=1))
+        if all_ufeat.shape[1] != self.utonia_feature_dim:
+            raise RuntimeError(
+                f"Utonia stage {self.utonia_feature_stage} feature dim mismatch: "
+                f"expected {self.utonia_feature_dim}, got {all_ufeat.shape[1]}"
+            )
+
+        # residual-adapt frozen utonia feats, then concat[utonia, intensity] -> trunk (192)
+        u_ref = self.utonia_adapter(all_ufeat)
+        agg_feat_i = self.intensity_agg_mlp(torch.cat([u_ref, all_ifeat], dim=1))
 
         # time_agg: out_coord is the Gaussian position coordinate. Dynamic points
         # are represented in object-local coordinates; static points stay in ref frame.

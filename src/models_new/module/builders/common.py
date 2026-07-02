@@ -1,7 +1,7 @@
 """Shared pieces for anchor/primitive feature builders.
 
 Both builders return, per frame, the same triple
-    (positions[Mi,3], utonia_feat[Mi,576], intensity_feat[Mi,64])
+    (positions[Mi,3], utonia_feat[Mi,C_stage], intensity_feat[Mi,64])
 so the Point2Gaus tail (agg_mlp -> time_agg -> gs_predictor -> assemble) is
 mode-agnostic. The intensity 5D is [int_mean, int_var, theta, phi, r].
 """
@@ -79,6 +79,45 @@ class IntensityEncoder(nn.Module):
         if x5.shape[0] == 0:
             return x5.new_zeros((0, self.norm.normalized_shape[0]))
         return self.norm(self.net(self._encode(x5)))
+
+
+class UtoniaResidualAdapter(nn.Module):
+    """Dim-preserving PEFT-style residual adapter for the frozen Utonia features.
+    Sibling of IntensityEncoder: these are the two modality encoders feeding the fusion.
+
+        u' = LayerNorm( u + Up(SiLU(Down(LayerNorm(u)))) )
+
+    Why each piece:
+    - Pre-LN bottleneck (Down: dim->r, Up: r->dim) task-adapts the frozen encoder
+      features without unfreezing it (cheap, low-rank, regularizing).
+    - `up` is zero-initialized, so at init the residual branch is 0 and u' = LN(u):
+      training starts from the *pristine* frozen features and learns a small delta,
+      rather than scrambling them through a random projection.
+    - The trailing LayerNorm rebalances the (un-normalized) frozen-feature scale at
+      the fusion boundary, so it concatenates with the already-LayerNorm'd intensity
+      stream at a comparable magnitude. A residual alone preserves the raw u scale,
+      so this norm is what actually fixes the geometry/intensity magnitude imbalance.
+
+    Auto-sizes to `dim`, so switching utonia_feature_stage (216/432/576) needs no
+    change here.
+    """
+
+    def __init__(self, dim: int, bottleneck: int | None = None):
+        super().__init__()
+        r = int(bottleneck) if bottleneck else max(8, dim // 4)
+        self.in_norm = nn.LayerNorm(dim)
+        self.down = nn.Linear(dim, r)
+        self.act = nn.SiLU()
+        self.up = nn.Linear(r, dim)
+        self.out_norm = nn.LayerNorm(dim)
+        nn.init.zeros_(self.up.weight)
+        nn.init.zeros_(self.up.bias)
+
+    def forward(self, u):
+        if u.shape[0] == 0:
+            return u
+        delta = self.up(self.act(self.down(self.in_norm(u))))
+        return self.out_norm(u + delta)
 
 
 class UtoniaGridMapper:
@@ -180,7 +219,7 @@ def aggregate_points_to_cells(points_xyz, intensity, grid_coord, voxel_feats,
     """Scatter raw points into the Utonia bottleneck cells they fall in, and pair
     each occupied cell with its Utonia feature (exact cell match, no trilinear).
 
-    Returns (positions[M,3] metric, utonia_feat[M,576], intensity5d[M,5]) for the
+    Returns (positions[M,3] metric, utonia_feat[M,C_stage], intensity5d[M,5]) for the
     Utonia cells that received >=1 point. positions = Utonia cell position; the
     intensity (theta,phi,r) come from the per-cell MEAN point position.
     """
