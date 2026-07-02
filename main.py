@@ -9,6 +9,14 @@ import time
 import warnings
 
 import torch
+import torch.multiprocessing as mp
+# DataLoader workers pass shared-tensor FDs over sockets with the default
+# 'file_descriptor' strategy, which fails under load with "received 0 items of
+# ancdata" (worker dies -> pin-memory thread exits -> crash). 'file_system' uses
+# named shm files instead and is robust. (Confirmed: num_workers=0 runs fine, so
+# the fault is purely in the worker FD-passing path.) Runs at module import so it
+# also applies in every DDP subprocess Lightning relaunches.
+mp.set_sharing_strategy("file_system")
 from torch.utils.data import DataLoader
 from lightning.pytorch import Trainer
 from lightning.pytorch.callbacks import ModelCheckpoint
