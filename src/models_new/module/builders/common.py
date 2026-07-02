@@ -7,6 +7,8 @@ mode-agnostic. The intensity 5D is [int_mean, int_var, theta, phi, r].
 """
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 
@@ -34,18 +36,49 @@ def xyz_to_sph(xyz):
 
 
 class IntensityEncoder(nn.Module):
-    """[int_mean, int_var, theta, phi, r] (5D) -> 64D. (Linear + LayerNorm; the
-    LayerNorm absorbs the mixed input scales, so phi/theta/r are fed un-normalized.)"""
+    """[mean_i, var_i, theta, phi, r] (5D) -> out_dim.
 
-    def __init__(self, in_dim: int = 5, out_dim: int = 64):
+    Less naive than a bare Linear, because this is the ONLY reflectance path to the
+    intensity-SH head (Utonia gets no intensity input):
+    - Inputs are conditioned before the first layer (-> 6D encoded):
+        mean_i, var_i        : already in [0,1], passed through
+        theta -> theta/(pi/2): ~[-1,1]
+        phi   -> (sin, cos)  : maps the line onto a circle, removing the +-pi azimuth
+                               wraparound (a discontinuity a bare Linear would see)
+        r     -> log1p(r)/log1p(r_far): compresses 0.2..70 m and *linearizes* the
+                               power-law range falloff (log turns 1/r^2 into a line),
+                               so the range dependence is easy to learn. Monotonic =>
+                               no range information is lost.
+    - A 2-layer MLP (+SiLU) can form nonlinear input cross-terms (e.g. range/angle
+      compensation of intensity) that a single linear map provably cannot.
+    - Output LayerNorm keeps the stream ~unit-scale for the fusion concat.
+    """
+
+    def __init__(self, in_dim: int = 5, out_dim: int = 64, hidden: int | None = None,
+                 r_far: float = 70.0):
         super().__init__()
-        self.proj = nn.Linear(in_dim, out_dim)
+        assert in_dim == 5, "IntensityEncoder expects 5D [mean_i, var_i, theta, phi, r]"
+        h = int(hidden) if hidden else out_dim
+        self._log_r_far = math.log1p(float(r_far))
+        self.net = nn.Sequential(
+            nn.Linear(6, h),          # encoded input width = 6
+            nn.SiLU(),
+            nn.Linear(h, out_dim),
+        )
         self.norm = nn.LayerNorm(out_dim)
+
+    def _encode(self, x5):
+        mean_i, var_i, theta, phi, r = x5.unbind(dim=-1)
+        theta_n = theta / (math.pi / 2.0)
+        log_r_n = torch.log1p(r.clamp_min(0.0)) / self._log_r_far
+        return torch.stack(
+            [mean_i, var_i, theta_n, torch.sin(phi), torch.cos(phi), log_r_n], dim=-1
+        )
 
     def forward(self, x5):
         if x5.shape[0] == 0:
             return x5.new_zeros((0, self.norm.normalized_shape[0]))
-        return self.norm(self.proj(x5))
+        return self.norm(self.net(self._encode(x5)))
 
 
 class UtoniaGridMapper:

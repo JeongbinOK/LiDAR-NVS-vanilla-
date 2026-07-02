@@ -24,7 +24,9 @@ class SphericalAnchorBuilder(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.voxelizer = Voxelizer(cfg=cfg, max_frames=4)
-        self.intensity_encoder = IntensityEncoder(cfg.int_proj.in_dim, cfg.int_proj.out_dim)
+        self.intensity_encoder = IntensityEncoder(
+            cfg.int_proj.in_dim, cfg.int_proj.out_dim, r_far=float(getattr(cfg, "r_far", 70.0))
+        )
 
     def forward(self, lidar_points, offset, pose, features, ptv3_input, mapper):
         device = features["feat"].device
