@@ -113,23 +113,6 @@ def _pano_theta_phi(range_image, vfov, hfov, row_to_theta=None):
     return theta, phi
 
 
-def pano_to_lidar(range_image, vfov, hfov, row_to_theta=None):
-    mask = range_image > 0
-
-    theta, phi = _pano_theta_phi(range_image, vfov, hfov, row_to_theta)
-
-    dx = torch.sin(theta) * torch.sin(phi)
-    dz = torch.sin(theta) * torch.cos(phi)
-    dy = -torch.cos(theta)
-
-    directions = torch.stack([dx, dy, dz], dim=0)
-    directions = F.normalize(directions, dim=0)
-
-    points_xyz = (directions * range_image)[:, mask[0]].permute(1, 0)
-
-    return points_xyz
-
-
 def depth_to_normal(range_image, vfov, hfov, row_to_theta=None):
     """
         view: view camera

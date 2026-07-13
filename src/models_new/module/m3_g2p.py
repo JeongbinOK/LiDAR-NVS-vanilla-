@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from torch import Tensor
-from ..gaussian_renderer import render, render_range_map
+from ..gaussian_renderer import render
 from ..utils.graphics_utils import pano_to_lidar 
 class GausRender(nn.Module):
     def __init__(self, cfg):
