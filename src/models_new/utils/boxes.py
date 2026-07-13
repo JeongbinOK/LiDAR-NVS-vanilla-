@@ -1,19 +1,7 @@
-"""Pure torch box/pose geometry helpers, shared across anchor_mode paths.
+"""Stateless torch box/pose geometry shared by both anchor modes.
 
-Extracted verbatim (same math) from two call sites so the logic lives in one
-place instead of being duplicated by the upcoming spherical-query anchor path
-(Step 3 of the spherical-query redesign):
-  - `apply_pose`, `yaw_from_pose`, `transform_boxes_to_ref`, `points_to_box_local`,
-    `point_in_box`, `common_instance_ids` were TimeAgg methods in
-    `module/m1_p2g.py`; TimeAgg now delegates to these (thin wrappers), so its
-    method names/signatures are unchanged and behavior is bit-identical.
-  - `box_local_to_ref` mirrors `GausRender.box_local_to_ref` in
-    `module/m3_g2p.py` (read-only reference; m3 itself still defines its own
-    copy and is not modified).
-
-No torch.nn.Module state anywhere here -- every function is stateless so it
-can be called directly by the new spherical-query head without going through
-TimeAgg.
+``box_local_to_ref`` mirrors the transform in ``GausRender``.  Keeping these
+operations here gives spherical and grid routing one coordinate convention.
 """
 from __future__ import annotations
 
@@ -73,7 +61,7 @@ def box_local_to_ref(points_local: Tensor, box_ref: Tensor) -> Tensor:
     """Inverse of `points_to_box_local`: box-local (N, 3) points -> box_ref's frame.
 
     Same math as `GausRender.box_local_to_ref` (module/m3_g2p.py); m3's copy is
-    left untouched, this is the shared implementation Step 3 will also call.
+    left untouched; this is the shared inverse transform used by anchor heads.
 
     points_local : (N, 3), in box_ref's local (yaw-aligned) frame.
     box_ref      : (7,) [x,y,z,w,l,h,yaw].
@@ -130,8 +118,7 @@ def common_instance_ids(first_ids, last_ids) -> set:
 
     first_ids, last_ids : 1D long Tensor or None.
     return : python set[int], empty if either side is None. An instance only
-             counts as "dynamic" if it appears at both endpoints (matches the
-             TimeAgg is_dynamic definition).
+             counts as "dynamic" if it appears at both endpoints.
     """
     if first_ids is None or last_ids is None:
         return set()

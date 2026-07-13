@@ -1,6 +1,6 @@
 """Spherical query-anchor head (anchor_mode="spherical").
 
-Replaces TimeAgg for the spherical mode. Per frame, the fused utonia tokens
+For spherical mode, the fused Utonia tokens
 (0.4 m cells, sensor-frame positions) are binned into (theta, phi, log r)
 spherical cells about that frame's sensor origin; every occupied cell becomes an
 anchor. Near-range anchors tend to hold few tokens while far-range anchors can
@@ -10,7 +10,7 @@ cross-attend to the anchor's K/V token set, and each query's initial position is
 the attention-probability-weighted mean of the K/V token positions (surface
 interpolation seed; a bounded offset head on top is applied by the caller).
 
-Grouping (mirrors TimeAgg's fg/bg contract):
+Background/foreground coordinate routing:
 - bg anchors/tokens live in the batch's ref frame (frame 0). P0 uses only the
   anchor's own-frame cell tokens. K/V = P1 bg context: same-frame 1x1x1
   spherical neighbourhood + other-frame bg tokens ego-compensated into this
@@ -150,7 +150,7 @@ class SphericalQueryHead(nn.Module):
                 for inst_id in common_ids:
                     is_dyn_f |= instance_f == int(inst_id)
 
-                # dynamic tokens -> box-local output coords (same as TimeAgg)
+                # Dynamic tokens use box-local output coordinates.
                 label_f = torch.where(is_dyn_f, instance_f, torch.full_like(instance_f, -1))
                 tok_label[sl] = label_f
                 tok_box[sl] = torch.where(is_dyn_f, box_assign_f,
@@ -256,7 +256,7 @@ class SphericalQueryHead(nn.Module):
     # ------------------------------------------------------------------ forward
     def forward(self, feat, tok_pos, new_offset, frame_batch_idx, pose_list,
                 bbox_list, bbox_instance_ids_list=None):
-        """Same input contract as TimeAgg.forward.
+        """Convert fused grid tokens into spherical Gaussian query seeds.
 
         feat (N,D) fused token features; tok_pos (N,3) per-frame sensor coords;
         new_offset (n_frames,) global cumsum; frame_batch_idx (n_frames,);
@@ -265,7 +265,7 @@ class SphericalQueryHead(nn.Module):
         Returns (out_feat (G,D), p_init (G,3), r_anchor (G,), gauss_offset
         (n_frames,) long, meta) with G = total_anchors * K, ordered frame-major,
         anchor-major, k fastest. p_init lives in the output coordinate frame
-        (bg: ref frame, fg: box-local); meta matches TimeAgg's agg_meta contract
+        (bg: ref frame, fg: box-local); meta follows the shared seed contract
         (box_assign / instance_id / is_dynamic / coord_ref / bbox_ref_by_frame).
         """
         device = feat.device
