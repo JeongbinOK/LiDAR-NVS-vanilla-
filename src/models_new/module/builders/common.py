@@ -1,16 +1,14 @@
 """Shared pieces for anchor/primitive feature builders.
 
-Both builders return, per frame, the same triple
-    (positions[Mi,3], utonia_feat[Mi,C_stage], intensity_feat[Mi,64])
-so the Point2Gaus tail (agg_mlp -> time_agg -> gs_predictor -> assemble) is
-mode-agnostic. The intensity 5D is [int_mean, int_var, theta, phi, r].
+Geometry, grid mapping, and scatter helpers shared by the config-selected
+builders. The per-cell intensity statistics are
+``[int_mean, int_var, theta, phi, r]``.
 """
 from __future__ import annotations
 
 import math
 
 import torch
-import torch.nn as nn
 
 
 def split_by_offset(tensor, offset):
@@ -35,89 +33,25 @@ def xyz_to_sph(xyz):
     return xyz_to_theta_phi_r(xyz)
 
 
-class IntensityEncoder(nn.Module):
-    """[mean_i, var_i, theta, phi, r] (5D) -> out_dim.
+def encode_ray_meta(tpr, r_far):
+    """(...,3)=[theta, phi, r] -> (...,4) encoded ray meta for K/V embeddings.
 
-    Less naive than a bare Linear, because this is the ONLY reflectance path to the
-    intensity-SH head (Utonia gets no intensity input):
-    - Inputs are conditioned before the first layer (-> 6D encoded):
-        mean_i, var_i        : already in [0,1], passed through
-        theta -> theta/(pi/2): ~[-1,1]
-        phi   -> (sin, cos)  : maps the line onto a circle, removing the +-pi azimuth
-                               wraparound (a discontinuity a bare Linear would see)
-        r     -> log1p(r)/log1p(r_far): compresses 0.2..70 m and *linearizes* the
-                               power-law range falloff (log turns 1/r^2 into a line),
-                               so the range dependence is easy to learn. Monotonic =>
-                               no range information is lost.
-    - A 2-layer MLP (+SiLU) can form nonlinear input cross-terms (e.g. range/angle
-      compensation of intensity) that a single linear map provably cannot.
-    - Output LayerNorm keeps the stream ~unit-scale for the fusion concat.
+    Follows the same convention as ``IntensityMLPEncoder``: theta is scaled by
+    pi/2, phi is mapped onto the unit circle
+    (sin, cos) to remove the +-pi azimuth wraparound a bare Linear would see,
+    and r is log1p-compressed/linearized before being normalized by log1p(r_far).
+    r is clamp_min(0.0)'d before log1p.
+
+        [theta/(pi/2), sin(phi), cos(phi), log1p(r)/log1p(r_far)]
+
+    tpr   : (..., 3) [theta, phi, r], own-sensor-origin ray angles/range.
+    r_far : python float/scalar, the normalizing max range (e.g. cfg.r_far).
+    return: (..., 4).
     """
-
-    def __init__(self, in_dim: int = 5, out_dim: int = 64, hidden: int | None = None,
-                 r_far: float = 70.0):
-        super().__init__()
-        assert in_dim == 5, "IntensityEncoder expects 5D [mean_i, var_i, theta, phi, r]"
-        h = int(hidden) if hidden else out_dim
-        self._log_r_far = math.log1p(float(r_far))
-        self.net = nn.Sequential(
-            nn.Linear(6, h),          # encoded input width = 6
-            nn.SiLU(),
-            nn.Linear(h, out_dim),
-        )
-        self.norm = nn.LayerNorm(out_dim)
-
-    def _encode(self, x5):
-        mean_i, var_i, theta, phi, r = x5.unbind(dim=-1)
-        theta_n = theta / (math.pi / 2.0)
-        log_r_n = torch.log1p(r.clamp_min(0.0)) / self._log_r_far
-        return torch.stack(
-            [mean_i, var_i, theta_n, torch.sin(phi), torch.cos(phi), log_r_n], dim=-1
-        )
-
-    def forward(self, x5):
-        if x5.shape[0] == 0:
-            return x5.new_zeros((0, self.norm.normalized_shape[0]))
-        return self.norm(self.net(self._encode(x5)))
-
-
-class UtoniaResidualAdapter(nn.Module):
-    """Dim-preserving PEFT-style residual adapter for the frozen Utonia features.
-    Sibling of IntensityEncoder: these are the two modality encoders feeding the fusion.
-
-        u' = LayerNorm( u + Up(SiLU(Down(LayerNorm(u)))) )
-
-    Why each piece:
-    - Pre-LN bottleneck (Down: dim->r, Up: r->dim) task-adapts the frozen encoder
-      features without unfreezing it (cheap, low-rank, regularizing).
-    - `up` is zero-initialized, so at init the residual branch is 0 and u' = LN(u):
-      training starts from the *pristine* frozen features and learns a small delta,
-      rather than scrambling them through a random projection.
-    - The trailing LayerNorm rebalances the (un-normalized) frozen-feature scale at
-      the fusion boundary, so it concatenates with the already-LayerNorm'd intensity
-      stream at a comparable magnitude. A residual alone preserves the raw u scale,
-      so this norm is what actually fixes the geometry/intensity magnitude imbalance.
-
-    Auto-sizes to `dim`, so switching utonia_feature_stage (216/432/576) needs no
-    change here.
-    """
-
-    def __init__(self, dim: int, bottleneck: int | None = None):
-        super().__init__()
-        r = int(bottleneck) if bottleneck else max(8, dim // 4)
-        self.in_norm = nn.LayerNorm(dim)
-        self.down = nn.Linear(dim, r)
-        self.act = nn.SiLU()
-        self.up = nn.Linear(r, dim)
-        self.out_norm = nn.LayerNorm(dim)
-        nn.init.zeros_(self.up.weight)
-        nn.init.zeros_(self.up.bias)
-
-    def forward(self, u):
-        if u.shape[0] == 0:
-            return u
-        delta = self.up(self.act(self.down(self.in_norm(u))))
-        return self.out_norm(u + delta)
+    theta, phi, r = tpr.unbind(dim=-1)
+    theta_n = theta / (math.pi / 2.0)
+    log_r_n = torch.log1p(r.clamp_min(0.0)) / math.log1p(float(r_far))
+    return torch.stack([theta_n, torch.sin(phi), torch.cos(phi), log_r_n], dim=-1)
 
 
 class UtoniaGridMapper:
@@ -219,16 +153,19 @@ def aggregate_points_to_cells(points_xyz, intensity, grid_coord, voxel_feats,
     """Scatter raw points into the Utonia bottleneck cells they fall in, and pair
     each occupied cell with its Utonia feature (exact cell match, no trilinear).
 
-    Returns (positions[M,3] metric, utonia_feat[M,C_stage], intensity5d[M,5]) for the
-    Utonia cells that received >=1 point. positions = Utonia cell position; the
-    intensity (theta,phi,r) come from the per-cell MEAN point position.
+    Returns (positions[M,3] metric, utonia_feat[M,C_stage], intensity5d[M,5],
+    occ[V] bool) for the Utonia cells that received >=1 point. positions = Utonia
+    cell position; the intensity (theta,phi,r) come from the per-cell MEAN point
+    position. ``occ`` (over all V grid_coord rows) lets callers recover the token
+    grid_coords (grid_coord[occ]) for aligning a separate intensity encoder.
     """
     device = voxel_feats.device
     V = grid_coord.shape[0]
     D = voxel_feats.shape[1]
     if V == 0 or points_xyz.shape[0] == 0:
         return (points_xyz.new_zeros((0, 3)), voxel_feats.new_zeros((0, D)),
-                points_xyz.new_zeros((0, 5)))
+                points_xyz.new_zeros((0, 5)),
+                torch.zeros((V,), dtype=torch.bool, device=device))
 
     grid_coord = grid_coord.to(device=device, dtype=torch.long)
     pcell = torch.floor(mapper.to_feature_grid(points_xyz, metric_origin)).long()   # (N,3)
@@ -279,4 +216,4 @@ def aggregate_points_to_cells(points_xyz, intensity, grid_coord, voxel_feats,
             + metric_origin.to(device=device, dtype=points_xyz.dtype).unsqueeze(0)
 
     int5 = torch.cat([mean_i.unsqueeze(-1), var_i.unsqueeze(-1), mean_tpr], dim=-1)
-    return util_pos[occ], voxel_feats[occ], int5[occ]
+    return util_pos[occ], voxel_feats[occ], int5[occ], occ

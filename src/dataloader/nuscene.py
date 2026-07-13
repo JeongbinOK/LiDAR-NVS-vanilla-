@@ -629,7 +629,7 @@ class NuScenesNVSDataset(Dataset):
 # Collate
 # ────────────────────────────────────────────────────────────────────────────
 
-transform = utonia.transform.default(0.2, apply_z_positive=False)    
+transform = utonia.transform.default(0.2, apply_z_positive=False, keep_strength=True)
 
 def ptv3_mod(lidar_points, offset):
     coords = lidar_points[:, :3]
@@ -718,16 +718,21 @@ def multiframe_collate_fn(batch):
 
     # ── ptv3 input (input frames만) ───────────────────────────────────────────
     ptv3_coords, ptv3_grid_coords, ptv3_colors, ptv3_inverses, ptv3_feats = [], [], [], [], []
+    ptv3_strengths = []
     starts = torch.cat([torch.tensor([0]), offset[:-1]])
 
     for start, end in zip(starts.tolist(), offset.tolist()):
         pts_slice_sensor = lidar_points_sensor[start:end]
         coords_sensor    = pts_slice_sensor[:, :3]
         coords_np = coords_sensor.detach().cpu().numpy().copy()
+        # per-point intensity ("strength"): rides through GridSample so the KEPT
+        # point's intensity is aligned to the sampled coord (Utonia's own point).
+        strength_np = pts_slice_sensor[:, 3:4].detach().cpu().numpy().copy()
         d = {
             "coord": coords_np,
             "color": np.zeros_like(coords_np),
             "normal": np.zeros_like(coords_np),
+            "strength": strength_np,
             "batch": offset.detach().cpu().numpy().copy(),
         }
         d = transform(d)
@@ -736,6 +741,7 @@ def multiframe_collate_fn(batch):
         ptv3_colors.append(d["color"])
         ptv3_inverses.append(d["inverse"])
         ptv3_feats.append(d["feat"])
+        ptv3_strengths.append(d["strength"])
 
     new_counts  = torch.tensor([c.shape[0] for c in ptv3_coords])
     ptv3_offset = torch.cumsum(new_counts, dim=0)
@@ -745,6 +751,7 @@ def multiframe_collate_fn(batch):
         "color":      torch.cat(ptv3_colors,      dim=0),
         "inverse":    torch.cat(ptv3_inverses,    dim=0),
         "feat":       torch.cat(ptv3_feats,       dim=0),
+        "strength":   torch.cat(ptv3_strengths,   dim=0),
         "offset":     ptv3_offset,
     }
 

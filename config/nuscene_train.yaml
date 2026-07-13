@@ -1,7 +1,7 @@
 device: [4, 5, 6, 7]
 
 project_name: 2dgs-utonia
-exp_name:  ${p2g.anchor_mode}_stage${p2g.utonia_feature_stage}_adapter_intensity
+exp_name:  ${p2g.anchor_mode}_stage${p2g.utonia_feature_stage}_${p2g.squery.K}-slots_v2
 mode: train
 
 
@@ -76,8 +76,18 @@ p2g:
   freeze_utonia: true
   utonia_ckpt: null   # optional abs path override; null -> checkpoints/utonia/utonia.pth (config dump: config/utonia_pretrained.yaml)
   utonia_feature_stage: 3  # encoder stage index: 3 -> 0.4m/432D, 4 -> 0.8m/576D (default/final)
-  anchor_mode: grid   # "spherical" | "grid"  (grid auto-adds a 3D offset head; gs head size is derived from gs_params, gs.out_dim is only a sanity check for spherical)
-  head_offset_bound: 0.8    # grid mode only: gaussian pos = utonia_pos + bound*tanh(offset)
+  anchor_mode: spherical   # "grid" | "spherical"(query 신규) | "spherical_legacy"
+  squery:
+    K: 3                      # anchor당 가우시안(query) 수
+    dtheta_deg: 2.0
+    dphi_deg: 3.0
+    dlogr: 0.18 # 대략 bin마다 1.2배씩 증가
+    r_min: 2.0
+    r_max: 80.0
+    max_kv: 64                # anchor당 K/V 토큰 cap (nearest)
+    attn_chunk: 8192
+    n_layers: 2                # bg·fg 공유 cross-attn depth (query refinement 라운드 수)
+  head_offset_bound: 0.8    # gaussian pos = seed_pos + bound*tanh(offset), per-axis meters
 
 
 
@@ -103,9 +113,44 @@ p2g:
   #  dec_num_head: [4, 8]
   # dec_patch_size: [1024, 1024]
 
+  # Intensity encoder selection. type=ptv3 -> mini PointTransformerV3 mirroring the
+  # frozen Utonia backbone (serialization -> RoPE patch attn + xCPE -> GridPooling);
+  # output dim = last channel (no projection head), fused end-to-end with the Utonia
+  # stream. type=sparse|mlp fall back to the encoders below. Omitting this block
+  # reverts to the legacy intensity_sparse.enable switch.
+  intensity_encoder:
+    type: ptv3                     # ptv3 | sparse | mlp
+    ptv3:
+      input_feats: [intensity]     # 1ch intensity/255; [intensity, ray] -> 5D A/B
+      channels: [36, 72, 108, 144, 192]   # uses first (utonia_feature_stage + 1); head_dim 18
+      num_heads: [2, 4, 6, 8, 8]          # stage4: 192/8=24 (12 would give head_dim 16, RoPE needs %6==0)
+      depths: [1, 1, 2, 2, 2]
+      patch_size: 1024
+      mlp_ratio: 2.0
+      order: [z, hilbert]          # or [z, z-trans, hilbert, hilbert-trans] to mirror Utonia
+
+  # Post-fusion joint token refiner: `depth` serialized RoPE attention blocks over the
+  # fused 192D trunk tokens (near-identity at init via layer_scale + xCPE zero-init).
+  joint_refiner:
+    enable: true
+    depth: 2
+    num_heads: 8                   # 192/8 = 24 (RoPE head_dim multiple of 6)
+    patch_size: 1024
+    layer_scale: 1.0e-5
+
+  # Fallback (sparse/mlp) intensity config; ignored when intensity_encoder.type=ptv3.
   int_proj:
     in_dim: 5
     out_dim: 64
+
+  # Sparse (SubMConv3d) intensity encoder mirroring the Utonia grid hierarchy, used
+  # when intensity_encoder.type=sparse (or the legacy enable switch when the
+  # intensity_encoder block is absent). n_down auto-tracks utonia_feature_stage
+  # (3 -> 0.4m, 4 -> 0.8m); type=mlp uses per-cell IntensityMLPEncoder.
+  intensity_sparse:
+    enable: true
+    channels: [16, 32, 48, 64, 96]   # uses first (utonia_feature_stage + 1)
+    depth: 1                          # SubMConv context blocks per stage
 
   utonia_adapter:
     bottleneck: null   # residual adapter bottleneck r (PEFT-style); null -> utonia_feature_dim // 4
@@ -136,7 +181,7 @@ p2g:
     scaling: 2
     rotation: 4
     shs: 32                # 16 intensity SH + 16 raydrop SH
-    offset: 3              # position-offset head: 3 for grid (utonia_pos+offset), 0 for spherical
+    offset: 3              # position-offset head: 3 enables bounded xyz offset
   # Local quadric init / k-NN
   knn_k_target: 16
   knn_k_min: 8
@@ -165,7 +210,7 @@ p2g:
   ]
   lidar_sigma: 3.0
   r_near: 0.2
-  r_far: 70.0
+  r_far: 80.0
 
   # Preprocessing
   ego_radius: 2.5

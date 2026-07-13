@@ -1202,7 +1202,15 @@ class Compose(object):
         return data_dict
 
 
-def default(scale = 1.0, apply_z_positive = True, normalize_coord = False):
+def default(scale = 1.0, apply_z_positive = True, normalize_coord = False, keep_strength = False):
+    # keep_strength: also collect the per-point "strength" (LiDAR intensity). It is
+    # in GridSample's index_valid_keys, so it is subsampled to the SAME kept point
+    # per voxel as coord -> the sampled point's intensity, aligned to the output.
+    # feat_keys is unchanged (coord/color/normal only), so the encoder input never
+    # sees intensity; it rides alongside for a separate intensity branch.
+    collect_keys = ("coord", "grid_coord", "color", "inverse")
+    if keep_strength:
+        collect_keys = collect_keys + ("strength",)
     config = [
         *([dict(type="NormalizeCoord")] if normalize_coord else []),
         dict(type="RandomScale", scale=[scale, scale]),
@@ -1219,7 +1227,7 @@ def default(scale = 1.0, apply_z_positive = True, normalize_coord = False):
         dict(type="ToTensor"),
         dict(
             type="Collect",
-            keys=("coord", "grid_coord", "color", "inverse"),
+            keys=collect_keys,
             feat_keys=("coord", "color", "normal"),
         ),
     ]

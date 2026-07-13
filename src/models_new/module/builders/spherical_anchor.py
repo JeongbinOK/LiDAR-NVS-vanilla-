@@ -12,11 +12,11 @@ import torch.nn as nn
 
 from ...utils.coord import Voxelizer
 from .common import (
-    IntensityEncoder,
     split_by_offset,
     utonia_cond_trilinear,
     xyz_to_theta_phi_r,
 )
+from .intensity_encoder import IntensityMLPEncoder
 
 
 class SphericalAnchorBuilder(nn.Module):
@@ -24,7 +24,7 @@ class SphericalAnchorBuilder(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.voxelizer = Voxelizer(cfg=cfg, max_frames=4)
-        self.intensity_encoder = IntensityEncoder(
+        self.intensity_encoder = IntensityMLPEncoder(
             cfg.int_proj.in_dim, cfg.int_proj.out_dim, r_far=float(getattr(cfg, "r_far", 70.0))
         )
 
