@@ -12,9 +12,9 @@ interpolation seed; a bounded offset head on top is applied by the caller).
 
 Grouping (mirrors TimeAgg's fg/bg contract):
 - bg anchors/tokens live in the batch's ref frame (frame 0). P0 uses only the
-  anchor's own-frame cell tokens. K/V = P1 bg context: same-frame 3x3x1
+  anchor's own-frame cell tokens. K/V = P1 bg context: same-frame 1x1x1
   spherical neighbourhood + other-frame bg tokens ego-compensated into this
-  frame's sensor coords and re-binned into the same 3x3x1 neighbourhood.
+  frame's sensor coords and re-binned into the same 1x1x1 cell.
 - fg (dynamic, instance shared by both endpoint frames) anchors/tokens live in
   bbox-local coords. K/V = ALL tokens of the same instance across frames
   (spherical reprojection breaks for movers; box-local pooling is
@@ -318,7 +318,7 @@ class SphericalQueryHead(nn.Module):
             p0_anchor.append(anchor_base[g] + fa["tok2cell"][fa["match"]])
             p0_token.append(fa["vi"][fa["match"]])
 
-        # ---- Stage C: bg P1 K/V pairs (same-frame + other-frame neighbors) ----
+        # ---- Stage C: bg P1 K/V pairs (same spherical cell only) ----
         p1_anchor = []
         p1_token = []
         for b, frame_indices in tm["batch_frame_map"].items():
@@ -330,9 +330,13 @@ class SphericalQueryHead(nn.Module):
                 bg_u = (~fa["is_dyn"]).nonzero(as_tuple=True)[0]     # frame-local anchor ids
                 if bg_u.numel() == 0:
                     continue
-                nbr_hash, nbr_valid = self.bins.neighbor_hashes(
-                    self.bins.unhash(fa["cell_hash"][bg_u]))
-                n_slots = nbr_hash.shape[1]
+                # Background attention is intentionally restricted to the
+                # anchor's own (theta, phi, log-r) cell. Other-frame tokens are
+                # ego-compensated and re-binned below, then must match this same
+                # hash exactly. Foreground uses its separate same-instance path.
+                nbr_hash = fa["cell_hash"][bg_u].unsqueeze(1)  # (U_bg, 1)
+                nbr_valid = torch.ones_like(nbr_hash, dtype=torch.bool)
+                n_slots = 1
 
                 # P1: same-frame tokens via the frame's own cell table
                 cell_idx, found = lookup_cells(nbr_hash.reshape(-1), fa["cell_hash"])

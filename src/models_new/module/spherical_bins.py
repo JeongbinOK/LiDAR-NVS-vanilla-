@@ -39,20 +39,20 @@ Data flow expected by Step 3
     tok_hash            = bins.hash(tok_idx3)                  # (N,)  (mask by tok_valid)
     cell_hash, tok2cell = build_cells(tok_hash[tok_valid])    # (U,), (Nv,)
 
-    # anchors = occupied cells; expand each to its 3x3x1 neighbourhood
-    anchor_idx3          = bins.unhash(cell_hash)             # (U,3)
-    nbr_hash, nbr_valid  = bins.neighbor_hashes(anchor_idx3)  # (U,9), (U,9)
-    cell_idx, found      = lookup_cells(nbr_hash.reshape(-1), cell_hash)
-    cell_idx = cell_idx.reshape(U, 9)
-    found    = found.reshape(U, 9)
+    # anchors = occupied cells; the current SphericalQueryHead background K/V
+    # path uses only each anchor's own 1x1x1 cell.
+    own_hash             = cell_hash[:, None]                 # (U,1)
+    cell_idx, found      = lookup_cells(own_hash.reshape(-1), cell_hash)
+    cell_idx = cell_idx.reshape(U, 1)
+    found    = found.reshape(U, 1)
     anchor_cell_idx = torch.where(found, cell_idx, cell_idx.new_full((), -1))
 
     # flatten (anchor, token) membership
     anchor_ids, token_ids, slot_ids = gather_cell_members(
         anchor_cell_idx, tok2cell, cell_hash.numel())
 
-Neighbour column order and the "self" cell are fixed constants documented on
-``SphericalBins.neighbor_hashes`` (self cell = slot ``SELF_SLOT`` = 4).
+``SphericalBins.neighbor_hashes`` remains available for geometry analysis or
+future wider-context experiments; its self cell is slot ``SELF_SLOT`` = 4.
 """
 from __future__ import annotations
 
