@@ -166,21 +166,6 @@ p2g:
 
 
 
-  # QGS head
-  # qgs_head:
-  #   head_hidden_dim: 128
-  #   lidar_latent_dim: null        # None → resolved from compiled rasterizer LIDAR_LATENT_DIM
-  #   head_alpha_bias_init: 0.0
-  #   head_intensity_residual: true
-  #   head_center_bound: 0.3
-  #   rot_tilt_deg: 10.0
-  #   rot_spin_deg: 30.0
-  #   scale_log_mean_bound: 0.6931471805599453  # ln(2)
-  #   scale_log_gap_bound: 0.4054651081081644   # ln(1.5)
-  #   s3_log_bound: 0.4054651081081644          # ln(1.5)
-  #   s3_fallback_abs: 0.05
-  #   init_feature_dim: 32
-
   gs_params:               # source of truth for the gaussian head size (= sum)
     opacity: 1
     scaling: 2
