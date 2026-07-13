@@ -131,7 +131,8 @@ p2g:
       order: [z, hilbert]          # or [z, z-trans, hilbert, hilbert-trans] to mirror Utonia
 
   # Post-fusion joint token refiner over the fused 192D trunk tokens. type=serial
-  # preserves serialized RoPE blocks; sparse uses exact occupied-cell local attention.
+  # preserves serialized RoPE blocks with xCPE; sparse uses exact occupied-cell
+  # local attention without xCPE.
   # At stage3 each cell is 0.4m, so window_size=3 attends to at most 3x3x3=27 cells.
   joint_refiner:
     enable: true

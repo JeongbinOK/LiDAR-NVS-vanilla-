@@ -1,15 +1,14 @@
 """Post-fusion joint token refiners.
 
-``serial`` preserves the existing serialized RoPE-attention implementation.
-``sparse`` replaces only that attention operator with exact occupied-cell local
-self-attention: every token attends to occupied cells in a configurable odd 3D
-window around its own ``grid_coord``.  The lookup key includes the frame id built
-from ``offset``, so neither implementation mixes frames; temporal fusion remains
-the SphericalQueryHead's job.
+``serial`` preserves the existing serialized RoPE-attention implementation,
+including its xCPE branch. ``sparse`` uses exact occupied-cell local
+self-attention without xCPE: every token attends to occupied cells in a
+configurable odd 3D window around its own ``grid_coord``.  The lookup key includes
+the frame id built from ``offset``, so neither implementation mixes frames;
+temporal fusion remains the SphericalQueryHead's job.
 
-Both refiners keep the surrounding xCPE and MLP residuals and start near identity.
-The attention/MLP branches use ``layer_scale``, while xCPE's unscaled residual is
-made zero at initialization by zero-initializing its Linear projection.
+The attention/MLP branches use ``layer_scale`` and start near identity.  The
+serial refiner additionally zero-initializes xCPE's unscaled residual projection.
 """
 from __future__ import annotations
 
@@ -18,7 +17,6 @@ from itertools import product
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
-import spconv.pytorch as spconv
 
 from ..utonia.model import (
     Block,
@@ -27,7 +25,6 @@ from ..utonia.model import (
     Point3DRoPE,
     flash_attn,
 )
-from ..utonia.module import PointSequential
 from ..utonia.structure import Point
 
 
@@ -265,19 +262,11 @@ class SparseLocalSelfAttention(nn.Module):
 
 
 class SparseLocalBlock(nn.Module):
-    """Utonia-style xCPE/attention/MLP block with sparse local attention."""
+    """Pre-norm sparse-local attention/MLP residual block without xCPE."""
 
     def __init__(self, dim: int, num_heads: int, max_neighbors: int,
-                 mlp_ratio: float, layer_scale: float, chunk_size: int,
-                 cpe_indice_key: str):
+                 mlp_ratio: float, layer_scale: float, chunk_size: int):
         super().__init__()
-        self.cpe = PointSequential(
-            spconv.SubMConv3d(
-                dim, dim, kernel_size=3, bias=True, indice_key=cpe_indice_key
-            ),
-            nn.Linear(dim, dim),
-            nn.LayerNorm(dim),
-        )
         self.norm1 = nn.LayerNorm(dim)
         self.attn = SparseLocalSelfAttention(
             dim=dim,
@@ -294,20 +283,12 @@ class SparseLocalBlock(nn.Module):
         )
         self.ls2 = LayerScale(dim, init_values=layer_scale)
 
-        # xCPE is outside layer scale, so zero-init its projection for identity.
-        nn.init.zeros_(self.cpe[1].weight)
-        nn.init.zeros_(self.cpe[1].bias)
-
-    def forward(self, point, neighbors):
-        shortcut = point.feat
-        point = self.cpe(point)
-        point.feat = shortcut + point.feat
-        point.feat = point.feat + self.ls1(
-            self.attn(self.norm1(point.feat), point.coord, neighbors)
+    def forward(self, feat, coord, neighbors):
+        feat = feat + self.ls1(
+            self.attn(self.norm1(feat), coord, neighbors)
         )
-        point.feat = point.feat + self.ls2(self.mlp(self.norm2(point.feat)))
-        point.sparse_conv_feat = point.sparse_conv_feat.replace_feature(point.feat)
-        return point
+        feat = feat + self.ls2(self.mlp(self.norm2(feat)))
+        return feat
 
 
 class SparseLocalTokenRefiner(nn.Module):
@@ -341,7 +322,6 @@ class SparseLocalTokenRefiner(nn.Module):
                 mlp_ratio=mlp_ratio,
                 layer_scale=layer_scale,
                 chunk_size=attn_chunk_size,
-                cpe_indice_key="jref_sparse",
             )
             for _ in range(int(depth))
         ])
@@ -349,19 +329,13 @@ class SparseLocalTokenRefiner(nn.Module):
     def forward(self, feat, pos, grid_coord, offset):
         if feat.shape[0] == 0:
             return feat
-        point = Point(dict(
-            feat=feat,
-            coord=pos * self.coord_scale,
-            grid_coord=grid_coord,
-            offset=offset,
-        ))
         neighbors = _sparse_window_neighbors(
-            point.grid_coord, point.offset, self.neighbor_offsets
+            grid_coord, offset, self.neighbor_offsets
         )
-        point.sparsify()
+        coord = pos * self.coord_scale
         for block in self.blocks:
-            point = block(point, neighbors)
-        return point.feat
+            feat = block(feat, coord, neighbors)
+        return feat
 
 
 def build_joint_refiner(cfg, *, dim: int, coord_scale: float):
