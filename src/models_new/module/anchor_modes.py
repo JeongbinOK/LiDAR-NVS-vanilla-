@@ -1,0 +1,116 @@
+"""Mode-specific conversion from fused grid tokens to Gaussian seeds.
+
+Both anchor modes consume the same refined Utonia/intensity tokens.  This
+module is the only boundary where their spatial/temporal semantics differ:
+
+* ``spherical`` groups tokens into spherical query anchors and emits a fixed
+  number of query seeds per occupied spherical cell.
+* ``grid`` keeps each occupied Cartesian token as an anchor, aggregates its
+  temporal feature, and expands it into a raw-count-dependent number of slots.
+
+The caller owns all trainable modules so their existing state-dict prefixes
+(``squery_head.*``, ``grid_temporal_agg.*``, and ``grid_slot_head.*``) stay
+unchanged.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional
+
+import torch
+
+
+@dataclass(frozen=True)
+class GaussianSeedBatch:
+    """Flat, mode-independent input contract for the shared Gaussian head."""
+
+    feature: torch.Tensor
+    position: torch.Tensor
+    frame_offset: torch.Tensor
+    metadata: dict
+    gradient_weight: Optional[torch.Tensor] = None
+
+
+def build_spherical_gaussian_seeds(
+    query_head,
+    fused_feature,
+    token_position,
+    token_offset,
+    frame_batch_idx,
+    pose,
+    bbox,
+    bbox_instance_ids,
+):
+    """Run spherical query aggregation and expose the shared seed contract."""
+    feature, position, _anchor_range, frame_offset, metadata = query_head(
+        fused_feature,
+        token_position,
+        token_offset,
+        frame_batch_idx,
+        pose,
+        bbox,
+        bbox_instance_ids,
+    )
+    return GaussianSeedBatch(
+        feature=feature,
+        position=position,
+        frame_offset=frame_offset,
+        metadata=metadata,
+    )
+
+
+def build_grid_gaussian_seeds(
+    temporal_aggregator,
+    slot_head,
+    fused_feature,
+    token_position,
+    raw_count,
+    token_offset,
+    frame_batch_idx,
+    pose,
+    bbox,
+    bbox_instance_ids,
+    timestamps,
+):
+    """Aggregate grid tokens, pack variable slots, and expand token metadata."""
+    anchor_feature, anchor_position, anchor_metadata = temporal_aggregator(
+        fused_feature,
+        token_position,
+        token_offset,
+        frame_batch_idx,
+        pose,
+        bbox,
+        bbox_instance_ids,
+        timestamps,
+    )
+    slot_feature, packing = slot_head(
+        anchor_feature,
+        raw_count,
+        token_position.norm(dim=-1),
+        token_offset,
+    )
+    anchor_index = packing["anchor_index"]
+    metadata = {
+        "box_assign": anchor_metadata["box_assign"][anchor_index],
+        "instance_id": anchor_metadata["instance_id"][anchor_index],
+        "is_dynamic": anchor_metadata["is_dynamic"][anchor_index],
+        "coord_ref": anchor_metadata["coord_ref"][anchor_index],
+        "bbox_ref_by_frame": anchor_metadata["bbox_ref_by_frame"],
+    }
+    gradient_weight = slot_head.gradient_weight(
+        packing["slot_k"], anchor_position.dtype
+    )
+    return GaussianSeedBatch(
+        feature=slot_feature,
+        position=anchor_position[anchor_index],
+        frame_offset=packing["gaussian_offset"],
+        metadata=metadata,
+        gradient_weight=gradient_weight,
+    )
+
+
+__all__ = [
+    "GaussianSeedBatch",
+    "build_grid_gaussian_seeds",
+    "build_spherical_gaussian_seeds",
+]

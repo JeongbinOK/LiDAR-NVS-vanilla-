@@ -29,10 +29,6 @@ def xyz_to_theta_phi_r(xyz):
     return torch.stack([theta, phi, r], dim=-1)
 
 
-def xyz_to_sph(xyz):
-    return xyz_to_theta_phi_r(xyz)
-
-
 def encode_ray_meta(tpr, r_far):
     """(...,3)=[theta, phi, r] -> (...,4) encoded ray meta for K/V embeddings.
 
@@ -87,77 +83,18 @@ class UtoniaGridMapper:
         return (points - metric_origin.unsqueeze(0)) / self.feature_grid_size
 
 
-def utonia_cond_trilinear(anchor_points, grid_coord, voxel_feats, metric_origin, mapper):
-    """Trilinear (8-neighbour) interpolation of Utonia bottleneck features onto
-    arbitrary metric anchor positions. Returns (feat[M_kept, D], keep_mask[M]).
-    (Moved verbatim from Point2Gaus.utonia_cond; uses mapper.to_feature_grid.)"""
-    M = anchor_points.shape[0]
-    D = voxel_feats.shape[1]
-    device = anchor_points.device
-    if M == 0 or voxel_feats.shape[0] == 0:
-        return voxel_feats.new_zeros((0, D)), torch.zeros((M,), dtype=torch.bool, device=device)
-
-    grid_coord = grid_coord.to(device=device, dtype=torch.long)
-    anchor_grid_f = mapper.to_feature_grid(anchor_points, metric_origin)
-    base_grid = torch.floor(anchor_grid_f).long()
-    frac = (anchor_grid_f - base_grid.to(anchor_points.dtype)).clamp(0.0, 1.0)
-
-    offsets = torch.tensor(
-        [[0, 0, 0], [0, 0, 1], [0, 1, 0], [0, 1, 1],
-         [1, 0, 0], [1, 0, 1], [1, 1, 0], [1, 1, 1]],
-        device=device, dtype=torch.long,
-    )
-    neighbor_grids = base_grid[:, None, :] + offsets[None, :, :]
-
-    grid_max = grid_coord.max(dim=0).values
-    in_bounds = ((neighbor_grids >= 0) & (neighbor_grids <= grid_max.view(1, 1, 3))).all(dim=-1)
-    safe_neighbor_grids = neighbor_grids.clamp(min=0)
-
-    dims = (grid_max + 1).clamp_min(1)
-    stride_x = dims[1] * dims[2]
-    stride_y = dims[2]
-
-    voxel_keys = grid_coord[:, 0] * stride_x + grid_coord[:, 1] * stride_y + grid_coord[:, 2]
-    sorted_keys, sorted_order = torch.sort(voxel_keys)
-    neighbor_keys = (
-        safe_neighbor_grids[:, :, 0] * stride_x
-        + safe_neighbor_grids[:, :, 1] * stride_y
-        + safe_neighbor_grids[:, :, 2]
-    )
-
-    flat_keys = neighbor_keys.reshape(-1)
-    pos = torch.searchsorted(sorted_keys, flat_keys)
-    pos_clamped = pos.clamp(max=sorted_keys.numel() - 1)
-    found = (pos < sorted_keys.numel()) & (sorted_keys[pos_clamped] == flat_keys)
-    found = found & in_bounds.reshape(-1)
-    neighbor_vi = sorted_order[pos_clamped].reshape(M, 8)
-    valid_mask = found.reshape(M, 8)
-
-    offsets_f = offsets.to(dtype=anchor_points.dtype)
-    wx = torch.where(offsets_f[:, 0].view(1, 8) > 0, frac[:, 0:1], 1.0 - frac[:, 0:1])
-    wy = torch.where(offsets_f[:, 1].view(1, 8) > 0, frac[:, 1:2], 1.0 - frac[:, 1:2])
-    wz = torch.where(offsets_f[:, 2].view(1, 8) > 0, frac[:, 2:3], 1.0 - frac[:, 2:3])
-    weights = wx * wy * wz
-    weights = weights * valid_mask.to(dtype=weights.dtype)
-    weight_sum = weights.sum(dim=-1)
-    keep_mask = weight_sum > 1e-8
-
-    safe_vi = neighbor_vi.clamp(min=0)
-    out_all = (weights[:, :, None] * voxel_feats[safe_vi]).sum(dim=1)
-    out_all = out_all / weight_sum.clamp_min(1e-8).unsqueeze(-1)
-    return out_all[keep_mask], keep_mask
-
-
 def aggregate_points_to_cells(points_xyz, intensity, grid_coord, voxel_feats,
                               voxel_coord, metric_origin, mapper):
     """Scatter raw points into the Utonia bottleneck cells they fall in, and pair
     each occupied cell with its Utonia feature (exact cell match, no trilinear).
 
     Returns (positions[M,3] metric, utonia_feat[M,C_stage], intensity5d[M,5],
-    occ[V] bool) for the Utonia cells that received >=1 point. positions = Utonia
-    cell position; the intensity (theta,phi,r) come from the per-cell MEAN point
-    position. ``occ`` (over all V grid_coord rows) lets callers recover the token
-    grid_coords (grid_coord[occ]) for aligning a separate intensity encoder.
+    occ[V] bool, raw_count[M] long) for the Utonia cells that received >=1 point.
+    positions = Utonia cell position; the intensity (theta,phi,r) come from the
+    per-cell MEAN point position. ``occ`` (over all V grid_coord rows) lets callers
+    recover the token grid_coords (grid_coord[occ]) for aligning a separate
+    intensity encoder. ``raw_count`` is the own-frame point count and deliberately
+    excludes temporally matched observations.
     """
     device = voxel_feats.device
     V = grid_coord.shape[0]
@@ -165,7 +102,8 @@ def aggregate_points_to_cells(points_xyz, intensity, grid_coord, voxel_feats,
     if V == 0 or points_xyz.shape[0] == 0:
         return (points_xyz.new_zeros((0, 3)), voxel_feats.new_zeros((0, D)),
                 points_xyz.new_zeros((0, 5)),
-                torch.zeros((V,), dtype=torch.bool, device=device))
+                torch.zeros((V,), dtype=torch.bool, device=device),
+                torch.zeros((0,), dtype=torch.long, device=device))
 
     grid_coord = grid_coord.to(device=device, dtype=torch.long)
     pcell = torch.floor(mapper.to_feature_grid(points_xyz, metric_origin)).long()   # (N,3)
@@ -216,4 +154,4 @@ def aggregate_points_to_cells(points_xyz, intensity, grid_coord, voxel_feats,
             + metric_origin.to(device=device, dtype=points_xyz.dtype).unsqueeze(0)
 
     int5 = torch.cat([mean_i.unsqueeze(-1), var_i.unsqueeze(-1), mean_tpr], dim=-1)
-    return util_pos[occ], voxel_feats[occ], int5[occ], occ
+    return util_pos[occ], voxel_feats[occ], int5[occ], occ, counts[occ].long()

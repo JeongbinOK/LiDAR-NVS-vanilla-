@@ -6,6 +6,15 @@ import torch
 from ..utils import boxes as box_utils
 
 
+def gradient_scale_identity(x, scale):
+    """Preserve forward values while scaling each row's upstream gradient."""
+    scale = torch.as_tensor(scale, device=x.device, dtype=x.dtype)
+    while scale.ndim < x.ndim:
+        scale = scale.unsqueeze(-1)
+    detached = x.detach()
+    return detached + scale * (x - detached)
+
+
 def assemble_batch_gaussians(
     gs_raw, out_coord, agg_meta, frame_offset, frame_batch_ids,
     frame_bboxes, frame_bbox_instance_ids, has_bbox_instance_ids, device,
@@ -102,4 +111,8 @@ def refresh_coord_ref_after_offset(out_coord, agg_meta, frame_offset):
     return refreshed
 
 
-__all__ = ["assemble_batch_gaussians", "refresh_coord_ref_after_offset"]
+__all__ = [
+    "assemble_batch_gaussians",
+    "gradient_scale_identity",
+    "refresh_coord_ref_after_offset",
+]

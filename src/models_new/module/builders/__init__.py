@@ -1,28 +1,26 @@
-"""Config-driven anchor/token builder factory."""
+"""Shared grid-token builder selected by the downstream anchor mode."""
 
 
-SUPPORTED_ANCHOR_MODES = ("grid", "spherical", "spherical_legacy")
+SUPPORTED_ANCHOR_MODES = ("spherical", "grid")
 
 
-def build_anchor_builder(cfg):
-    """Build only the selected implementation and report its token contract."""
+def resolve_anchor_mode(cfg):
+    """Validate and normalize the two supported anchor modes."""
     mode = str(getattr(cfg, "anchor_mode", "spherical")).lower()
     if mode not in SUPPORTED_ANCHOR_MODES:
         raise ValueError(
             f"Unknown p2g.anchor_mode={mode!r}; expected one of "
             f"{SUPPORTED_ANCHOR_MODES}"
         )
-    if mode == "spherical_legacy":
-        from .spherical_anchor import SphericalAnchorBuilder
+    return mode
 
-        return mode, SphericalAnchorBuilder(cfg), False
 
-    # Both grid primitives and the spherical-query head consume Utonia-grid
-    # tokens with a selected intensity encoder.  The query head changes only the
-    # downstream aggregation strategy.
+def build_token_builder(cfg):
+    """Build the tokenization path shared by spherical and grid modes."""
+    mode = resolve_anchor_mode(cfg)
     from .grid_intensity import GridIntensityBuilder
 
-    return mode, GridIntensityBuilder(cfg), True
+    return mode, GridIntensityBuilder(cfg)
 
 
-__all__ = ["SUPPORTED_ANCHOR_MODES", "build_anchor_builder"]
+__all__ = ["SUPPORTED_ANCHOR_MODES", "build_token_builder", "resolve_anchor_mode"]

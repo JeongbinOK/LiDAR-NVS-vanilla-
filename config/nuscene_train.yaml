@@ -1,7 +1,10 @@
 device: [0, 1, 2, 3]
 
 project_name: 2dgs-utonia
-exp_name:  ${p2g.anchor_mode}_stage${p2g.utonia_feature_stage}_${p2g.squery.K}-slots_v2
+exp_name:  ${p2g.anchor_mode}_${p2g.squery.K}-slots_int_enc_KV-1x1x1_scale_reg
+# Grid runs can select this name with ``exp_name=${grid_exp_name}``; the existing
+# spherical experiment name above is intentionally preserved.
+grid_exp_name: grid_Kmax${p2g.grid_query.K_max}_int_enc_KV-1x1x1_scale_reg
 mode: train
 
 
@@ -77,8 +80,8 @@ p2g:
   freeze_utonia: true
   utonia_ckpt: null   # optional abs path override; null -> checkpoints/utonia/utonia.pth (config dump: config/utonia_pretrained.yaml)
   utonia_feature_stage: 3  # encoder stage index: 3 -> 0.4m/432D, 4 -> 0.8m/576D (default/final)
-  anchor_mode: spherical   # "grid" | "spherical"(query 신규) | "spherical_legacy"
-  squery:
+  anchor_mode: spherical   # "spherical" | "grid"
+  squery:                       # spherical mode only
     K: 3                      # anchor당 가우시안(query) 수
     dtheta_deg: 2.0
     dphi_deg: 3.0
@@ -88,31 +91,22 @@ p2g:
     max_kv: 64                # anchor당 K/V 토큰 cap (nearest)
     attn_chunk: 8192
     n_layers: 2                # bg·fg 공유 cross-attn depth (query refinement 라운드 수)
+  grid_query:                   # grid mode only
+    K_max: 3
+    points_per_gaussian: 4
+    bg_radius_m: 0.8
+    bg_max_kv_per_frame: 8
+    num_heads: 8
+    bg_layers: 2
+    fg_layers: 2
+    layer_scale: 1.0e-5
+    film_scale: 0.1
+    count_condition_cap: 32
+    grad_balance: sqrt_k
   head_offset_bound: 0.8    # gaussian pos = seed_pos + bound*tanh(offset), per-axis meters
 
 
 
-  # PTv3 backbone
-  #ptv3_backbone: 
-  # grid_size: 0.1
-  #  model_in_channels: ${p2g.anchor_token_dim}
-  #  enable_flash: true
-  #  conv_algo: "native"
-  #  batch_norm_eval: true
-  #  decoupled_stem: true
-  #  pdnorm_bn: true
-  #  pdnorm_ln: true
-  #  pdnorm_decouple: true
-  #  condition_names: ["static", "dynamic"]
-  #  stride: [2, 2]
-  #  enc_depths: [2, 2, 4]
-  #  enc_channels: [32, 64, 128]
-  #  enc_num_head: [2, 4, 8]
-  #  enc_patch_size: [1024, 1024, 1024]
-  #  dec_depths: [2, 2]
-  #  dec_channels: [64, 128]
-  #  dec_num_head: [4, 8]
-  # dec_patch_size: [1024, 1024]
 
   # Intensity encoder selection. type=ptv3 -> mini PointTransformerV3 mirroring the
   # frozen Utonia backbone (serialization -> RoPE patch attn + xCPE -> GridPooling);

@@ -19,9 +19,9 @@ Intensity per primitive comes from one of three encoders (config
 - "mlp" (fallback): ``IntensityMLPEncoder`` on the aggregated
   [mean_i, var_i, theta, phi, r] 5D.
 
-All modes also return a per-frame ``occ_gc`` list (the occupied token grid_coords)
-so the post-fusion joint refiner can mix the fused trunk tokens with either
-serialized or exact sparse-local attention.
+All modes also return per-frame ``occ_gc`` (occupied token grid coordinates) and
+``raw_count`` lists.  ``raw_count`` is the number of own-frame raw points in each
+token and is used by grid mode to choose its variable Gaussian count.
 """
 from __future__ import annotations
 
@@ -64,11 +64,12 @@ class GridIntensityBuilder(nn.Module):
         pts_list = split_by_offset(lidar_points.to(device), offset)
 
         pos_list, ufeat_list, int5_list, occ_list, gc_list = [], [], [], [], []
+        raw_count_list = []
         for i in range(len(feat_list)):
             pts = pts_list[i]
             xyz = pts[:, :3]
             inten = pts[:, 3]
-            upos, ufeat, int5, occ = aggregate_points_to_cells(
+            upos, ufeat, int5, occ, raw_count = aggregate_points_to_cells(
                 xyz, inten, grid_coord_list[i], feat_list[i],
                 coord_list[i], origins[i], mapper,
             )
@@ -78,6 +79,7 @@ class GridIntensityBuilder(nn.Module):
             int5_list.append(int5)
             occ_list.append(occ)
             gc_list.append(occ_gc)
+            raw_count_list.append(raw_count)
 
         ifeat_list = encode_intensity_features(
             self.intensity_mode,
@@ -90,4 +92,4 @@ class GridIntensityBuilder(nn.Module):
             occupied_grid_coord_list=gc_list,
             cell_statistics_list=int5_list,
         )
-        return pos_list, ufeat_list, ifeat_list, gc_list
+        return pos_list, ufeat_list, ifeat_list, gc_list, raw_count_list

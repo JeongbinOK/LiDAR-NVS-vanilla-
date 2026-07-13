@@ -6,14 +6,18 @@ import torch
 import torch.nn as nn
 
 from .. import utonia
-from .builders import build_anchor_builder
+from .anchor_modes import (
+    build_grid_gaussian_seeds,
+    build_spherical_gaussian_seeds,
+)
+from .builders import build_token_builder
 from .builders.common import UtoniaGridMapper
 from .feature_fusion import build_feature_fusion, fuse_features
 from .gaussian_assembly import (
     assemble_batch_gaussians,
+    gradient_scale_identity,
     refresh_coord_ref_after_offset,
 )
-from .temporal_aggregator import TimeAgg
 
 
 class Point2Gaus(nn.Module):
@@ -49,30 +53,17 @@ class Point2Gaus(nn.Module):
         self.utonia_feature_grid_size = self._infer_utonia_feature_grid_size()
         self.utonia_feature_dim = self._infer_utonia_feature_dim()
 
-        # Utonia bottleneck grid mapper shared by all builder implementations.
+        # Both anchor modes start from the exact same occupied Utonia-grid tokens.
         self.grid_mapper = UtoniaGridMapper(
             self.utonia_coord_scale, self.utonia_input_grid_size, self.utonia_stride_factor
         )
-        (
-            self.anchor_mode,
-            self.anchor_builder,
-            self.builder_returns_grid_coord,
-        ) = build_anchor_builder(cfg)
+        self.anchor_mode, self.anchor_builder = build_token_builder(cfg)
 
         self.agg_mlp = cfg.agg_mlp
-        # Intensity width is part of the selected builder contract.
+        # Intensity width is part of the shared token-builder contract.
         intensity_out_dim = getattr(self.anchor_builder, "intensity_out_dim", None)
         if intensity_out_dim is None:
-            ie_cfg = getattr(cfg, "intensity_encoder", None)
-            refiner_cfg = getattr(cfg, "joint_refiner", None)
-            if (ie_cfg is not None and str(getattr(ie_cfg, "type", "")) == "ptv3") or (
-                refiner_cfg is not None and bool(getattr(refiner_cfg, "enable", False))
-            ):
-                raise ValueError(
-                    "anchor_mode='spherical_legacy' (SphericalAnchorBuilder) does not "
-                    "support intensity_encoder.type='ptv3' or joint_refiner (it emits no "
-                    "per-token grid_coord); use anchor_mode 'grid' or 'spherical'.")
-            intensity_out_dim = int(cfg.int_proj.out_dim)
+            raise RuntimeError("the shared token builder must expose intensity_out_dim")
         self.agg_in_dim = self.utonia_feature_dim + int(intensity_out_dim)
         (
             self.utonia_adapter,
@@ -95,9 +86,20 @@ class Point2Gaus(nn.Module):
                 squery_cfg, dim=self.agg_mlp.out_dim,
                 r_far=float(getattr(cfg, "r_far", 70.0)),
             )
-            self.time_agg = None   # replaced by the query head in this mode
-        else:
-            self.time_agg = TimeAgg(dim=self.agg_mlp.out_dim, num_heads= 8, k_bg= 8, k_fg= 16)
+        else:  # grid; validated by build_token_builder
+            from .grid_query_head import GridSlotHead, GridTemporalAggregator
+
+            grid_query_cfg = getattr(cfg, "grid_query", None)
+            if grid_query_cfg is None:
+                raise ValueError("p2g.grid_query config block is required for anchor_mode='grid'")
+            self.grid_temporal_agg = GridTemporalAggregator(
+                grid_query_cfg, dim=self.agg_mlp.out_dim,
+                r_far=float(getattr(cfg, "r_far", 70.0)),
+            )
+            self.grid_slot_head = GridSlotHead(
+                grid_query_cfg, dim=self.agg_mlp.out_dim,
+                r_far=float(getattr(cfg, "r_far", 70.0)),
+            )
 
         # Gaussian head size is derived purely from gs_params (shs+opacity+scaling+
         # rotation [+offset]). Edit gs_params to control the head. offset>0 adds the
@@ -112,8 +114,7 @@ class Point2Gaus(nn.Module):
             int(cfg.gs_params.rotation),
         ] + ([self.offset_size] if self.use_offset else [])
         gs_out_dim = sum(self.gs_param_sizes)
-        # Input dim is dictated by the trunk width (agg_mlp.out_dim; TimeAgg preserves
-        # dim), so the gs head can never desync when the trunk width changes.
+        # Both mode-specific seed modules preserve the shared fusion trunk width.
         trunk_dim = int(self.agg_mlp.out_dim)
         self.gs_predictor = nn.Sequential(
             nn.Linear(trunk_dim, trunk_dim),
@@ -192,26 +193,18 @@ class Point2Gaus(nn.Module):
         pose = _input["pose"]
         bbox = _input["bbox"]
         bbox_instance_ids = _input.get("bbox_instance_ids")
-
-
         features = self._forward_utonia_features(_input["ptv3_input"])
 
-        # Builder contract: per-frame position/Utonia/intensity, plus grid_coord
-        # for token builders used by the optional joint refiner.
+        # Shared contract for both anchor modes: occupied grid tokens, their
+        # aligned Utonia/intensity features, grid coordinates, and own-frame count.
         builder_out = self.anchor_builder(
             lidar_points, offset, pose, features, _input["ptv3_input"], self.grid_mapper
         )
-        expected_items = 4 if self.builder_returns_grid_coord else 3
-        if len(builder_out) != expected_items:
+        if len(builder_out) != 5:
             raise RuntimeError(
-                f"anchor builder for mode={self.anchor_mode!r} returned "
-                f"{len(builder_out)} items; expected {expected_items}"
+                f"shared token builder returned {len(builder_out)} items; expected 5"
             )
-        if self.builder_returns_grid_coord:
-            pos_list, ufeat_list, ifeat_list, gc_list = builder_out
-        else:
-            pos_list, ufeat_list, ifeat_list = builder_out
-            gc_list = None
+        pos_list, ufeat_list, ifeat_list, gc_list, raw_count_list = builder_out
 
         n_frames = len(pos_list)
 
@@ -222,9 +215,9 @@ class Point2Gaus(nn.Module):
         all_pos         = []
         all_ufeat       = []
         all_ifeat       = []
-        all_gc          = [] if gc_list is not None else None
+        all_gc          = []
+        all_raw_count   = []
         all_offset      = []
-        all_batch       = []
         all_frame_batch = []
         all_bbox        = []   # List[Tensor(B_f, 7)], 프레임별
         all_bbox_iids   = []
@@ -242,9 +235,8 @@ class Point2Gaus(nn.Module):
             all_pos.append(pos_i)
             all_ufeat.append(ufeat_list[i])
             all_ifeat.append(ifeat_list[i])
-            if all_gc is not None:
-                all_gc.append(gc_list[i])
-            all_batch.append(torch.full((n_i,), b, dtype=torch.long, device=pos_i.device))
+            all_gc.append(gc_list[i])
+            all_raw_count.append(raw_count_list[i])
             all_frame_batch.append(b)
             all_bbox.append(bbox[b][local_f])   # Tensor(B_f, 7)
             if bbox_instance_ids is not None:
@@ -255,9 +247,8 @@ class Point2Gaus(nn.Module):
         all_pos       = torch.cat(all_pos,   dim=0)   # (N_valid, 3)
         all_ufeat     = torch.cat(all_ufeat, dim=0)   # (N_valid, C_stage)
         all_ifeat     = torch.cat(all_ifeat, dim=0)   # (N_valid, D)
-        if all_gc is not None:
-            all_gc    = torch.cat(all_gc, dim=0)      # (N_valid, 3) token grid_coord
-        new_batch     = torch.cat(all_batch, dim=0)   # (N_valid,)
+        all_gc        = torch.cat(all_gc, dim=0)      # (N_valid, 3) token grid_coord
+        all_raw_count = torch.cat(all_raw_count, dim=0).long()
         new_offset    = torch.stack(all_offset)        # (n_frames,)
         frame_batch_idx = torch.tensor(
             all_frame_batch, dtype=torch.long, device=all_ufeat.device
@@ -281,79 +272,74 @@ class Point2Gaus(nn.Module):
         )
 
         if self.anchor_mode == "spherical":
-            # Spherical query path (replaces TimeAgg): K learnable queries per
-            # (theta, phi, log r) anchor cross-attend to the anchor's token
-            # neighbourhood; each query yields one gaussian whose seed position is
-            # the attention-weighted K/V position (bg: ref frame, fg: box-local).
-            out_feat, p_init, _r_anchor, gauss_offset, agg_meta = self.squery_head(
-                agg_feat_i, all_pos, new_offset, frame_batch_idx, pose, bbox,
+            seeds = build_spherical_gaussian_seeds(
+                self.squery_head,
+                agg_feat_i,
+                all_pos,
+                new_offset,
+                frame_batch_idx,
+                pose,
+                bbox,
                 bbox_instance_ids,
             )
-            gs_feat = self.gs_predictor(out_feat)
-            gs_raw = self.split_gs_params(gs_feat)
-            out_coord = p_init
-            if self.use_offset:
-                # Same bounded offset contract as grid/legacy modes: each xyz
-                # component is limited to +/- head_offset_bound meters.
-                out_coord = out_coord + self.offset_bound * torch.tanh(gs_raw.pop("offset"))
-            agg_meta = refresh_coord_ref_after_offset(out_coord, agg_meta, gauss_offset)
-            batch_gaussians = assemble_batch_gaussians(
-                gs_raw, out_coord, agg_meta, gauss_offset, all_frame_batch,
-                all_bbox, all_bbox_iids, bbox_instance_ids is not None, out_feat.device,
+        else:
+            seeds = build_grid_gaussian_seeds(
+                self.grid_temporal_agg,
+                self.grid_slot_head,
+                agg_feat_i,
+                all_pos,
+                all_raw_count,
+                new_offset,
+                frame_batch_idx,
+                pose,
+                bbox,
+                bbox_instance_ids,
+                _input.get("timestamps"),
             )
-            gauss_counts = torch.diff(gauss_offset, prepend=gauss_offset.new_zeros(1))
-            new_batch_g = torch.repeat_interleave(
-                frame_batch_idx.to(gauss_offset.device), gauss_counts)
-            return {
-                "batch_gaussians": batch_gaussians,
-                "gaussians": batch_gaussians,  # List[dict], 배치별 (구조는 grid 경로와 동일)
-                "batch": new_batch_g,
-                "pose": pose,
-                "timestamps": _input["timestamps"],
-            }
 
-        # time_agg: out_coord is the Gaussian position coordinate. Dynamic points
-        # are represented in object-local coordinates; static points stay in ref frame.
-        out_feat, out_coord, agg_meta = self.time_agg(
-            agg_feat_i, all_pos, new_offset,
-            frame_batch_idx, pose, bbox, bbox_instance_ids
-        )
-
-        # GS 예측
-        gs_feat = self.gs_predictor(out_feat)
+        # From here onward spherical and grid share the exact same Gaussian
+        # parameter prediction, bounded offset, metadata refresh, and assembly.
+        gs_feat = self.gs_predictor(seeds.feature)
         gs_raw = self.split_gs_params(gs_feat)
-        # gs_raw: dict of (N_valid, ...) tensors
-
+        out_coord = seeds.position
         if self.use_offset:
             out_coord = out_coord + self.offset_bound * torch.tanh(gs_raw.pop("offset"))
-        agg_meta = refresh_coord_ref_after_offset(out_coord, agg_meta, new_offset)
 
-        # 배치별로 분리 + box_assign 붙이기 (모든 anchor_mode 공유 헬퍼)
+        # Grid's variable-K balancing is forward-identical and is applied once at
+        # this common renderer boundary. Spherical has no gradient weight.
+        if seeds.gradient_weight is not None:
+            out_coord = gradient_scale_identity(out_coord, seeds.gradient_weight)
+            for key in ("shs", "opacity", "scaling", "rotation"):
+                gs_raw[key] = gradient_scale_identity(
+                    gs_raw[key], seeds.gradient_weight
+                )
+
+        agg_meta = refresh_coord_ref_after_offset(
+            out_coord, seeds.metadata, seeds.frame_offset
+        )
         batch_gaussians = assemble_batch_gaussians(
-            gs_raw, out_coord, agg_meta, new_offset, all_frame_batch,
-            all_bbox, all_bbox_iids, bbox_instance_ids is not None, out_feat.device,
+            gs_raw,
+            out_coord,
+            agg_meta,
+            seeds.frame_offset,
+            all_frame_batch,
+            all_bbox,
+            all_bbox_iids,
+            bbox_instance_ids is not None,
+            out_coord.device,
+        )
+        gauss_counts = torch.diff(
+            seeds.frame_offset,
+            prepend=seeds.frame_offset.new_zeros(1),
+        )
+        gaussian_batch = torch.repeat_interleave(
+            frame_batch_idx.to(seeds.frame_offset.device), gauss_counts
         )
 
         return {
             "batch_gaussians": batch_gaussians,
-            "gaussians": batch_gaussians,  # List[dict], 배치별
-            # batch_gaussians[b] 구조:
-            #   "position"     : (Nb, 3)
-            #   "opacity"      : (Nb, 1)
-            #   "scale"        : (Nb, 2)
-            #   "rotation"     : (Nb, 4)
-            #   "shs" : (Nb, 16) -> L =3 임.
-            #   "coord"        : (Nb, 3)  frame_0 좌표계
-            #   "box_assign"   : (Nb,)    -1=bg, 0~B-1=box index
-            #   "bg_mask"      : (Nb,)    bool
-            #   "fg_masks"     : {box_id: (Nb,) bool}
-            #   "frame_bboxes"  : List[dict] 프레임별
-            #       [local_f]["center"] : (B_f, 3)
-            #       [local_f]["size"]   : (B_f, 3)
-            #       [local_f]["yaw"]    : (B_f,)
-            #       [local_f]["bbox"]   : (B_f, 7)
-            # bbox바더서 linear 이동할 준비. 
-            "batch":  new_batch,
+            "gaussians": batch_gaussians,
+            "batch": gaussian_batch,
             "pose": pose,
             "timestamps": _input["timestamps"],
         }
