@@ -130,13 +130,17 @@ p2g:
       mlp_ratio: 2.0
       order: [z, hilbert]          # or [z, z-trans, hilbert, hilbert-trans] to mirror Utonia
 
-  # Post-fusion joint token refiner: `depth` serialized RoPE attention blocks over the
-  # fused 192D trunk tokens (near-identity at init via layer_scale + xCPE zero-init).
+  # Post-fusion joint token refiner over the fused 192D trunk tokens. type=serial
+  # preserves serialized RoPE blocks; sparse uses exact occupied-cell local attention.
+  # At stage3 each cell is 0.4m, so window_size=3 attends to at most 3x3x3=27 cells.
   joint_refiner:
     enable: true
+    type: sparse                     # serial | sparse
     depth: 2
     num_heads: 8                   # 192/8 = 24 (RoPE head_dim multiple of 6)
-    patch_size: 1024
+    patch_size: 1024                # serial only
+    window_size: 3                 # sparse only; odd int or [x, y, z] odd triplet
+    attn_chunk_size: 4096          # sparse manual fallback only; CUDA uses flash-attn
     layer_scale: 1.0e-5
 
   # Fallback (sparse/mlp) intensity config; ignored when intensity_encoder.type=ptv3.

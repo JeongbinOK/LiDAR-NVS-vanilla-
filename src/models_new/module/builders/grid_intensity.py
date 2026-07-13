@@ -20,7 +20,8 @@ Intensity per primitive comes from one of three encoders (config
   [mean_i, var_i, theta, phi, r] 5D.
 
 All modes also return a per-frame ``occ_gc`` list (the occupied token grid_coords)
-so the post-fusion ``JointTokenRefiner`` can serialize the fused trunk tokens.
+so the post-fusion joint refiner can mix the fused trunk tokens with either
+serialized or exact sparse-local attention.
 """
 from __future__ import annotations
 
