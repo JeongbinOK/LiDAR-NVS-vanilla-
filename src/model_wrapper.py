@@ -19,6 +19,7 @@ WANDB_COMMON_LOSS_KEYS = {
     "loss_intensity",
     "loss_raydrop",
     "loss_chamfer",
+    "loss_scale",
     "render_points_mean",
     "intensity_psnr_valid",
     "intensity_ssim_valid",
@@ -90,7 +91,7 @@ class ModelWrapper(LightningModule):
         out = self.g2g_model(out, _input["timestamps"])
         all_renders = self.g2p_model(out, gt)
 
-        loss_dict = self.loss(all_renders, metric_mode=prefix)
+        loss_dict = self.loss(all_renders, gaussians=out, metric_mode=prefix)
         self._log_losses(loss_dict, prefix=prefix, batch_size=self._batch_size(_input))
 
         if self._dbg_finite and prefix == "train":

@@ -11,6 +11,9 @@ try:
 except ImportError:
     lpips = None
 
+SCALE_REG_MAX_M = 5.0
+
+
 class Loss(nn.Module):
     def __init__(self, cfg):
         super().__init__()
@@ -21,6 +24,7 @@ class Loss(nn.Module):
         self.w_depth_median = getattr(cfg, "w_depth_median", cfg.w_depth)
         self.w_intensity    = cfg.w_intensity
         self.w_raydrop      = cfg.w_raydrop
+        self.w_scale        = float(getattr(cfg, "w_scale", 0.0))
         self.chamfer = chamfer_3DDist()
         self.enable_lpips = bool(getattr(cfg, "enable_lpips", False))
         # LPIPS is an expensive logging metric, not part of the training loss.
@@ -107,7 +111,46 @@ class Loss(nn.Module):
             score = self.lpips_fn(p_img, g_img).mean()
         return score
 
-    def forward(self, all_renders, *, metric_mode="train"):
+    def _scale_regularization(self, gaussians, reference):
+        """Penalize only activated Gaussian semi-axes larger than 5 meters.
+
+        The penalty is a squared log-ratio, averaged per sample and then over
+        the batch.  This keeps the loss independent of the number of Gaussians
+        in each sample and avoids the extreme gradients of a meter-space
+        squared hinge.  ``w_scale=0`` is a true off switch and does not require
+        Gaussian tensors to be passed.
+        """
+        if self.w_scale == 0.0:
+            return reference.new_zeros(())
+        if gaussians is None:
+            raise ValueError("loss.w_scale > 0 requires Gaussian outputs")
+        if isinstance(gaussians, dict):
+            gaussians = gaussians.get("batch_gaussians", gaussians.get("gaussians"))
+        if gaussians is None:
+            raise ValueError("Could not find batch Gaussian outputs for scale regularization")
+
+        sample_losses = []
+        for batch_item in gaussians:
+            if batch_item is None:
+                continue
+            raw_scale = batch_item.get("scaling")
+            if raw_scale is None:
+                raise KeyError("Gaussian output is missing 'scaling'")
+            if raw_scale.shape[0] == 0:
+                continue
+            scales = F.softplus(raw_scale[:, :2])
+            max_scale = scales.amax(dim=-1)
+            excess = F.relu(
+                torch.log(max_scale.clamp_min(1e-6))
+                - max_scale.new_tensor(SCALE_REG_MAX_M).log()
+            )
+            sample_losses.append(excess.square().mean())
+
+        if not sample_losses:
+            return reference.new_zeros(())
+        return torch.stack(sample_losses).mean()
+
+    def forward(self, all_renders, *, gaussians=None, metric_mode="train"):
         losses = {}
 
         # 데이터 세팅
@@ -184,6 +227,7 @@ class Loss(nn.Module):
             device=gt_depth.device,
             dtype=gt_depth.dtype,
         )
+        losses["loss_scale"] = self._scale_regularization(gaussians, gt_depth)
 
         # ----------------------------------------------------------
         # 2. 로그 및 평가 전용 Metrics 계산 (역전파 제외 / 단순 로깅용)
@@ -251,7 +295,7 @@ class Loss(nn.Module):
                 losses["depth_lpips"] = depth_lpips
 
         # ----------------------------------------------------------
-        # 3. 가중치 결합을 통한 최종 Total Loss 정의 (4개만 반영)
+        # 3. 가중치 결합을 통한 최종 Total Loss 정의
         # ----------------------------------------------------------
         # median은 w_depth_median으로 토글: 0이면 학습 제외(detached metric), >0이면 학습 loss로 합산.
         losses["total"] = (
@@ -259,7 +303,8 @@ class Loss(nn.Module):
             self.w_depth_median * losses["loss_depth_median"] +
             self.w_intensity    * losses["loss_intensity"]    +
             self.w_raydrop      * losses["loss_raydrop"]      +
-            self.w_chamfer      * losses["loss_chamfer"]
+            self.w_chamfer      * losses["loss_chamfer"]      +
+            self.w_scale        * losses["loss_scale"]
         )
 
         # 항별 가중 기여(w·loss) 로깅 — 절대 loss가 아니라 이 값들을 보고 weight를 등화한다.
@@ -268,5 +313,6 @@ class Loss(nn.Module):
         losses["wc_intensity"]    = (self.w_intensity    * losses["loss_intensity"]).detach()
         losses["wc_raydrop"]      = (self.w_raydrop      * losses["loss_raydrop"]).detach()
         losses["wc_chamfer"]      = (self.w_chamfer      * losses["loss_chamfer"]).detach()
+        losses["wc_scale"]        = (self.w_scale        * losses["loss_scale"]).detach()
 
         return losses
