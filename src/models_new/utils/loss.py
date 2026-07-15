@@ -11,7 +11,7 @@ try:
 except ImportError:
     lpips = None
 
-SCALE_REG_MAX_M = 5.0
+SCALE_REG_MAX_M = 2.5
 
 
 class Loss(nn.Module):
