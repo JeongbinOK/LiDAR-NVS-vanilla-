@@ -1,10 +1,7 @@
 device: [0, 1, 2, 3]
 
 project_name: 2dgs-utonia
-exp_name:  ${p2g.anchor_mode}_${p2g.squery.K}-slots_int_enc_KV-1x1x1_scale_reg
-# Grid runs can select this name with ``exp_name=${grid_exp_name}``; the existing
-# spherical experiment name above is intentionally preserved.
-grid_exp_name: grid_Kmax${p2g.grid_query.K_max}_int_enc_KV-1x1x1_scale_reg
+exp_name:  ${p2g.anchor_mode}_${p2g.squery.K}-slots_int_enc_KV-1x3x1_scale_reg
 mode: train
 
 
@@ -83,25 +80,22 @@ p2g:
   anchor_mode: spherical   # "spherical" | "grid"
   squery:                       # spherical mode only
     K: 3                      # anchor당 가우시안(query) 수
-    dtheta_deg: 2.0
+    dtheta_deg: 2.67
     dphi_deg: 3.0
-    dlogr: 0.18 # 대략 bin마다 1.2배씩 증가
+    dlogr: 0.12
     r_min: 2.0
     r_max: 80.0
     max_kv: 64                # anchor당 K/V 토큰 cap (nearest)
     attn_chunk: 8192
     n_layers: 2                # bg·fg 공유 cross-attn depth (query refinement 라운드 수)
-  grid_query:                   # grid mode only
-    K_max: 3
-    points_per_gaussian: 4
+  grid_query:                   # grid mode only: raw-point seeds + independent joint K heads
+    K_max: 3                    # maximum Gaussians emitted by one occupied 0.4m cell
+    points_per_gaussian: 4      # K_i = ceil(own-frame raw_count / this), capped by K_max
     bg_radius_m: 0.8
     bg_max_kv_per_frame: 8
     num_heads: 8
     bg_layers: 2
     fg_layers: 2
-    layer_scale: 1.0e-5
-    film_scale: 0.1
-    count_condition_cap: 32
     grad_balance: sqrt_k
   head_offset_bound: 0.8    # gaussian pos = seed_pos + bound*tanh(offset), per-axis meters
 
