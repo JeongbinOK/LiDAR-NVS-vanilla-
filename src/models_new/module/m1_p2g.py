@@ -76,6 +76,20 @@ class Point2Gaus(nn.Module):
             coord_scale=self.utonia_coord_scale,
         )
 
+        # Gaussian head size is derived purely from gs_params (shs+opacity+scaling+
+        # rotation [+offset]). offset>0 adds the bounded position-offset output.
+        self.offset_size = int(getattr(cfg.gs_params, "offset", 0) or 0)
+        self.use_offset = self.offset_size > 0
+        self.offset_bound = float(getattr(cfg, "head_offset_bound", 0.8))
+        self.gs_param_sizes = [
+            int(cfg.gs_params.shs),
+            int(cfg.gs_params.opacity),
+            int(cfg.gs_params.scaling),
+            int(cfg.gs_params.rotation),
+        ] + ([self.offset_size] if self.use_offset else [])
+        gs_out_dim = sum(self.gs_param_sizes)
+        trunk_dim = int(self.agg_mlp.out_dim)
+
         if self.anchor_mode == "spherical":
             from .spherical_query_head import SphericalQueryHead
             squery_cfg = getattr(cfg, "squery", None)
@@ -85,6 +99,11 @@ class Point2Gaus(nn.Module):
             self.squery_head = SphericalQueryHead(
                 squery_cfg, dim=self.agg_mlp.out_dim,
                 r_far=float(getattr(cfg, "r_far", 70.0)),
+            )
+            self.gs_predictor = nn.Sequential(
+                nn.Linear(trunk_dim, trunk_dim),
+                nn.SiLU(),
+                nn.Linear(trunk_dim, gs_out_dim),
             )
         else:  # grid; validated by build_token_builder
             from .grid_query_head import GridSlotHead, GridTemporalAggregator
@@ -97,30 +116,8 @@ class Point2Gaus(nn.Module):
                 r_far=float(getattr(cfg, "r_far", 70.0)),
             )
             self.grid_slot_head = GridSlotHead(
-                grid_query_cfg, dim=self.agg_mlp.out_dim,
-                r_far=float(getattr(cfg, "r_far", 70.0)),
+                grid_query_cfg, cfg.gs_params, dim=self.agg_mlp.out_dim,
             )
-
-        # Gaussian head size is derived purely from gs_params (shs+opacity+scaling+
-        # rotation [+offset]). Edit gs_params to control the head. offset>0 adds the
-        # position-offset head; 0 disables it for every anchor mode.
-        self.offset_size = int(getattr(cfg.gs_params, "offset", 0) or 0)
-        self.use_offset = self.offset_size > 0
-        self.offset_bound = float(getattr(cfg, "head_offset_bound", 0.8))
-        self.gs_param_sizes = [
-            int(cfg.gs_params.shs),
-            int(cfg.gs_params.opacity),
-            int(cfg.gs_params.scaling),
-            int(cfg.gs_params.rotation),
-        ] + ([self.offset_size] if self.use_offset else [])
-        gs_out_dim = sum(self.gs_param_sizes)
-        # Both mode-specific seed modules preserve the shared fusion trunk width.
-        trunk_dim = int(self.agg_mlp.out_dim)
-        self.gs_predictor = nn.Sequential(
-            nn.Linear(trunk_dim, trunk_dim),
-            nn.SiLU(),
-            nn.Linear(trunk_dim, gs_out_dim),
-        )
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -195,16 +192,20 @@ class Point2Gaus(nn.Module):
         bbox_instance_ids = _input.get("bbox_instance_ids")
         features = self._forward_utonia_features(_input["ptv3_input"])
 
-        # Shared contract for both anchor modes: occupied grid tokens, their
-        # aligned Utonia/intensity features, grid coordinates, and own-frame count.
-        builder_out = self.anchor_builder(
+        # Shared contract for both anchor modes: occupied Cartesian tokens and
+        # optional grid-only variable-K seed geometry.
+        token_batch = self.anchor_builder(
             lidar_points, offset, pose, features, _input["ptv3_input"], self.grid_mapper
         )
-        if len(builder_out) != 5:
-            raise RuntimeError(
-                f"shared token builder returned {len(builder_out)} items; expected 5"
-            )
-        pos_list, ufeat_list, ifeat_list, gc_list, raw_count_list = builder_out
+        pos_list = token_batch.positions
+        ufeat_list = token_batch.utonia_features
+        ifeat_list = token_batch.intensity_features
+        gc_list = token_batch.grid_coords
+        grid_seed_list = token_batch.grid_seeds
+        if self.anchor_mode == "grid" and grid_seed_list is None:
+            raise RuntimeError("grid token builder did not return seed data")
+        if self.anchor_mode == "spherical" and grid_seed_list is not None:
+            raise RuntimeError("spherical token builder unexpectedly constructed grid seeds")
 
         n_frames = len(pos_list)
 
@@ -216,7 +217,6 @@ class Point2Gaus(nn.Module):
         all_ufeat       = []
         all_ifeat       = []
         all_gc          = []
-        all_raw_count   = []
         all_offset      = []
         all_frame_batch = []
         all_bbox        = []   # List[Tensor(B_f, 7)], 프레임별
@@ -236,7 +236,6 @@ class Point2Gaus(nn.Module):
             all_ufeat.append(ufeat_list[i])
             all_ifeat.append(ifeat_list[i])
             all_gc.append(gc_list[i])
-            all_raw_count.append(raw_count_list[i])
             all_frame_batch.append(b)
             all_bbox.append(bbox[b][local_f])   # Tensor(B_f, 7)
             if bbox_instance_ids is not None:
@@ -248,11 +247,21 @@ class Point2Gaus(nn.Module):
         all_ufeat     = torch.cat(all_ufeat, dim=0)   # (N_valid, C_stage)
         all_ifeat     = torch.cat(all_ifeat, dim=0)   # (N_valid, D)
         all_gc        = torch.cat(all_gc, dim=0)      # (N_valid, 3) token grid_coord
-        all_raw_count = torch.cat(all_raw_count, dim=0).long()
         new_offset    = torch.stack(all_offset)        # (n_frames,)
         frame_batch_idx = torch.tensor(
             all_frame_batch, dtype=torch.long, device=all_ufeat.device
         )  # (n_frames,)
+
+        if self.anchor_mode == "grid":
+            all_seed_sensor = torch.cat(
+                [item.seed_sensor for item in grid_seed_list], dim=0
+            )
+            all_delta_sensor = torch.cat(
+                [item.delta_sensor for item in grid_seed_list], dim=0
+            )
+            all_anchor_k = torch.cat(
+                [item.anchor_k for item in grid_seed_list], dim=0
+            )
 
         if all_ufeat.shape[1] != self.utonia_feature_dim:
             raise RuntimeError(
@@ -288,7 +297,9 @@ class Point2Gaus(nn.Module):
                 self.grid_slot_head,
                 agg_feat_i,
                 all_pos,
-                all_raw_count,
+                all_anchor_k,
+                all_seed_sensor,
+                all_delta_sensor,
                 new_offset,
                 frame_batch_idx,
                 pose,
@@ -297,9 +308,14 @@ class Point2Gaus(nn.Module):
                 _input.get("timestamps"),
             )
 
-        # From here onward spherical and grid share the exact same Gaussian
-        # parameter prediction, bounded offset, metadata refresh, and assembly.
-        gs_feat = self.gs_predictor(seeds.feature)
+        # Spherical retains the shared predictor; grid's K-specific head already
+        # returns tensors in the exact split_gs_params layout.
+        if seeds.raw_params is None:
+            if seeds.feature is None:
+                raise RuntimeError("Gaussian seeds provide neither features nor raw parameters")
+            gs_feat = self.gs_predictor(seeds.feature)
+        else:
+            gs_feat = seeds.raw_params
         gs_raw = self.split_gs_params(gs_feat)
         out_coord = seeds.position
         if self.use_offset:

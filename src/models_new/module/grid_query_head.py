@@ -1,38 +1,26 @@
-"""Variable-count Gaussian queries for ``anchor_mode='grid'``.
+"""Variable-count Gaussian generation for ``anchor_mode='grid'``.
 
-The grid path keeps every occupied Utonia token as an anchor.  Temporal
-aggregation updates only its feature; the anchor coordinate itself remains the
-Gaussian seed (reference-frame for background, box-local for persistent
-foreground).  A shared FiLM-conditioned Gaussian head then expands anchor ``i``
-into ``K_i`` slots, where ``K_i`` depends only on the token's own-frame raw point
-count.
+Each occupied Utonia token keeps its temporal context while own-frame raw points
+provide range-quantile position seeds. Background seeds live in the reference
+frame and persistent foreground seeds live in box-local coordinates. A shared
+anchor trunk consumes the padded seed offsets, then an independent joint head for
+each possible ``K_i`` predicts all Gaussian parameters for that anchor.
 """
 from __future__ import annotations
-
-import math
 
 import torch
 import torch.nn as nn
 
 from ..utils import boxes as box_utils
-from .builders.common import encode_ray_meta, xyz_to_theta_phi_r
+from ..utils.attention import Rotary3D
 
 
-def counts_to_variable_k(raw_count, points_per_gaussian: int, k_max: int):
-    """Map positive own-frame point counts to ``ceil(count / ppg)`` in [1, Kmax]."""
-    points_per_gaussian = int(points_per_gaussian)
-    k_max = int(k_max)
-    if points_per_gaussian <= 0:
-        raise ValueError("points_per_gaussian must be positive")
-    if k_max <= 0:
-        raise ValueError("K_max must be positive")
-    count = raw_count.to(dtype=torch.long).clamp_min(1)
-    k = torch.div(
-        count + points_per_gaussian - 1,
-        points_per_gaussian,
-        rounding_mode="floor",
-    )
-    return k.clamp_(min=1, max=k_max)
+# Fixed query-head geometry constants.  They are intentionally kept out of the
+# training config because changing them alters the physical RoPE wavelengths,
+# not an ordinary optimization hyperparameter.
+_GRID_ROPE_BASE = 10.0
+_GRID_BG_ROPE_POSITION_SCALE = 4.0
+_GRID_FG_ROPE_POSITION_SCALE = 1.0
 
 
 def _radius_pairs(query_pos, source_pos, radius: float, max_neighbors: int):
@@ -125,9 +113,16 @@ def _radius_pairs(query_pos, source_pos, radius: float, max_neighbors: int):
 
 
 class _RaggedCrossAttention(nn.Module):
-    """One-query-per-anchor cross attention over a ragged, fixed K/V memory."""
+    """One-query-per-anchor cross attention over a ragged, fixed K/V memory.
 
-    def __init__(self, dim, num_heads, n_layers, layer_scale, mlp_ratio=4):
+    Relative geometry enters the scores via Utonia-compatible ``Rotary3D``:
+    queries are rotated by their own token position and keys by their source-token
+    position, so the logits depend only on the source-query displacement. Pair
+    memory is the source token feature itself; no metadata is concatenated.
+    """
+
+    def __init__(self, dim, num_heads, n_layers, mlp_ratio=4,
+                 rope_base=10.0, rope_position_scale=4.0):
         super().__init__()
         dim = int(dim)
         num_heads = int(num_heads)
@@ -138,37 +133,38 @@ class _RaggedCrossAttention(nn.Module):
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
         self.n_layers = int(n_layers)
+        self.rope = Rotary3D(
+            self.head_dim, base=rope_base, position_scale=rope_position_scale
+        )
 
-        self.q_norm = nn.ModuleList([nn.LayerNorm(dim) for _ in range(self.n_layers)])
-        self.mem_norm = nn.ModuleList([nn.LayerNorm(dim) for _ in range(self.n_layers)])
+        # Normalize the feature-only Q/K/V embeddings once before their learned
+        # projections. The attention/FFN blocks themselves then use the same
+        # post-norm residual topology as AnchorQueryCrossAttention.
+        self.query_norm = nn.LayerNorm(dim)
+        self.memory_norm = nn.LayerNorm(dim)
         self.q_proj = nn.ModuleList([nn.Linear(dim, dim) for _ in range(self.n_layers)])
         self.kv_proj = nn.ModuleList([nn.Linear(dim, 2 * dim) for _ in range(self.n_layers)])
         self.out_proj = nn.ModuleList([nn.Linear(dim, dim) for _ in range(self.n_layers)])
-        self.ffn_norm = nn.ModuleList([nn.LayerNorm(dim) for _ in range(self.n_layers)])
+        self.norm = nn.ModuleList([nn.LayerNorm(dim) for _ in range(self.n_layers)])
+        self.norm_ffn = nn.ModuleList([nn.LayerNorm(dim) for _ in range(self.n_layers)])
         hidden = int(dim * mlp_ratio)
         self.ffn = nn.ModuleList([
             nn.Sequential(nn.Linear(dim, hidden), nn.SiLU(), nn.Linear(hidden, dim))
-            for _ in range(self.n_layers)
-        ])
-        self.attn_scale = nn.ParameterList([
-            nn.Parameter(torch.full((dim,), float(layer_scale)))
-            for _ in range(self.n_layers)
-        ])
-        self.ffn_scale = nn.ParameterList([
-            nn.Parameter(torch.full((dim,), float(layer_scale)))
             for _ in range(self.n_layers)
         ])
         for ffn in self.ffn:
             nn.init.zeros_(ffn[-1].weight)
             nn.init.zeros_(ffn[-1].bias)
 
-    def forward(self, query_feat, pair_memory, pair_query):
+    def forward(self, query_feat, pair_memory, pair_query, query_pos, pair_pos):
+        query_feat = self.query_norm(query_feat)
         if pair_query.numel() == 0 or self.n_layers == 0:
             return query_feat
 
         order = torch.argsort(pair_query, stable=True)
         pair_query = pair_query[order]
-        pair_memory = pair_memory[order]
+        pair_memory = self.memory_norm(pair_memory[order])
+        pair_pos = pair_pos[order]
         active, counts = torch.unique_consecutive(pair_query, return_counts=True)
         starts = torch.cumsum(counts, dim=0) - counts
         local_row = torch.repeat_interleave(
@@ -184,32 +180,47 @@ class _RaggedCrossAttention(nn.Module):
         )
         memory[local_row, within] = pair_memory
         mask[local_row, within] = True
+        # fp32 positions for the rotary angles (bf16 costs centimeters at range)
+        pos_pad = torch.zeros(
+            (active.numel(), max_len, 3), dtype=torch.float32, device=query_feat.device
+        )
+        pos_pad[local_row, within] = pair_pos.float()
 
         x = query_feat[active]
         H, dh = self.num_heads, self.head_dim
         neg_mask = ~mask[:, None, None, :]
+        # Rotary angles are per-position, shared by every layer.
+        q_ang = self.rope.angles(query_pos[active])          # (A, 3, axis_pairs)
+        k_ang = self.rope.angles(pos_pad)                    # (A, L, 3, axis_pairs)
         for layer in range(self.n_layers):
-            q = self.q_proj[layer](self.q_norm[layer](x)).reshape(-1, H, dh)
-            mem = self.mem_norm[layer](memory)
-            key, value = self.kv_proj[layer](mem).chunk(2, dim=-1)
+            q = self.q_proj[layer](x).reshape(-1, H, dh)
+            key, value = self.kv_proj[layer](memory).chunk(2, dim=-1)
             key = key.reshape(active.numel(), max_len, H, dh)
             value = value.reshape(active.numel(), max_len, H, dh)
-            scores = torch.einsum("ahd,alhd->ahl", q.float(), key.float()) * self.scale
+            q_rot = self.rope.rotate(q.float(), q_ang[:, None, :, :])
+            key_rot = self.rope.rotate(key.float(), k_ang[:, :, None, :, :])
+            scores = torch.einsum("ahd,alhd->ahl", q_rot, key_rot) * self.scale
             scores = scores.unsqueeze(2).masked_fill(neg_mask, float("-inf"))
             prob = torch.softmax(scores, dim=-1).squeeze(2)
             attended = torch.einsum("ahl,alhd->ahd", prob, value.float())
             attended = attended.reshape(active.numel(), self.dim).to(x.dtype)
-            x = x + self.attn_scale[layer] * self.out_proj[layer](attended)
-            x = x + self.ffn_scale[layer] * self.ffn[layer](self.ffn_norm[layer](x))
+            x = self.norm[layer](x + self.out_proj[layer](attended))
+            x = self.norm_ffn[layer](x + self.ffn[layer](x))
 
-        # Unmatched rows are copied verbatim: exact identity in forward and backward.
+        # Unmatched rows retain the normalized query embedding. Only active rows
+        # receive cross-frame attention updates.
         return query_feat.index_copy(0, active, x)
 
 
 class _FullSelfAttention(nn.Module):
-    """Full self attention for one persistent object instance."""
+    """Full self attention for one persistent object instance.
 
-    def __init__(self, dim, num_heads, n_layers, layer_scale, mlp_ratio=4):
+    The token content is feature-only; bbox-local position reaches Q/K scores
+    through Utonia-compatible RoPE and is not added to V or the residual stream.
+    """
+
+    def __init__(self, dim, num_heads, n_layers, mlp_ratio=4,
+                 rope_base=10.0, rope_position_scale=1.0):
         super().__init__()
         dim = int(dim)
         num_heads = int(num_heads)
@@ -220,44 +231,45 @@ class _FullSelfAttention(nn.Module):
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
         self.n_layers = int(n_layers)
-        self.norm = nn.ModuleList([nn.LayerNorm(dim) for _ in range(self.n_layers)])
+        self.rope = Rotary3D(
+            self.head_dim, base=rope_base, position_scale=rope_position_scale
+        )
+        self.input_norm = nn.LayerNorm(dim)
         self.qkv = nn.ModuleList([nn.Linear(dim, 3 * dim) for _ in range(self.n_layers)])
         self.out = nn.ModuleList([nn.Linear(dim, dim) for _ in range(self.n_layers)])
-        self.ffn_norm = nn.ModuleList([nn.LayerNorm(dim) for _ in range(self.n_layers)])
+        self.norm = nn.ModuleList([nn.LayerNorm(dim) for _ in range(self.n_layers)])
+        self.norm_ffn = nn.ModuleList([nn.LayerNorm(dim) for _ in range(self.n_layers)])
         hidden = int(dim * mlp_ratio)
         self.ffn = nn.ModuleList([
             nn.Sequential(nn.Linear(dim, hidden), nn.SiLU(), nn.Linear(hidden, dim))
-            for _ in range(self.n_layers)
-        ])
-        self.attn_scale = nn.ParameterList([
-            nn.Parameter(torch.full((dim,), float(layer_scale)))
-            for _ in range(self.n_layers)
-        ])
-        self.ffn_scale = nn.ParameterList([
-            nn.Parameter(torch.full((dim,), float(layer_scale)))
             for _ in range(self.n_layers)
         ])
         for ffn in self.ffn:
             nn.init.zeros_(ffn[-1].weight)
             nn.init.zeros_(ffn[-1].bias)
 
-    def forward(self, feat, context):
+    def forward(self, feat, position):
+        x = self.input_norm(feat)
         if feat.shape[0] == 0 or self.n_layers == 0:
-            return feat
-        x = feat
+            return x
         H, dh = self.num_heads, self.head_dim
+        rope_angles = self.rope.angles(position)
         for layer in range(self.n_layers):
-            qkv = self.qkv[layer](self.norm[layer](x + context))
+            qkv = self.qkv[layer](x)
             q, key, value = qkv.chunk(3, dim=-1)
             q = q.reshape(-1, H, dh)
             key = key.reshape(-1, H, dh)
             value = value.reshape(-1, H, dh)
-            scores = torch.einsum("ihd,jhd->hij", q.float(), key.float()) * self.scale
+            q_rot = self.rope.rotate(q.float(), rope_angles[:, None, :, :])
+            key_rot = self.rope.rotate(key.float(), rope_angles[:, None, :, :])
+            scores = torch.einsum(
+                "ihd,jhd->hij", q_rot, key_rot
+            ) * self.scale
             prob = torch.softmax(scores, dim=-1)
             attended = torch.einsum("hij,jhd->ihd", prob, value.float())
             attended = attended.reshape(-1, self.dim).to(x.dtype)
-            x = x + self.attn_scale[layer] * self.out[layer](attended)
-            x = x + self.ffn_scale[layer] * self.ffn[layer](self.ffn_norm[layer](x))
+            x = self.norm[layer](x + self.out[layer](attended))
+            x = self.norm_ffn[layer](x + self.ffn[layer](x))
         return x
 
 
@@ -266,28 +278,28 @@ class GridTemporalAggregator(nn.Module):
 
     def __init__(self, cfg, dim, r_far):
         super().__init__()
+        required = (
+            "bg_radius_m", "bg_max_kv_per_frame", "num_heads",
+            "bg_layers", "fg_layers",
+        )
+        missing = [name for name in required if getattr(cfg, name, None) is None]
+        if missing:
+            raise ValueError(
+                "p2g.grid_query is missing required keys: " + ", ".join(missing)
+            )
         self.dim = int(dim)
         self.radius = float(cfg.bg_radius_m)
         self.max_kv_per_frame = int(cfg.bg_max_kv_per_frame)
-        self.r_far = float(r_far)
         num_heads = int(cfg.num_heads)
-        layer_scale = float(cfg.layer_scale)
-
-        # [refined feature, source-query xyz, source-target time, source own-ray]
-        self.bg_kv_embed = nn.Sequential(
-            nn.Linear(self.dim + 8, self.dim),
-            nn.LayerNorm(self.dim),
-        )
         self.bg_attention = _RaggedCrossAttention(
-            self.dim, num_heads, int(cfg.bg_layers), layer_scale
-        )
-        # Foreground positional context: [box-local xyz, timestamp, own ray4].
-        self.fg_context_embed = nn.Sequential(
-            nn.Linear(8, self.dim),
-            nn.LayerNorm(self.dim),
+            self.dim, num_heads, int(cfg.bg_layers),
+            rope_base=_GRID_ROPE_BASE,
+            rope_position_scale=_GRID_BG_ROPE_POSITION_SCALE,
         )
         self.fg_attention = _FullSelfAttention(
-            self.dim, num_heads, int(cfg.fg_layers), layer_scale
+            self.dim, num_heads, int(cfg.fg_layers),
+            rope_base=_GRID_ROPE_BASE,
+            rope_position_scale=_GRID_FG_ROPE_POSITION_SCALE,
         )
 
     @staticmethod
@@ -295,19 +307,25 @@ class GridTemporalAggregator(nn.Module):
         start = int(new_offset[global_frame - 1]) if global_frame > 0 else 0
         return start, int(new_offset[global_frame])
 
-    def _token_metadata(self, anchor, new_offset, frame_batch_idx, pose_list,
-                        bbox_list, bbox_instance_ids_list, timestamps_list):
+    def _token_metadata(self, anchor, seed_sensor, delta_sensor, new_offset,
+                        frame_batch_idx, pose_list, bbox_list,
+                        bbox_instance_ids_list, timestamps_list):
         device, dtype = anchor.device, anchor.dtype
         N = anchor.shape[0]
+        if seed_sensor.shape != delta_sensor.shape:
+            raise ValueError("seed_sensor and delta_sensor must have identical shapes")
+        if seed_sensor.ndim != 3 or seed_sensor.shape[0] != N or seed_sensor.shape[2] != 3:
+            raise ValueError("grid seeds must have shape (num_anchors, K_max, 3)")
         n_frames = int(frame_batch_idx.numel())
         token_frame = torch.zeros(N, dtype=torch.long, device=device)
-        token_time = torch.zeros(N, dtype=dtype, device=device)
         coord_ref = torch.zeros_like(anchor)
         coord_out = torch.zeros_like(anchor)
+        seed_ref = torch.zeros_like(seed_sensor)
+        seed_out = torch.zeros_like(seed_sensor)
+        center_out = torch.zeros_like(seed_sensor)
         is_dynamic = torch.zeros(N, dtype=torch.bool, device=device)
         instance_id = torch.full((N,), -1, dtype=torch.long, device=device)
         box_assign = torch.full((N,), -1, dtype=torch.long, device=device)
-        ray4 = encode_ray_meta(xyz_to_theta_phi_r(anchor), self.r_far)
         bbox_ref_by_frame = [None for _ in range(n_frames)]
         frame_indices_out = [None for _ in range(n_frames)]
 
@@ -326,26 +344,30 @@ class GridTemporalAggregator(nn.Module):
                 common_ids = box_utils.common_instance_ids(iids_b[0], iids_b[-1])
             else:
                 common_ids = set()
-            if timestamps_list is not None:
-                timestamps_b = timestamps_list[batch_id].to(device=device, dtype=dtype)
-            else:
-                denom = max(len(frame_indices) - 1, 1)
-                timestamps_b = torch.arange(
-                    len(frame_indices), device=device, dtype=dtype
-                ) / float(denom)
-
             for local_f, global_f in enumerate(frame_indices):
                 start, end = self._frame_bounds(new_offset, global_f)
                 rows = torch.arange(start, end, device=device)
                 frame_indices_out[global_f] = rows
                 token_frame[start:end] = global_f
-                token_time[start:end] = timestamps_b[local_f]
 
                 anchor_f = anchor[start:end]
                 pose_f = pose_b[local_f].to(device=device, dtype=dtype)
                 ref_f = box_utils.apply_pose(anchor_f, pose_f)
                 coord_ref[start:end] = ref_f
                 coord_out[start:end] = ref_f
+
+                seed_sensor_f = seed_sensor[start:end]
+                center_sensor_f = seed_sensor_f - delta_sensor[start:end]
+                seed_shape = seed_sensor_f.shape
+                seed_ref_f = box_utils.apply_pose(
+                    seed_sensor_f.reshape(-1, 3), pose_f
+                ).reshape(seed_shape)
+                center_ref_f = box_utils.apply_pose(
+                    center_sensor_f.reshape(-1, 3), pose_f
+                ).reshape(seed_shape)
+                seed_ref[start:end] = seed_ref_f
+                seed_out[start:end] = seed_ref_f
+                center_out[start:end] = center_ref_f
 
                 bbox_sensor_f = bbox_b[local_f].to(device=device, dtype=dtype)
                 bbox_ref_f = box_utils.transform_boxes_to_ref(bbox_sensor_f, pose_f)
@@ -382,16 +404,28 @@ class GridTemporalAggregator(nn.Module):
                             ref_f[selected], bbox_ref_f[box_index]
                         )
                         coord_out[start:end] = out_f
+                        seed_out_f = seed_out[start:end]
+                        center_out_f = center_out[start:end]
+                        selected_shape = seed_out_f[selected].shape
+                        seed_out_f[selected] = box_utils.points_to_box_local(
+                            seed_ref_f[selected].reshape(-1, 3), bbox_ref_f[box_index]
+                        ).reshape(selected_shape)
+                        center_out_f[selected] = box_utils.points_to_box_local(
+                            center_ref_f[selected].reshape(-1, 3), bbox_ref_f[box_index]
+                        ).reshape(selected_shape)
+                        seed_out[start:end] = seed_out_f
+                        center_out[start:end] = center_out_f
 
         return {
             "frame": token_frame,
-            "time": token_time,
             "ref": coord_ref,
             "out": coord_out,
+            "seed_ref": seed_ref,
+            "seed_out": seed_out,
+            "seed_delta": seed_out - center_out,
             "is_dynamic": is_dynamic,
             "instance_id": instance_id,
             "box_assign": box_assign,
-            "ray4": ray4,
             "bbox_ref_by_frame": bbox_ref_by_frame,
             "frame_indices": frame_indices_out,
             "batch_frame_map": batch_frame_map,
@@ -424,23 +458,18 @@ class GridTemporalAggregator(nn.Module):
             return empty, empty
         return torch.cat(pair_query), torch.cat(pair_source)
 
-    def forward(self, feat, anchor, new_offset, frame_batch_idx, pose_list,
-                bbox_list, bbox_instance_ids_list=None, timestamps_list=None):
+    def forward(self, feat, anchor, seed_sensor, delta_sensor, new_offset,
+                frame_batch_idx, pose_list, bbox_list,
+                bbox_instance_ids_list=None, timestamps_list=None):
         metadata = self._token_metadata(
-            anchor, new_offset, frame_batch_idx, pose_list, bbox_list,
-            bbox_instance_ids_list, timestamps_list,
+            anchor, seed_sensor, delta_sensor, new_offset, frame_batch_idx,
+            pose_list, bbox_list, bbox_instance_ids_list, timestamps_list,
         )
-        out_feat = feat
         pair_query, pair_source = self._background_pairs(metadata)
-        if pair_query.numel() > 0:
-            delta = metadata["out"][pair_source] - metadata["out"][pair_query]
-            delta_t = metadata["time"][pair_source] - metadata["time"][pair_query]
-            kv_input = torch.cat([
-                feat[pair_source], delta, delta_t.unsqueeze(-1),
-                metadata["ray4"][pair_source],
-            ], dim=-1)
-            pair_memory = self.bg_kv_embed(kv_input)
-            out_feat = self.bg_attention(out_feat, pair_memory, pair_query)
+        out_feat = self.bg_attention(
+            feat, feat[pair_source], pair_query,
+            metadata["out"], metadata["out"][pair_source],
+        )
 
         fg_rows_to_update = []
         fg_feature_updates = []
@@ -452,15 +481,10 @@ class GridTemporalAggregator(nn.Module):
                 rows = dynamic_rows[metadata["instance_id"][dynamic_rows] == item_id]
                 if rows.numel() == 0:
                     continue
-                context_input = torch.cat([
-                    metadata["out"][rows], metadata["time"][rows, None],
-                    metadata["ray4"][rows],
-                ], dim=-1)
-                context = self.fg_context_embed(context_input)
                 # Instances are disjoint and background attention never touches
                 # these rows, so accumulate and scatter once instead of copying
                 # the full N-token tensor once per object.
-                updated = self.fg_attention(feat[rows], context)
+                updated = self.fg_attention(feat[rows], metadata["out"][rows])
                 fg_rows_to_update.append(rows)
                 fg_feature_updates.append(updated)
         if fg_rows_to_update:
@@ -473,37 +497,53 @@ class GridTemporalAggregator(nn.Module):
             "instance_id": metadata["instance_id"],
             "is_dynamic": metadata["is_dynamic"],
             "coord_ref": metadata["ref"],
+            "seed_ref": metadata["seed_ref"],
             "bbox_ref_by_frame": metadata["bbox_ref_by_frame"],
         }
-        return out_feat, metadata["out"], agg_meta
+        return (
+            out_feat, metadata["out"], metadata["seed_out"],
+            metadata["seed_delta"], agg_meta,
+        )
 
 
 class GridSlotHead(nn.Module):
-    """Expand anchors into variable slots and FiLM-condition one shared GS head."""
+    """Predict variable-count Gaussian parameters with independent joint K heads."""
 
-    def __init__(self, cfg, dim, r_far):
+    def __init__(self, cfg, gs_params, dim):
         super().__init__()
         self.dim = int(dim)
-        self.k_max = int(cfg.K_max)
-        self.points_per_gaussian = int(cfg.points_per_gaussian)
-        self.film_scale = float(cfg.film_scale)
-        self.count_cap = float(cfg.count_condition_cap)
-        self.r_far = float(r_far)
+        k_max = getattr(cfg, "K_max", None)
+        if k_max is None:
+            raise ValueError("p2g.grid_query.K_max is required")
+        self.k_max = int(k_max)
         self.grad_balance = str(getattr(cfg, "grad_balance", "sqrt_k"))
+        if self.k_max <= 0:
+            raise ValueError("grid_query.K_max must be positive")
         if self.grad_balance not in ("sqrt_k", "none"):
             raise ValueError("grid_query.grad_balance must be 'sqrt_k' or 'none'")
-        if self.count_cap <= 0:
-            raise ValueError("grid_query.count_condition_cap must be positive")
 
-        self.anchor_norm = nn.LayerNorm(self.dim)
-        # Fourier(u): sin/cos at 1x and 2x frequencies + log-count + range + K/Kmax.
-        self.conditioner = nn.Sequential(
-            nn.Linear(7, self.dim),
+        param_names = ["shs", "opacity", "scaling", "rotation"]
+        param_sizes = []
+        for name in param_names:
+            size = getattr(gs_params, name, None)
+            if size is None:
+                raise ValueError(f"p2g.gs_params.{name} is required for grid mode")
+            param_sizes.append(int(size))
+        offset_size = int(getattr(gs_params, "offset", 0) or 0)
+        if offset_size > 0:
+            param_sizes.append(offset_size)
+        self.param_dim = sum(param_sizes)
+        if self.param_dim <= 0:
+            raise ValueError("p2g.gs_params must define a positive output width")
+
+        self.trunk = nn.Sequential(
+            nn.Linear(self.dim + 3 * self.k_max, self.dim),
             nn.SiLU(),
-            nn.Linear(self.dim, 2 * self.dim),
         )
-        nn.init.normal_(self.conditioner[-1].weight, mean=0.0, std=1.0e-3)
-        nn.init.zeros_(self.conditioner[-1].bias)
+        self.k_heads = nn.ModuleList([
+            nn.Linear(self.dim, k * self.param_dim)
+            for k in range(1, self.k_max + 1)
+        ])
 
     def _gaussian_offset(self, anchor_k, anchor_offset):
         frame_gaussian_counts = []
@@ -516,25 +556,29 @@ class GridSlotHead(nn.Module):
             return torch.zeros(0, dtype=torch.long, device=anchor_k.device)
         return torch.cumsum(torch.stack(frame_gaussian_counts), dim=0).long()
 
-    def forward(self, anchor_feature, raw_count, sensor_range, anchor_offset):
-        if raw_count.shape[0] != anchor_feature.shape[0]:
-            raise ValueError("raw_count and anchor_feature must have the same first dimension")
-        anchor_k = counts_to_variable_k(
-            raw_count, self.points_per_gaussian, self.k_max
-        )
+    def forward(self, anchor_feature, anchor_k, delta_p, anchor_offset):
+        if anchor_k.ndim != 1 or anchor_k.shape[0] != anchor_feature.shape[0]:
+            raise ValueError("anchor_k must be one-dimensional and aligned with anchor_feature")
+        expected_delta_shape = (anchor_feature.shape[0], self.k_max, 3)
+        if tuple(delta_p.shape) != expected_delta_shape:
+            raise ValueError(
+                f"delta_p must have shape {expected_delta_shape}, got {tuple(delta_p.shape)}"
+            )
+        anchor_k = anchor_k.to(device=anchor_feature.device, dtype=torch.long)
+        invalid_k = (anchor_k < 1) | (anchor_k > self.k_max)
+        if invalid_k.any():
+            raise ValueError(f"anchor_k values must be in [1, {self.k_max}]")
         anchor_index = torch.repeat_interleave(
             torch.arange(anchor_feature.shape[0], device=anchor_feature.device), anchor_k
         )
         gaussian_offset = self._gaussian_offset(anchor_k, anchor_offset)
         if anchor_index.numel() == 0:
             empty_long = torch.zeros(0, dtype=torch.long, device=anchor_feature.device)
-            return anchor_feature.new_zeros((0, self.dim)), {
+            return anchor_feature.new_zeros((0, self.param_dim)), {
                 "anchor_index": empty_long,
                 "slot_index": empty_long,
                 "slot_k": empty_long,
                 "anchor_k": anchor_k,
-                "slot_u": anchor_feature.new_zeros(0),
-                "conditioner_input": anchor_feature.new_zeros((0, 7)),
                 "gaussian_offset": gaussian_offset,
             }
 
@@ -542,36 +586,29 @@ class GridSlotHead(nn.Module):
         slot_start = torch.cumsum(anchor_k, dim=0) - anchor_k
         slot_index = torch.arange(anchor_index.numel(), device=anchor_feature.device) - \
             torch.repeat_interleave(slot_start, anchor_k)
-        slot_u = (slot_index.to(anchor_feature.dtype) + 0.5) / slot_k.to(anchor_feature.dtype)
-
-        two_pi_u = 2.0 * math.pi * slot_u
-        four_pi_u = 2.0 * two_pi_u
-        raw_slot_count = raw_count[anchor_index].to(anchor_feature.dtype)
-        count_condition = torch.log1p(raw_slot_count.clamp(max=self.count_cap)) / \
-            math.log1p(self.count_cap)
-        range_condition = (
-            sensor_range[anchor_index].to(anchor_feature.dtype).clamp(min=0.0, max=self.r_far)
-            / self.r_far
-        )
-        k_condition = slot_k.to(anchor_feature.dtype) / float(self.k_max)
-        conditioner_input = torch.stack([
-            torch.sin(two_pi_u), torch.cos(two_pi_u),
-            torch.sin(four_pi_u), torch.cos(four_pi_u),
-            count_condition, range_condition, k_condition,
+        trunk_input = torch.cat([
+            anchor_feature,
+            delta_p.to(dtype=anchor_feature.dtype).reshape(anchor_feature.shape[0], -1),
         ], dim=-1)
-        gamma_beta = self.conditioner(conditioner_input)
-        gamma, beta = gamma_beta.chunk(2, dim=-1)
-        gamma = self.film_scale * torch.tanh(gamma)
-        beta = self.film_scale * torch.tanh(beta)
-        normalized = self.anchor_norm(anchor_feature)[anchor_index]
-        slot_feature = (1.0 + gamma) * normalized + beta
-        return slot_feature, {
+        trunk_feature = self.trunk(trunk_input)
+        raw_params = anchor_feature.new_zeros((anchor_index.numel(), self.param_dim))
+        anchor_start = torch.cumsum(anchor_k, dim=0) - anchor_k
+        for k, head in enumerate(self.k_heads, start=1):
+            anchor_rows = (anchor_k == k).nonzero(as_tuple=True)[0]
+            if anchor_rows.numel() == 0:
+                continue
+            predicted = head(trunk_feature[anchor_rows]).reshape(-1, k, self.param_dim)
+            output_rows = anchor_start[anchor_rows, None] + torch.arange(
+                k, device=anchor_feature.device
+            ).view(1, -1)
+            raw_params = raw_params.index_copy(
+                0, output_rows.reshape(-1), predicted.reshape(-1, self.param_dim)
+            )
+        return raw_params, {
             "anchor_index": anchor_index,
             "slot_index": slot_index,
             "slot_k": slot_k,
             "anchor_k": anchor_k,
-            "slot_u": slot_u,
-            "conditioner_input": conditioner_input,
             "gaussian_offset": gaussian_offset,
         }
 
@@ -584,5 +621,4 @@ class GridSlotHead(nn.Module):
 __all__ = [
     "GridTemporalAggregator",
     "GridSlotHead",
-    "counts_to_variable_k",
 ]

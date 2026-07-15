@@ -1,4 +1,4 @@
-"""Grid-intensity builder (no spherical anchor).
+"""Shared occupied Cartesian-token builder for spherical and grid heads.
 
 For each frame the raw points are scattered into the Utonia bottleneck cells they
 fall in (0.4/0.8 m, same grid as features['grid_coord']); each occupied cell is
@@ -20,24 +20,64 @@ Intensity per primitive comes from one of three encoders (config
   [mean_i, var_i, theta, phi, r] 5D.
 
 All modes also return per-frame ``occ_gc`` (occupied token grid coordinates) and
-``raw_count`` lists.  ``raw_count`` is the number of own-frame raw points in each
-token and is used by grid mode to choose its variable Gaussian count.
+``raw_count`` lists. Grid mode additionally returns padded own-frame range-quantile
+seeds and their offsets from geometric cell centers.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Optional
+
+import torch
 import torch.nn as nn
 
-from .common import aggregate_points_to_cells, split_by_offset
+from .common import (
+    GridSeedData,
+    aggregate_points_to_cells,
+    aggregate_points_to_cells_with_seeds,
+    split_by_offset,
+)
 from .intensity_encoder import (
     build_intensity_encoder,
     encode_intensity_features,
 )
 
 
-class GridIntensityBuilder(nn.Module):
+@dataclass(frozen=True)
+class OccupiedTokenBatch:
+    """Per-frame occupied-token tensors shared by both downstream anchor modes."""
+
+    positions: list[torch.Tensor]
+    utonia_features: list[torch.Tensor]
+    intensity_features: list[torch.Tensor]
+    grid_coords: list[torch.Tensor]
+    raw_counts: list[torch.Tensor]
+    grid_seeds: Optional[list[GridSeedData]]
+
+
+class OccupiedGridTokenBuilder(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
+        self.anchor_mode = str(getattr(cfg, "anchor_mode", "spherical")).lower()
+        self.grid_seed_config = None
+        if self.anchor_mode == "grid":
+            grid_query = getattr(cfg, "grid_query", None)
+            if grid_query is None:
+                raise ValueError("p2g.grid_query config block is required for anchor_mode='grid'")
+            k_max = getattr(grid_query, "K_max", None)
+            points_per_gaussian = getattr(grid_query, "points_per_gaussian", None)
+            if k_max is None or points_per_gaussian is None:
+                raise ValueError(
+                    "p2g.grid_query.K_max and points_per_gaussian are required for grid seeds"
+                )
+            k_max = int(k_max)
+            points_per_gaussian = int(points_per_gaussian)
+            if k_max <= 0:
+                raise ValueError("p2g.grid_query.K_max must be positive")
+            if points_per_gaussian <= 0:
+                raise ValueError("p2g.grid_query.points_per_gaussian must be positive")
+            self.grid_seed_config = (points_per_gaussian, k_max)
         (
             self.intensity_mode,
             self.intensity_encoder,
@@ -65,14 +105,25 @@ class GridIntensityBuilder(nn.Module):
 
         pos_list, ufeat_list, int5_list, occ_list, gc_list = [], [], [], [], []
         raw_count_list = []
+        seed_data_list = [] if self.grid_seed_config is not None else None
         for i in range(len(feat_list)):
             pts = pts_list[i]
             xyz = pts[:, :3]
             inten = pts[:, 3]
-            upos, ufeat, int5, occ, raw_count = aggregate_points_to_cells(
-                xyz, inten, grid_coord_list[i], feat_list[i],
-                coord_list[i], origins[i], mapper,
-            )
+            if self.grid_seed_config is None:
+                upos, ufeat, int5, occ, raw_count = aggregate_points_to_cells(
+                    xyz, inten, grid_coord_list[i], feat_list[i],
+                    coord_list[i], origins[i], mapper,
+                )
+            else:
+                points_per_gaussian, k_max = self.grid_seed_config
+                result = aggregate_points_to_cells_with_seeds(
+                    xyz, inten, grid_coord_list[i], feat_list[i],
+                    coord_list[i], origins[i], mapper,
+                    points_per_gaussian, k_max,
+                )
+                upos, ufeat, int5, occ, raw_count, seed_data = result
+                seed_data_list.append(seed_data)
             occ_gc = grid_coord_list[i].to(device)[occ]
             pos_list.append(upos)
             ufeat_list.append(ufeat)
@@ -92,4 +143,11 @@ class GridIntensityBuilder(nn.Module):
             occupied_grid_coord_list=gc_list,
             cell_statistics_list=int5_list,
         )
-        return pos_list, ufeat_list, ifeat_list, gc_list, raw_count_list
+        return OccupiedTokenBatch(
+            positions=pos_list,
+            utonia_features=ufeat_list,
+            intensity_features=ifeat_list,
+            grid_coords=gc_list,
+            raw_counts=raw_count_list,
+            grid_seeds=seed_data_list,
+        )

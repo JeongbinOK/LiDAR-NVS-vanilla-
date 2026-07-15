@@ -22,13 +22,14 @@ import torch
 
 @dataclass(frozen=True)
 class GaussianSeedBatch:
-    """Flat, mode-independent input contract for the shared Gaussian head."""
+    """Flat mode-specific positions and either head features or raw GS parameters."""
 
-    feature: torch.Tensor
+    feature: Optional[torch.Tensor]
     position: torch.Tensor
     frame_offset: torch.Tensor
     metadata: dict
     gradient_weight: Optional[torch.Tensor] = None
+    raw_params: Optional[torch.Tensor] = None
 
 
 def build_spherical_gaussian_seeds(
@@ -64,7 +65,9 @@ def build_grid_gaussian_seeds(
     slot_head,
     fused_feature,
     token_position,
-    raw_count,
+    anchor_k,
+    seed_sensor,
+    delta_sensor,
     token_offset,
     frame_batch_idx,
     pose,
@@ -73,9 +76,13 @@ def build_grid_gaussian_seeds(
     timestamps,
 ):
     """Aggregate grid tokens, pack variable slots, and expand token metadata."""
-    anchor_feature, anchor_position, anchor_metadata = temporal_aggregator(
+    (
+        anchor_feature, _anchor_position, seed_position, delta_p, anchor_metadata,
+    ) = temporal_aggregator(
         fused_feature,
         token_position,
+        seed_sensor,
+        delta_sensor,
         token_offset,
         frame_batch_idx,
         pose,
@@ -83,29 +90,31 @@ def build_grid_gaussian_seeds(
         bbox_instance_ids,
         timestamps,
     )
-    slot_feature, packing = slot_head(
+    raw_params, packing = slot_head(
         anchor_feature,
-        raw_count,
-        token_position.norm(dim=-1),
+        anchor_k,
+        delta_p,
         token_offset,
     )
     anchor_index = packing["anchor_index"]
+    slot_index = packing["slot_index"]
     metadata = {
         "box_assign": anchor_metadata["box_assign"][anchor_index],
         "instance_id": anchor_metadata["instance_id"][anchor_index],
         "is_dynamic": anchor_metadata["is_dynamic"][anchor_index],
-        "coord_ref": anchor_metadata["coord_ref"][anchor_index],
+        "coord_ref": anchor_metadata["seed_ref"][anchor_index, slot_index],
         "bbox_ref_by_frame": anchor_metadata["bbox_ref_by_frame"],
     }
     gradient_weight = slot_head.gradient_weight(
-        packing["slot_k"], anchor_position.dtype
+        packing["slot_k"], seed_position.dtype
     )
     return GaussianSeedBatch(
-        feature=slot_feature,
-        position=anchor_position[anchor_index],
+        feature=None,
+        position=seed_position[anchor_index, slot_index],
         frame_offset=packing["gaussian_offset"],
         metadata=metadata,
         gradient_weight=gradient_weight,
+        raw_params=raw_params,
     )
 
 

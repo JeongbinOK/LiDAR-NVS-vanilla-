@@ -55,6 +55,7 @@ def test_spherical_head_adapts_to_common_seed_contract():
     assert seeds.frame_offset is frame_offset
     assert seeds.metadata is metadata
     assert seeds.gradient_weight is None
+    assert seeds.raw_params is None
 
 
 def test_grid_head_expands_positions_metadata_and_gradient_weights():
@@ -65,27 +66,39 @@ def test_grid_head_expands_positions_metadata_and_gradient_weights():
         [0.0, 0.0, 1.0],
     ])
     anchor_position = token_position + 10.0
+    seed_position = torch.tensor([
+        [[1.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+        [[2.0, 0.0, 0.0], [3.0, 0.0, 0.0]],
+        [[4.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+    ])
+    delta_p = torch.randn(3, 2, 3)
+    seed_ref = seed_position + 20.0
     anchor_metadata = {
         "box_assign": torch.tensor([-1, 0, 1]),
         "instance_id": torch.tensor([-1, 7, 8]),
         "is_dynamic": torch.tensor([False, True, True]),
         "coord_ref": token_position + 20.0,
+        "seed_ref": seed_ref,
         "bbox_ref_by_frame": [torch.empty(0, 7)],
     }
 
     class TemporalAggregator:
         def __call__(self, *args):
-            return token_feature, anchor_position, anchor_metadata
+            return (
+                token_feature, anchor_position, seed_position, delta_p,
+                anchor_metadata,
+            )
 
     class SlotHead:
         def __init__(self):
-            self.sensor_range = None
+            self.delta_p = None
 
-        def __call__(self, feature, raw_count, sensor_range, token_offset):
-            self.sensor_range = sensor_range
+        def __call__(self, feature, anchor_k, delta, token_offset):
+            self.delta_p = delta
             anchor_index = torch.tensor([0, 1, 1, 2])
-            return feature[anchor_index], {
+            return torch.arange(24, dtype=torch.float32).reshape(4, 6), {
                 "anchor_index": anchor_index,
+                "slot_index": torch.tensor([0, 0, 1, 0]),
                 "slot_k": torch.tensor([1, 2, 2, 1]),
                 "gaussian_offset": torch.tensor([4]),
             }
@@ -100,7 +113,9 @@ def test_grid_head_expands_positions_metadata_and_gradient_weights():
         slot_head,
         token_feature,
         token_position,
-        torch.tensor([1, 5, 2]),
+        torch.tensor([1, 2, 1]),
+        torch.zeros(3, 2, 3),
+        torch.zeros(3, 2, 3),
         torch.tensor([3]),
         torch.tensor([0]),
         [],
@@ -110,13 +125,20 @@ def test_grid_head_expands_positions_metadata_and_gradient_weights():
     )
 
     anchor_index = torch.tensor([0, 1, 1, 2])
-    torch.testing.assert_close(seeds.feature, token_feature[anchor_index])
-    torch.testing.assert_close(seeds.position, anchor_position[anchor_index])
-    torch.testing.assert_close(slot_head.sensor_range, torch.tensor([5.0, 2.0, 1.0]))
+    slot_index = torch.tensor([0, 0, 1, 0])
+    assert seeds.feature is None
+    torch.testing.assert_close(
+        seeds.raw_params, torch.arange(24, dtype=torch.float32).reshape(4, 6)
+    )
+    torch.testing.assert_close(seeds.position, seed_position[anchor_index, slot_index])
+    torch.testing.assert_close(slot_head.delta_p, delta_p)
     assert seeds.frame_offset.tolist() == [4]
     assert seeds.metadata["instance_id"].tolist() == [-1, 7, 7, 8]
     assert seeds.metadata["is_dynamic"].tolist() == [False, True, True, True]
     torch.testing.assert_close(
         seeds.gradient_weight,
         torch.tensor([1.0, 2.0**-0.5, 2.0**-0.5, 1.0]),
+    )
+    torch.testing.assert_close(
+        seeds.metadata["coord_ref"], seed_ref[anchor_index, slot_index]
     )

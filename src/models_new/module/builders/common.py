@@ -6,9 +6,36 @@ builders. The per-cell intensity statistics are
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 import math
 
 import torch
+
+
+@dataclass(frozen=True)
+class GridSeedData:
+    """Own-frame variable-K seed geometry aligned with occupied token rows."""
+
+    seed_sensor: torch.Tensor
+    delta_sensor: torch.Tensor
+    anchor_k: torch.Tensor
+
+
+def counts_to_variable_k(raw_count, points_per_gaussian: int, k_max: int):
+    """Map positive own-frame point counts to ``ceil(count / ppg)`` in [1, Kmax]."""
+    points_per_gaussian = int(points_per_gaussian)
+    k_max = int(k_max)
+    if points_per_gaussian <= 0:
+        raise ValueError("points_per_gaussian must be positive")
+    if k_max <= 0:
+        raise ValueError("K_max must be positive")
+    count = raw_count.to(dtype=torch.long).clamp_min(1)
+    k = torch.div(
+        count + points_per_gaussian - 1,
+        points_per_gaussian,
+        rounding_mode="floor",
+    )
+    return k.clamp_(min=1, max=k_max)
 
 
 def split_by_offset(tensor, offset):
@@ -83,8 +110,50 @@ class UtoniaGridMapper:
         return (points - metric_origin.unsqueeze(0)) / self.feature_grid_size
 
 
-def aggregate_points_to_cells(points_xyz, intensity, grid_coord, voxel_feats,
-                              voxel_coord, metric_origin, mapper):
+def _r_quantile_seed_data(points, cell_idx, counts, grid_coord, occupied,
+                          metric_origin, mapper, points_per_gaussian, k_max):
+    """Select deterministic range-quantile points for each occupied cell."""
+    occupied_index = occupied.nonzero(as_tuple=True)[0]
+    num_cells = occupied_index.numel()
+    seeds = points.new_zeros((num_cells, k_max, 3))
+    delta = points.new_zeros((num_cells, k_max, 3))
+    occupied_count = counts.long()[occupied_index]
+    anchor_k = counts_to_variable_k(
+        occupied_count, points_per_gaussian, k_max
+    )
+    if num_cells == 0:
+        return GridSeedData(seeds, delta, anchor_k)
+
+    point_range = points.norm(dim=-1)
+    order = torch.arange(points.shape[0], device=points.device)
+    # Stable least-to-most-significant sorting gives (cell, r, x, y, z).
+    for value in (points[:, 2], points[:, 1], points[:, 0], point_range, cell_idx):
+        order = order[torch.argsort(value[order], stable=True)]
+    sorted_points = points[order]
+
+    count_long = counts.long()
+    starts = torch.cumsum(count_long, dim=0) - count_long
+    slot = torch.arange(k_max, device=points.device).view(1, -1)
+    valid = slot < anchor_k.view(-1, 1)
+    rank = torch.div(
+        (2 * slot + 1) * occupied_count.view(-1, 1),
+        2 * anchor_k.view(-1, 1),
+        rounding_mode="floor",
+    )
+    sorted_row = starts[occupied_index].view(-1, 1) + rank
+    seeds[valid] = sorted_points[sorted_row[valid]]
+
+    cell_center = (
+        (grid_coord[occupied_index].to(points.dtype) + 0.5)
+        * mapper.feature_grid_size
+        + metric_origin.to(device=points.device, dtype=points.dtype).unsqueeze(0)
+    )
+    delta[valid] = seeds[valid] - cell_center[:, None, :].expand_as(seeds)[valid]
+    return GridSeedData(seeds, delta, anchor_k)
+
+
+def _aggregate_points_to_cells(points_xyz, intensity, grid_coord, voxel_feats,
+                               voxel_coord, metric_origin, mapper, seed_config=None):
     """Scatter raw points into the Utonia bottleneck cells they fall in, and pair
     each occupied cell with its Utonia feature (exact cell match, no trilinear).
 
@@ -100,10 +169,18 @@ def aggregate_points_to_cells(points_xyz, intensity, grid_coord, voxel_feats,
     V = grid_coord.shape[0]
     D = voxel_feats.shape[1]
     if V == 0 or points_xyz.shape[0] == 0:
-        return (points_xyz.new_zeros((0, 3)), voxel_feats.new_zeros((0, D)),
-                points_xyz.new_zeros((0, 5)),
-                torch.zeros((V,), dtype=torch.bool, device=device),
-                torch.zeros((0,), dtype=torch.long, device=device))
+        result = (
+            points_xyz.new_zeros((0, 3)), voxel_feats.new_zeros((0, D)),
+            points_xyz.new_zeros((0, 5)),
+            torch.zeros((V,), dtype=torch.bool, device=device),
+            torch.zeros((0,), dtype=torch.long, device=device),
+        )
+        if seed_config is None:
+            return result
+        k_max = int(seed_config[1])
+        empty_seed = points_xyz.new_zeros((0, k_max, 3))
+        empty_k = torch.zeros((0,), dtype=torch.long, device=device)
+        return result + (GridSeedData(empty_seed, empty_seed.clone(), empty_k),)
 
     grid_coord = grid_coord.to(device=device, dtype=torch.long)
     pcell = torch.floor(mapper.to_feature_grid(points_xyz, metric_origin)).long()   # (N,3)
@@ -154,4 +231,32 @@ def aggregate_points_to_cells(points_xyz, intensity, grid_coord, voxel_feats,
             + metric_origin.to(device=device, dtype=points_xyz.dtype).unsqueeze(0)
 
     int5 = torch.cat([mean_i.unsqueeze(-1), var_i.unsqueeze(-1), mean_tpr], dim=-1)
-    return util_pos[occ], voxel_feats[occ], int5[occ], occ, counts[occ].long()
+    result = util_pos[occ], voxel_feats[occ], int5[occ], occ, counts[occ].long()
+    if seed_config is None:
+        return result
+    seed_data = _r_quantile_seed_data(
+        pts, cell_idx, counts, grid_coord, occ, metric_origin, mapper,
+        points_per_gaussian=int(seed_config[0]), k_max=int(seed_config[1]),
+    )
+    return result + (seed_data,)
+
+
+def aggregate_points_to_cells(points_xyz, intensity, grid_coord, voxel_feats,
+                              voxel_coord, metric_origin, mapper):
+    """Aggregate raw points without constructing grid-mode Gaussian seeds."""
+    return _aggregate_points_to_cells(
+        points_xyz, intensity, grid_coord, voxel_feats,
+        voxel_coord, metric_origin, mapper,
+    )
+
+
+def aggregate_points_to_cells_with_seeds(
+    points_xyz, intensity, grid_coord, voxel_feats, voxel_coord, metric_origin,
+    mapper, points_per_gaussian, k_max,
+):
+    """Aggregate raw points and construct padded grid-mode seed tensors."""
+    return _aggregate_points_to_cells(
+        points_xyz, intensity, grid_coord, voxel_feats,
+        voxel_coord, metric_origin, mapper,
+        seed_config=(points_per_gaussian, k_max),
+    )

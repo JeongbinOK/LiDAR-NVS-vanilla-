@@ -18,9 +18,9 @@ def resolve_anchor_mode(cfg):
 def build_token_builder(cfg):
     """Build the tokenization path shared by spherical and grid modes."""
     mode = resolve_anchor_mode(cfg)
-    from .grid_intensity import GridIntensityBuilder
+    from .grid_intensity import OccupiedGridTokenBuilder
 
-    return mode, GridIntensityBuilder(cfg)
+    return mode, OccupiedGridTokenBuilder(cfg)
 
 
 __all__ = ["SUPPORTED_ANCHOR_MODES", "build_token_builder", "resolve_anchor_mode"]
