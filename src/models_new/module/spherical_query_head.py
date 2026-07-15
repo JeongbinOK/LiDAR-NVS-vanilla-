@@ -12,14 +12,16 @@ interpolation seed; a bounded offset head on top is applied by the caller).
 
 Background/foreground coordinate routing:
 - bg anchors/tokens live in the batch's ref frame (frame 0). P0 uses only the
-  anchor's own-frame cell tokens. K/V = P1 bg context: same-frame 1x1x1
+  anchor's own-frame cell tokens. K/V = P1 bg context: same-frame 1x3x1
   spherical neighbourhood + other-frame bg tokens ego-compensated into this
-  frame's sensor coords and re-binned into the same 1x1x1 cell.
+  frame's sensor coords and re-binned into the same azimuth neighbourhood.
 - fg (dynamic, instance shared by both endpoint frames) anchors/tokens live in
   bbox-local coords. K/V = ALL tokens of the same instance across frames
   (spherical reprojection breaks for movers; box-local pooling is
   motion-compensated by construction).
 - Both are capped to `max_kv` nearest-|delta_p| tokens per anchor.
+- BG/FG share learned query/cross-attention weights, but use independent RoPE
+  metric scales selected per anchor to respect their different spatial support.
 
 Anchor cell labels are decided by majority vote over the cell's token labels
 (ties -> bg), and the anchor position is the mean of the *label-matching*
@@ -35,13 +37,20 @@ import torch.nn as nn
 
 from ..utils import boxes as box_utils
 from ..utils.attention import AnchorQueryCrossAttention
-from .builders.common import encode_ray_meta, xyz_to_theta_phi_r
 from .spherical_bins import (
     SphericalBins,
     build_cells,
     gather_cell_members,
     lookup_cells,
 )
+
+
+# Fixed geometry constants, not experiment knobs.  The operator/frequency
+# schedule matches Utonia Point3DRoPE; metric scales come from the measured
+# train-set p95 support of background and bbox-local foreground pairs.
+_SPHERICAL_ROPE_BASE = 10.0
+_SPHERICAL_BG_ROPE_POSITION_SCALE = 1.75
+_SPHERICAL_FG_ROPE_POSITION_SCALE = 1.35
 
 
 def _segment_rank(sorted_ids, num_segments):
@@ -59,7 +68,6 @@ class SphericalQueryHead(nn.Module):
         self.dim = int(dim)
         self.K = int(squery_cfg.K)
         self.max_kv = int(squery_cfg.max_kv)
-        self.r_far = float(r_far)
         self.bins = SphericalBins(
             float(squery_cfg.dtheta_deg), float(squery_cfg.dphi_deg),
             float(squery_cfg.dlogr), float(squery_cfg.r_min), float(squery_cfg.r_max),
@@ -69,19 +77,32 @@ class SphericalQueryHead(nn.Module):
         # them through its pooled anchor embedding (query_k = learnable_k + emb).
         self.query_embed = nn.Parameter(torch.randn(self.K, self.dim) * 0.02)
 
-        # P0 anchor embedding: proj([token feat, delta_p]) -> mean pool -> LN.
-        self.p0_proj = nn.Linear(self.dim + 3, self.dim)
+        # P0 anchor embedding: shared nonlinear token map -> mean pool -> LN.
+        # The following cross-attention performs the adaptive/query-specific
+        # selection, so this first anchor summary intentionally stays smooth.
+        self.p0_mlp = nn.Sequential(
+            nn.Linear(self.dim, self.dim),
+            nn.SiLU(),
+            nn.Linear(self.dim, self.dim),
+        )
         self.p0_norm = nn.LayerNorm(self.dim)
 
-        # K/V input embedding: [feat(D), delta_p(3), dframe(1), ray_meta(4)] -> D.
-        self.kv_embed = nn.Linear(self.dim + 8, self.dim)
+        # The fused token trunk has no final normalization. Normalize raw token
+        # features once, then let the attention's W_k/W_v form K and V.
         self.kv_norm = nn.LayerNorm(self.dim)
+
+        self.bg_rope_position_scale = _SPHERICAL_BG_ROPE_POSITION_SCALE
+        self.fg_rope_position_scale = _SPHERICAL_FG_ROPE_POSITION_SCALE
 
         self.attn = AnchorQueryCrossAttention(
             self.dim, num_heads=8,
             n_layers=int(getattr(squery_cfg, "n_layers", 1) or 1),
             chunk=int(getattr(squery_cfg, "attn_chunk", 8192) or 8192),
             mlp_ratio=int(getattr(squery_cfg, "ffn_ratio", 4) or 4),
+            rope_base=_SPHERICAL_ROPE_BASE,
+            # Direct calls default to BG scale. Normal spherical forward passes
+            # override it per anchor below without splitting learned weights.
+            rope_position_scale=self.bg_rope_position_scale,
         )
 
     # ------------------------------------------------------------------ stages
@@ -98,8 +119,6 @@ class SphericalQueryHead(nn.Module):
         tok_out = torch.zeros_like(tok_pos)          # bg: ref frame, fg: box-local
         tok_label = torch.full((N,), -1, dtype=torch.long, device=device)
         tok_box = torch.full((N,), -1, dtype=torch.long, device=device)  # frame-local box idx (dynamic only)
-        tpr_own = xyz_to_theta_phi_r(tok_pos)        # own-sensor-origin ray (theta, phi, r)
-        tok_ray4 = encode_ray_meta(tpr_own, self.r_far)
         idx3, tok_valid = self.bins.bin_coords(tok_pos)
 
         frame_slices = [None] * n_frames             # (start, end) per global frame
@@ -165,7 +184,7 @@ class SphericalQueryHead(nn.Module):
 
         return {
             "frame": tok_frame, "ref": tok_ref, "out": tok_out, "label": tok_label,
-            "box": tok_box, "ray4": tok_ray4, "idx3": idx3, "valid": tok_valid,
+            "box": tok_box, "idx3": idx3, "valid": tok_valid,
             "frame_slices": frame_slices, "bbox_ref_by_frame": bbox_ref_by_frame,
             "iids_by_frame": iids_by_frame, "batch_frame_map": batch_frame_map,
         }
@@ -318,7 +337,7 @@ class SphericalQueryHead(nn.Module):
             p0_anchor.append(anchor_base[g] + fa["tok2cell"][fa["match"]])
             p0_token.append(fa["vi"][fa["match"]])
 
-        # ---- Stage C: bg P1 K/V pairs (same spherical cell only) ----
+        # ---- Stage C: bg P1 K/V pairs (1x3x1 azimuth neighbourhood) ----
         p1_anchor = []
         p1_token = []
         for b, frame_indices in tm["batch_frame_map"].items():
@@ -330,13 +349,13 @@ class SphericalQueryHead(nn.Module):
                 bg_u = (~fa["is_dyn"]).nonzero(as_tuple=True)[0]     # frame-local anchor ids
                 if bg_u.numel() == 0:
                     continue
-                # Background attention is intentionally restricted to the
-                # anchor's own (theta, phi, log-r) cell. Other-frame tokens are
-                # ego-compensated and re-binned below, then must match this same
-                # hash exactly. Foreground uses its separate same-instance path.
-                nbr_hash = fa["cell_hash"][bg_u].unsqueeze(1)  # (U_bg, 1)
-                nbr_valid = torch.ones_like(nbr_hash, dtype=torch.bool)
-                n_slots = 1
+                # Keep elevation and log-range fixed, and look one cell left and
+                # right in periodic azimuth. Other-frame tokens are ego-
+                # compensated and re-binned against the same 1x3x1 stencil.
+                # Foreground keeps its separate same-instance full-attention path.
+                anchor_idx3 = self.bins.unhash(fa["cell_hash"][bg_u])
+                nbr_hash, nbr_valid = self.bins.azimuth_neighbor_hashes(anchor_idx3)
+                n_slots = self.bins.N_AZIMUTH_NEIGHBORS
 
                 # P1: same-frame tokens via the frame's own cell table
                 cell_idx, found = lookup_cells(nbr_hash.reshape(-1), fa["cell_hash"])
@@ -463,8 +482,7 @@ class SphericalQueryHead(nn.Module):
             torch.zeros(0, dtype=torch.long, device=device)
         emb = feat.new_zeros(A, self.dim)
         if p0_anchor.numel() > 0:
-            p0_delta = tm["out"][p0_token] - anchor_out[p0_anchor]
-            p0_feat = self.p0_proj(torch.cat([feat[p0_token], p0_delta], dim=-1))
+            p0_feat = self.p0_mlp(feat[p0_token])
             emb.index_add_(0, p0_anchor, p0_feat)
             p0_cnt = torch.bincount(p0_anchor, minlength=A).to(feat.dtype)
             emb = emb / p0_cnt.clamp_min(1.0).unsqueeze(-1)
@@ -473,18 +491,20 @@ class SphericalQueryHead(nn.Module):
 
         # ---- Stage E3: K/V embedding + cross attention ----
         if pair_anchor.numel() > 0:
-            kv_delta = tm["out"][pair_token] - anchor_out[pair_anchor]
-            dframe = (tm["frame"][pair_token] - anchor_frame[pair_anchor]).to(feat.dtype)
-            kv_in = torch.cat([
-                feat[pair_token], kv_delta, dframe.unsqueeze(-1),
-                tm["ray4"][pair_token],
-            ], dim=-1)
-            kv_feat = self.kv_norm(self.kv_embed(kv_in))
+            kv_feat = self.kv_norm(feat[pair_token])
             kv_pos = tm["out"][pair_token]
         else:
             kv_feat = feat.new_zeros(0, self.dim)
             kv_pos = feat.new_zeros(0, 3)
-        out, p_init = self.attn(queries, kv_feat, kv_pos, pair_anchor, A, anchor_out)
+        anchor_rope_scale = torch.where(
+            anchor_is_dyn,
+            torch.full((A,), self.fg_rope_position_scale, device=device),
+            torch.full((A,), self.bg_rope_position_scale, device=device),
+        )
+        out, p_init = self.attn(
+            queries, kv_feat, kv_pos, pair_anchor, A, anchor_out,
+            position_scale=anchor_rope_scale,
+        )
 
         # ---- Stage E4: flatten to gaussians (anchor-major, k fastest) + meta ----
         G = A * self.K

@@ -39,20 +39,21 @@ Data flow expected by Step 3
     tok_hash            = bins.hash(tok_idx3)                  # (N,)  (mask by tok_valid)
     cell_hash, tok2cell = build_cells(tok_hash[tok_valid])    # (U,), (Nv,)
 
-    # anchors = occupied cells; the current SphericalQueryHead background K/V
-    # path uses only each anchor's own 1x1x1 cell.
-    own_hash             = cell_hash[:, None]                 # (U,1)
-    cell_idx, found      = lookup_cells(own_hash.reshape(-1), cell_hash)
-    cell_idx = cell_idx.reshape(U, 1)
-    found    = found.reshape(U, 1)
+    # anchors = occupied cells; background K/V keeps theta/log-r fixed and uses
+    # the anchor's left/self/right azimuth cells (1x3x1).
+    anchor_idx3          = bins.unhash(cell_hash)              # (U,3)
+    nbr_hash, nbr_valid  = bins.azimuth_neighbor_hashes(anchor_idx3)
+    cell_idx, found      = lookup_cells(nbr_hash.reshape(-1), cell_hash)
+    cell_idx = cell_idx.reshape(U, bins.N_AZIMUTH_NEIGHBORS)
+    found    = found.reshape(U, bins.N_AZIMUTH_NEIGHBORS) & nbr_valid
     anchor_cell_idx = torch.where(found, cell_idx, cell_idx.new_full((), -1))
 
     # flatten (anchor, token) membership
     anchor_ids, token_ids, slot_ids = gather_cell_members(
         anchor_cell_idx, tok2cell, cell_hash.numel())
 
-``SphericalBins.neighbor_hashes`` remains available for geometry analysis or
-future wider-context experiments; its self cell is slot ``SELF_SLOT`` = 4.
+``SphericalBins.neighbor_hashes`` remains available for the wider 3x3x1
+elevation/azimuth stencil; its self cell is slot ``SELF_SLOT`` = 4.
 """
 from __future__ import annotations
 
@@ -90,6 +91,10 @@ class SphericalBins:
     N_NEIGHBORS: int = 9
     #: flat slot index of the centre (self) cell in ``neighbor_hashes`` output
     SELF_SLOT: int = 4
+    #: number of cells in the elevation/range-fixed azimuth neighbourhood
+    N_AZIMUTH_NEIGHBORS: int = 3
+    #: flat slot index of the centre cell in ``azimuth_neighbor_hashes`` output
+    AZIMUTH_SELF_SLOT: int = 1
 
     def __init__(self, dtheta_deg: float, dphi_deg: float, dlogr: float,
                  r_min: float, r_max: float):
@@ -230,6 +235,24 @@ class SphericalBins:
         h = (nl_c * self.n_theta + nt_c) * self.n_phi + nphi     # (A,9)
         nbr_hash = torch.where(nbr_valid, h, h.new_full((), -1))
         return nbr_hash, nbr_valid
+
+    def azimuth_neighbor_hashes(self, idx3):
+        """``(A,3)`` -> hashes for the 1x3x1 azimuth-only neighbourhood.
+
+        Elevation ``i_theta`` and log-range ``i_lr`` stay fixed while azimuth
+        ``i_phi`` uses offsets ``[-1, 0, +1]`` with periodic wrapping. The self
+        cell is therefore slot ``AZIMUTH_SELF_SLOT == 1``. Inputs are assumed to
+        be valid bin coordinates, so all three returned slots are valid.
+        """
+        idx3 = idx3.to(torch.long)
+        dphi = torch.tensor([-1, 0, 1], dtype=torch.long, device=idx3.device)
+        i_theta = idx3[:, 0:1].expand(-1, self.N_AZIMUTH_NEIGHBORS)
+        i_phi = torch.remainder(
+            idx3[:, 1:2] + dphi.view(1, -1), self.n_phi
+        )
+        i_lr = idx3[:, 2:3].expand(-1, self.N_AZIMUTH_NEIGHBORS)
+        nbr_hash = (i_lr * self.n_theta + i_theta) * self.n_phi + i_phi
+        return nbr_hash, torch.ones_like(nbr_hash, dtype=torch.bool)
 
 
 # ----------------------------------------------------------------- sparse cells
