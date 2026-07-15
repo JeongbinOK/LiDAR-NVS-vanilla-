@@ -44,6 +44,7 @@ from src.eval.gaussian_stats import collect_window_stats, analyze_gaussian_sizes
 from src.models_new.utils.render import visualize_depth
 
 CONFIG_PATH = "/data/jeongbin/utonia/config/nuscene_train.yaml"
+RAYDROP_THRESHOLD = 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -84,13 +85,29 @@ def _viz_depth_black_holes(depth_1hw, near=2, far=50):
     return vis * keep
 
 
-def save_viz(out_png, depth_keep, gt_depth, intensity_keep, gt_intensity, raydrop):
+def _binary_raydrop(raydrop, threshold=RAYDROP_THRESHOLD):
+    """Return 1 for predicted/GT drop and 0 for non-drop (keep)."""
+    return (raydrop > float(threshold)).to(raydrop.dtype)
+
+
+def save_viz(
+    out_png,
+    depth_keep,
+    gt_depth,
+    intensity_keep,
+    gt_intensity,
+    raydrop,
+    gt_raydrop,
+):
+    pred_drop = _binary_raydrop(raydrop)
+    gt_drop = _binary_raydrop(gt_raydrop)
     rows = [
         _viz_depth_black_holes(depth_keep),                   # pred depth  [3,H,W]
         _viz_depth_black_holes(gt_depth),                     # gt depth (holes=black)
         intensity_keep.clamp(0, 1).repeat(3, 1, 1),           # pred intensity
         gt_intensity.clamp(0, 1).repeat(3, 1, 1),             # gt intensity
-        visualize_depth(raydrop, near=0.01, far=1),           # pred raydrop prob
+        pred_drop.repeat(3, 1, 1),                            # pred drop, >0.5 = white
+        gt_drop.repeat(3, 1, 1),                              # GT drop, 1 = white
     ]
     grid = make_grid(torch.stack([r.detach().cpu() for r in rows], dim=0), nrow=1)
     save_image(grid, str(out_png))
@@ -160,12 +177,12 @@ def main(cfg):
         raydrop = renders["raydrop"][b, target_cam]
         gt_depth = renders["gt_depth"][b, target_cam]
         gt_intensity = renders["gt_intensity_sh"][b, target_cam]
+        gt_raydrop = renders["gt_raydrop"][b, target_cam]
 
         # GS-LiDAR: zero out predicted-drop pixels before depth/intensity/points.
-        keep = (raydrop <= 0.5).to(depth.dtype)
+        keep = 1.0 - _binary_raydrop(raydrop).to(depth.dtype)
         depth_keep = depth * keep
         intensity_keep = intensity * keep
-        gt_raydrop = (gt_depth <= 0).to(depth.dtype)  # 1 = dropped
 
         gt_cam = gt["cameras"][b][target_cam]
         row_to_theta = gt_cam.row_to_theta
@@ -177,13 +194,16 @@ def main(cfg):
             "nuscenes_split": nuscenes_split,
             "depth": depth_errors(depth_keep, gt_depth, backends),
             "intensity": intensity_errors(intensity_keep, gt_intensity, backends),
-            "raydrop": raydrop_errors(raydrop, gt_raydrop),
+            "raydrop": raydrop_errors(
+                raydrop, gt_raydrop, ratio=RAYDROP_THRESHOLD
+            ),
             "points": point_metrics(depth_keep, gt_depth, row_to_theta, backends,
                                     vfov=vfov),
         }
         window_metrics.append(wm)
         save_viz(viz_dir / f"{seq_name}_T{target_s}s.png",
-                 depth_keep, gt_depth, intensity_keep, gt_intensity, raydrop)
+                 depth_keep, gt_depth, intensity_keep, gt_intensity,
+                 raydrop, gt_raydrop)
 
         # Gaussian centers + 1σ surfels at this window's target time (per-seq HTML).
         static_xyz, dynamic_xyz = gaussians_from_output(
