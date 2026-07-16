@@ -105,26 +105,25 @@ class Rotary3D(nn.Module):
 class AnchorQueryCrossAttention(nn.Module):
     """Manual (non-flash) varlen cross-attention: K learnable queries per anchor
     attend to that anchor's variable-length K/V token set, and additionally return
-    a probability-weighted position ``p_init`` per query.
+    a probability-weighted K/V position per query for diagnostics.
 
-    Why manual instead of flash_attn: the spherical-query head needs the attention
-    *probabilities* to form ``p_init = sum_l w_bar[k,l] * kv_pos[l]`` (a surface
-    interpolation seed), and flash_attn does not expose them. Scores / softmax /
-    weighted-position are computed in **fp32** (NaN-collapse history under bf16),
-    then cast back to the input dtype.
+    The manual probability path is retained to expose a weighted K/V position for
+    diagnostics and legacy callers. The raw-seeded spherical head no longer uses
+    that position as its Gaussian centre. Scores / softmax / weighted-position are
+    computed in **fp32** (NaN-collapse history under bf16), then cast back.
 
     Relative geometry enters the scores via Utonia-compatible ``Rotary3D``:
-    every query is rotated by its anchor's position (``fallback_pos``) and every
-    key by its ``kv_pos``, so the logits see only ``kv_pos - anchor_pos``.
-    Positions are not concatenated into K/V features; ``fallback_pos`` therefore
-    serves double duty (query rotation origin + empty-anchor ``p_init``).
+    every query is rotated by its own ``query_pos`` and every key by its
+    ``kv_pos``, so the logits see ``kv_pos - query_pos``. Positions are not
+    concatenated into K/V features. ``query_pos`` also supplies the diagnostic
+    weighted-position fallback for anchors without K/V.
 
     varlen packing: ``anchor_ids`` (ascending) gives every K/V pair's anchor; per
     anchor we derive (start, len) via bincount+cumsum and process anchors in chunks
     of ``chunk`` (padding each chunk to its own ``L_max`` with a bool mask). Padded
     slots are ``-inf`` masked so their softmax weight is exactly 0; a fully-empty
     anchor (L_a == 0, rare -- P0 guarantees >=1 in the normal flow) keeps its query
-    through the residual path only and takes ``p_init = fallback_pos``.
+    through the residual path only and returns ``query_pos`` as its position.
 
     Cross-attention decoder-layer semantics: the K/V memory (``kv_feat``) is fixed;
     each of ``n_layers`` layers re-projects it and updates the queries via
@@ -168,15 +167,16 @@ class AnchorQueryCrossAttention(nn.Module):
             nn.init.zeros_(ff[-1].bias)
 
     def forward(self, queries, kv_feat, kv_pos, anchor_ids, num_anchors,
-                fallback_pos, position_scale=None):
+                query_pos, position_scale=None):
         """
         queries      : (A, K, D)  per-anchor query bank (learnable + anchor embed)
         kv_feat      : (P, D)      embedded K/V tokens, grouped by ascending anchor
         kv_pos       : (P, 3)      K/V token positions in the *output* coordinate frame
         anchor_ids   : (P,)  long  ascending anchor index of each K/V pair, in [0, A)
         num_anchors  : int         A
-        fallback_pos : (A, 3)      anchor position; rotary origin for the anchor's
-                                   queries, and p_init when L_a == 0
+        query_pos    : (A,K,3)     per-query positions in the output coordinate
+                                   frame. (A,3) is accepted and broadcast for
+                                   backward-compatible direct calls.
         position_scale: optional scalar or (A,) tensor.  A per-anchor tensor
                         changes only RoPE wavelengths; all learned attention
                         projections remain shared.
@@ -188,6 +188,15 @@ class AnchorQueryCrossAttention(nn.Module):
         device = queries.device
         dtype = queries.dtype
         K = queries.shape[1]
+
+        if query_pos.ndim == 2 and query_pos.shape == (A, 3):
+            query_pos = query_pos[:, None, :].expand(A, K, 3)
+        elif query_pos.ndim != 3 or query_pos.shape != (A, K, 3):
+            raise ValueError(
+                "query_pos must have shape (A, 3) or (A, K, 3), "
+                f"got {tuple(query_pos.shape)} for A={A}, K={K}"
+            )
+        query_pos_fp32 = query_pos.to(device=device, dtype=torch.float32)
 
         anchor_scale = None
         if position_scale is not None:
@@ -222,7 +231,7 @@ class AnchorQueryCrossAttention(nn.Module):
             cs = a1 - a0
             c_counts = counts[a0:a1]                                  # (cs,)
             q_chunk = queries[a0:a1]                                  # (cs, K, D)
-            fb_chunk = fallback_pos[a0:a1].to(dtype)                  # (cs, 3)
+            qpos_chunk = query_pos_fp32[a0:a1]                         # (cs, K, 3)
             L_max = int(c_counts.max().item()) if cs > 0 else 0
 
             if L_max == 0:
@@ -230,13 +239,13 @@ class AnchorQueryCrossAttention(nn.Module):
                 # each layer's LayerNorm so an empty anchor gets the exact same
                 # treatment as an empty anchor inside a non-empty chunk (chunking
                 # must never change semantics). p_init falls back to the anchor
-                # position.
+                # per-query position.
                 q_cur = q_chunk
                 for li in range(self.n_layers):
                     q_cur = self.norm[li](q_cur)
                     q_cur = self.norm_ffn[li](q_cur + self.ffn[li](q_cur))
                 out_chunks.append(q_cur)
-                pinit_chunks.append(fb_chunk.unsqueeze(1).expand(cs, K, 3))
+                pinit_chunks.append(qpos_chunk.to(dtype))
                 continue
 
             # contiguous pair range for this chunk (anchor_ids ascending)
@@ -262,8 +271,8 @@ class AnchorQueryCrossAttention(nn.Module):
                 anchor_scale if anchor_scale is None or anchor_scale.ndim == 0
                 else anchor_scale[a0:a1]
             )
-            q_ang = self.rope.angles(                                # (cs, 3, axis_pairs)
-                fallback_pos[a0:a1], position_scale=chunk_scale
+            q_ang = self.rope.angles(                                # (cs,K,3,axis_pairs)
+                qpos_chunk, position_scale=chunk_scale
             )
             k_ang = self.rope.angles(                                # (cs, L, 3, axis_pairs)
                 padded_pos, position_scale=chunk_scale
@@ -278,7 +287,7 @@ class AnchorQueryCrossAttention(nn.Module):
                 vf = vf.reshape(cs, L_max, H, dh)
 
                 # fp32 scores / softmax (NaN-collapse guard), rotary q/k
-                q_rot = self.rope.rotate(qh.float(), q_ang[:, None, None, :, :])
+                q_rot = self.rope.rotate(qh.float(), q_ang[:, :, None, :, :])
                 k_rot = self.rope.rotate(kf.float(), k_ang[:, :, None, :, :])
                 scores = torch.einsum('ckhd,clhd->chkl', q_rot, k_rot) * self.scale
                 scores = scores.masked_fill(neg_mask, float('-inf'))
@@ -299,8 +308,9 @@ class AnchorQueryCrossAttention(nn.Module):
             # p_init = last-layer head-averaged weights @ kv positions (fp32)
             pinit_c = torch.einsum('ckl,cld->ckd', last_wbar, padded_pos).to(dtype)
             if (~has_kv).any():
-                fb = fb_chunk.unsqueeze(1).expand(cs, K, 3)
-                pinit_c = torch.where(has_kv.view(cs, 1, 1), pinit_c, fb)
+                pinit_c = torch.where(
+                    has_kv.view(cs, 1, 1), pinit_c, qpos_chunk.to(dtype)
+                )
             out_chunks.append(q_cur)
             pinit_chunks.append(pinit_c)
 
