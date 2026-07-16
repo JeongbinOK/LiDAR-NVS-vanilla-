@@ -6,6 +6,7 @@ import torch
 
 from src.models_new.module.builders.common import (
     aggregate_points_to_cells,
+    aggregate_points_to_cells_with_membership,
     aggregate_points_to_cells_with_seeds,
     counts_to_variable_k,
 )
@@ -152,6 +153,7 @@ def test_grid_builder_returns_frame_local_seeds_and_spherical_placeholder():
         lidar_points, offset, None, features, ptv3_input, _UnitMapper()
     )
     seed_data = grid_out.grid_seeds
+    assert grid_out.raw_memberships is None
     assert len(seed_data) == 2
     torch.testing.assert_close(seed_data[0].seed_sensor[0, 0], lidar_points[1, :3])
     torch.testing.assert_close(seed_data[1].seed_sensor[0, 0], lidar_points[3, :3])
@@ -162,6 +164,35 @@ def test_grid_builder_returns_frame_local_seeds_and_spherical_placeholder():
         lidar_points, offset, None, features, ptv3_input, _UnitMapper()
     )
     assert spherical_out.grid_seeds is None
+    assert len(spherical_out.raw_memberships) == 2
+    for frame, membership in enumerate(spherical_out.raw_memberships):
+        start = 2 * frame
+        torch.testing.assert_close(
+            membership.points_sensor, lidar_points[start:start + 2, :3]
+        )
+        assert membership.token_index.tolist() == [0, 0]
+
+
+def test_raw_membership_preserves_input_points_and_compact_token_rows():
+    points = torch.tensor([
+        [1.10, 0.1, 0.1], [0.10, 0.1, 0.1],
+        [1.20, 0.1, 0.1], [0.20, 0.1, 0.1],
+    ])
+    grid_coord = torch.tensor([[0, 0, 0], [1, 0, 0], [2, 0, 0]])
+    voxel_feature = torch.arange(6, dtype=torch.float32).reshape(3, 2)
+    voxel_coord = torch.tensor([
+        [0.5, 0.5, 0.5], [1.5, 0.5, 0.5], [2.5, 0.5, 0.5],
+    ])
+    result = aggregate_points_to_cells_with_membership(
+        points, torch.ones(4), grid_coord, voxel_feature, voxel_coord,
+        torch.zeros(3), _UnitMapper(),
+    )
+    _, _, _, occupied, raw_count, membership = result
+
+    assert occupied.tolist() == [True, True, False]
+    assert raw_count.tolist() == [2, 2]
+    torch.testing.assert_close(membership.points_sensor, points)
+    assert membership.token_index.tolist() == [1, 0, 1, 0]
 
 
 def test_r_quantile_seeds_for_k1_k2_k3():

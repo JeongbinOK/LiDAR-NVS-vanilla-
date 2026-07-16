@@ -21,6 +21,14 @@ class GridSeedData:
     anchor_k: torch.Tensor
 
 
+@dataclass(frozen=True)
+class RawTokenMembership:
+    """Own-frame raw points and their compact occupied-token row indices."""
+
+    points_sensor: torch.Tensor
+    token_index: torch.Tensor
+
+
 def counts_to_variable_k(raw_count, points_per_gaussian: int, k_max: int):
     """Map positive own-frame point counts to ``ceil(count / ppg)`` in [1, Kmax]."""
     points_per_gaussian = int(points_per_gaussian)
@@ -153,7 +161,8 @@ def _r_quantile_seed_data(points, cell_idx, counts, grid_coord, occupied,
 
 
 def _aggregate_points_to_cells(points_xyz, intensity, grid_coord, voxel_feats,
-                               voxel_coord, metric_origin, mapper, seed_config=None):
+                               voxel_coord, metric_origin, mapper, seed_config=None,
+                               return_membership=False):
     """Scatter raw points into the Utonia bottleneck cells they fall in, and pair
     each occupied cell with its Utonia feature (exact cell match, no trilinear).
 
@@ -175,12 +184,18 @@ def _aggregate_points_to_cells(points_xyz, intensity, grid_coord, voxel_feats,
             torch.zeros((V,), dtype=torch.bool, device=device),
             torch.zeros((0,), dtype=torch.long, device=device),
         )
-        if seed_config is None:
-            return result
-        k_max = int(seed_config[1])
-        empty_seed = points_xyz.new_zeros((0, k_max, 3))
-        empty_k = torch.zeros((0,), dtype=torch.long, device=device)
-        return result + (GridSeedData(empty_seed, empty_seed.clone(), empty_k),)
+        if return_membership:
+            empty_membership = RawTokenMembership(
+                points_sensor=points_xyz.new_zeros((0, 3)),
+                token_index=torch.zeros((0,), dtype=torch.long, device=device),
+            )
+            result = result + (empty_membership,)
+        if seed_config is not None:
+            k_max = int(seed_config[1])
+            empty_seed = points_xyz.new_zeros((0, k_max, 3))
+            empty_k = torch.zeros((0,), dtype=torch.long, device=device)
+            result = result + (GridSeedData(empty_seed, empty_seed.clone(), empty_k),)
+        return result
 
     grid_coord = grid_coord.to(device=device, dtype=torch.long)
     pcell = torch.floor(mapper.to_feature_grid(points_xyz, metric_origin)).long()   # (N,3)
@@ -232,13 +247,25 @@ def _aggregate_points_to_cells(points_xyz, intensity, grid_coord, voxel_feats,
 
     int5 = torch.cat([mean_i.unsqueeze(-1), var_i.unsqueeze(-1), mean_tpr], dim=-1)
     result = util_pos[occ], voxel_feats[occ], int5[occ], occ, counts[occ].long()
-    if seed_config is None:
-        return result
-    seed_data = _r_quantile_seed_data(
-        pts, cell_idx, counts, grid_coord, occ, metric_origin, mapper,
-        points_per_gaussian=int(seed_config[0]), k_max=int(seed_config[1]),
-    )
-    return result + (seed_data,)
+    if return_membership:
+        # ``cell_idx`` addresses the original Utonia grid rows.  Downstream
+        # spherical code consumes only occupied tokens, so remap every retained
+        # raw point to that compact row order (the same order as result[0:3]).
+        full_to_compact = torch.full(
+            (V,), -1, dtype=torch.long, device=device
+        )
+        full_to_compact[occ] = torch.cumsum(occ.to(torch.long), dim=0)[occ] - 1
+        result = result + (RawTokenMembership(
+            points_sensor=pts,
+            token_index=full_to_compact[cell_idx],
+        ),)
+    if seed_config is not None:
+        seed_data = _r_quantile_seed_data(
+            pts, cell_idx, counts, grid_coord, occ, metric_origin, mapper,
+            points_per_gaussian=int(seed_config[0]), k_max=int(seed_config[1]),
+        )
+        result = result + (seed_data,)
+    return result
 
 
 def aggregate_points_to_cells(points_xyz, intensity, grid_coord, voxel_feats,
@@ -247,6 +274,18 @@ def aggregate_points_to_cells(points_xyz, intensity, grid_coord, voxel_feats,
     return _aggregate_points_to_cells(
         points_xyz, intensity, grid_coord, voxel_feats,
         voxel_coord, metric_origin, mapper,
+    )
+
+
+def aggregate_points_to_cells_with_membership(
+    points_xyz, intensity, grid_coord, voxel_feats, voxel_coord, metric_origin,
+    mapper,
+):
+    """Aggregate raw points and preserve raw-to-occupied-token membership."""
+    return _aggregate_points_to_cells(
+        points_xyz, intensity, grid_coord, voxel_feats,
+        voxel_coord, metric_origin, mapper,
+        return_membership=True,
     )
 
 

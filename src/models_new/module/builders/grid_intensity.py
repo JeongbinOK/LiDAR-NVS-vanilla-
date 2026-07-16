@@ -33,7 +33,8 @@ import torch.nn as nn
 
 from .common import (
     GridSeedData,
-    aggregate_points_to_cells,
+    RawTokenMembership,
+    aggregate_points_to_cells_with_membership,
     aggregate_points_to_cells_with_seeds,
     split_by_offset,
 )
@@ -53,6 +54,7 @@ class OccupiedTokenBatch:
     grid_coords: list[torch.Tensor]
     raw_counts: list[torch.Tensor]
     grid_seeds: Optional[list[GridSeedData]]
+    raw_memberships: Optional[list[RawTokenMembership]]
 
 
 class OccupiedGridTokenBuilder(nn.Module):
@@ -106,15 +108,18 @@ class OccupiedGridTokenBuilder(nn.Module):
         pos_list, ufeat_list, int5_list, occ_list, gc_list = [], [], [], [], []
         raw_count_list = []
         seed_data_list = [] if self.grid_seed_config is not None else None
+        membership_list = [] if self.anchor_mode == "spherical" else None
         for i in range(len(feat_list)):
             pts = pts_list[i]
             xyz = pts[:, :3]
             inten = pts[:, 3]
             if self.grid_seed_config is None:
-                upos, ufeat, int5, occ, raw_count = aggregate_points_to_cells(
+                result = aggregate_points_to_cells_with_membership(
                     xyz, inten, grid_coord_list[i], feat_list[i],
                     coord_list[i], origins[i], mapper,
                 )
+                upos, ufeat, int5, occ, raw_count, membership = result
+                membership_list.append(membership)
             else:
                 points_per_gaussian, k_max = self.grid_seed_config
                 result = aggregate_points_to_cells_with_seeds(
@@ -150,4 +155,5 @@ class OccupiedGridTokenBuilder(nn.Module):
             grid_coords=gc_list,
             raw_counts=raw_count_list,
             grid_seeds=seed_data_list,
+            raw_memberships=membership_list,
         )
