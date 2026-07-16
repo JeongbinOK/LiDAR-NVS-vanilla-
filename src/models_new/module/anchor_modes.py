@@ -3,8 +3,10 @@
 Both anchor modes consume the same refined Utonia/intensity tokens.  This
 module is the only boundary where their spatial/temporal semantics differ:
 
-* ``spherical`` groups tokens into spherical query anchors and emits a fixed
-  number of query seeds per occupied spherical cell.
+* ``spherical`` bins each frame's bbox-labelled raw points into spherical
+  cells about its sensor origin; every occupied (cell, label) group is a query
+  anchor that emits up to three raw-seeded queries (count-limited below three
+  raw points), so mixed boundary cells split into pure bg/instance anchors.
 * ``grid`` keeps each occupied Cartesian token as an anchor, aggregates its
   temporal feature, and expands it into a raw-count-dependent number of slots.
 
@@ -28,6 +30,7 @@ class GaussianSeedBatch:
     position: torch.Tensor
     frame_offset: torch.Tensor
     metadata: dict
+    delta: Optional[torch.Tensor] = None
     gradient_weight: Optional[torch.Tensor] = None
     raw_params: Optional[torch.Tensor] = None
 
@@ -36,6 +39,8 @@ def build_spherical_gaussian_seeds(
     query_head,
     fused_feature,
     token_position,
+    raw_point_sensor,
+    raw_token_index,
     token_offset,
     frame_batch_idx,
     pose,
@@ -43,9 +48,11 @@ def build_spherical_gaussian_seeds(
     bbox_instance_ids,
 ):
     """Run spherical query aggregation and expose the shared seed contract."""
-    feature, position, _anchor_range, frame_offset, metadata = query_head(
+    feature, position, delta, _anchor_range, frame_offset, metadata = query_head(
         fused_feature,
         token_position,
+        raw_point_sensor,
+        raw_token_index,
         token_offset,
         frame_batch_idx,
         pose,
@@ -57,6 +64,7 @@ def build_spherical_gaussian_seeds(
         position=position,
         frame_offset=frame_offset,
         metadata=metadata,
+        delta=delta,
     )
 
 

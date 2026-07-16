@@ -101,7 +101,7 @@ class Point2Gaus(nn.Module):
                 r_far=float(getattr(cfg, "r_far", 70.0)),
             )
             self.gs_predictor = nn.Sequential(
-                nn.Linear(trunk_dim, trunk_dim),
+                nn.Linear(trunk_dim + 3, trunk_dim),
                 nn.SiLU(),
                 nn.Linear(trunk_dim, gs_out_dim),
             )
@@ -202,10 +202,15 @@ class Point2Gaus(nn.Module):
         ifeat_list = token_batch.intensity_features
         gc_list = token_batch.grid_coords
         grid_seed_list = token_batch.grid_seeds
+        raw_membership_list = token_batch.raw_memberships
         if self.anchor_mode == "grid" and grid_seed_list is None:
             raise RuntimeError("grid token builder did not return seed data")
         if self.anchor_mode == "spherical" and grid_seed_list is not None:
             raise RuntimeError("spherical token builder unexpectedly constructed grid seeds")
+        if self.anchor_mode == "spherical" and raw_membership_list is None:
+            raise RuntimeError("spherical token builder did not return raw-token membership")
+        if self.anchor_mode == "grid" and raw_membership_list is not None:
+            raise RuntimeError("grid token builder unexpectedly returned raw-token membership")
 
         n_frames = len(pos_list)
 
@@ -221,6 +226,8 @@ class Point2Gaus(nn.Module):
         all_frame_batch = []
         all_bbox        = []   # List[Tensor(B_f, 7)], 프레임별
         all_bbox_iids   = []
+        all_raw_point_sensor = []
+        all_raw_token_index = []
         local_frame_counter = {}
         cumsum = 0
 
@@ -240,6 +247,10 @@ class Point2Gaus(nn.Module):
             all_bbox.append(bbox[b][local_f])   # Tensor(B_f, 7)
             if bbox_instance_ids is not None:
                 all_bbox_iids.append(bbox_instance_ids[b][local_f])
+            if raw_membership_list is not None:
+                membership = raw_membership_list[i]
+                all_raw_point_sensor.append(membership.points_sensor)
+                all_raw_token_index.append(membership.token_index + cumsum)
             cumsum += n_i
             all_offset.append(torch.tensor(cumsum, device=pos_i.device))
 
@@ -262,6 +273,9 @@ class Point2Gaus(nn.Module):
             all_anchor_k = torch.cat(
                 [item.anchor_k for item in grid_seed_list], dim=0
             )
+        else:
+            all_raw_point_sensor = torch.cat(all_raw_point_sensor, dim=0)
+            all_raw_token_index = torch.cat(all_raw_token_index, dim=0)
 
         if all_ufeat.shape[1] != self.utonia_feature_dim:
             raise RuntimeError(
@@ -285,6 +299,8 @@ class Point2Gaus(nn.Module):
                 self.squery_head,
                 agg_feat_i,
                 all_pos,
+                all_raw_point_sensor,
+                all_raw_token_index,
                 new_offset,
                 frame_batch_idx,
                 pose,
@@ -313,7 +329,10 @@ class Point2Gaus(nn.Module):
         if seeds.raw_params is None:
             if seeds.feature is None:
                 raise RuntimeError("Gaussian seeds provide neither features nor raw parameters")
-            gs_feat = self.gs_predictor(seeds.feature)
+            if seeds.delta is None or seeds.delta.shape != (seeds.feature.shape[0], 3):
+                raise RuntimeError("spherical Gaussian seeds must provide one 3D delta per feature")
+            delta = seeds.delta.to(device=seeds.feature.device, dtype=seeds.feature.dtype)
+            gs_feat = self.gs_predictor(torch.cat([seeds.feature, delta], dim=-1))
         else:
             gs_feat = seeds.raw_params
         gs_raw = self.split_gs_params(gs_feat)

@@ -30,30 +30,28 @@ i_lr]``. The scalar cell hash is::
 
     hash = (i_lr * n_theta + i_theta) * n_phi + i_phi
 
-Data flow expected by Step 3
-----------------------------
+Data flow expected by the spherical query head
+----------------------------------------------
     bins = SphericalBins(dtheta_deg, dphi_deg, dlogr, r_min, r_max)
 
-    # tokens -> cells
-    tok_idx3, tok_valid = bins.bin_coords(token_xyz)          # (N,3), (N,)
-    tok_hash            = bins.hash(tok_idx3)                  # (N,)  (mask by tok_valid)
-    cell_hash, tok2cell = build_cells(tok_hash[tok_valid])    # (U,), (Nv,)
+    # own-frame raw points -> cells; every occupied cell is one anchor (1x1x1,
+    # no neighbour stencil)
+    raw_idx3, raw_valid = bins.bin_coords(raw_xyz)             # (R,3), (R,)
+    raw_hash            = bins.hash(raw_idx3)                  # (R,)  (mask by raw_valid)
+    cell_hash, pt2cell  = build_cells(raw_hash[raw_valid])    # (U,), (Rv,)
 
-    # anchors = occupied cells; background K/V keeps theta/log-r fixed and uses
-    # the anchor's left/self/right azimuth cells (1x3x1).
-    anchor_idx3          = bins.unhash(cell_hash)              # (U,3)
-    nbr_hash, nbr_valid  = bins.azimuth_neighbor_hashes(anchor_idx3)
-    cell_idx, found      = lookup_cells(nbr_hash.reshape(-1), cell_hash)
-    cell_idx = cell_idx.reshape(U, bins.N_AZIMUTH_NEIGHBORS)
-    found    = found.reshape(U, bins.N_AZIMUTH_NEIGHBORS) & nbr_valid
-    anchor_cell_idx = torch.where(found, cell_idx, cell_idx.new_full((), -1))
+    # anchor reference position = geometric cell centre
+    anchor_idx3   = bins.unhash(cell_hash)                     # (U,3)
+    anchor_centre = bins.cell_center_xyz(anchor_idx3)          # (U,3)
 
-    # flatten (anchor, token) membership
-    anchor_ids, token_ids, slot_ids = gather_cell_members(
-        anchor_cell_idx, tok2cell, cell_hash.numel())
+    # other frames' raw points, ego-compensated into this sensor frame, are
+    # re-binned and matched against the same occupied-cell table
+    cell_idx, found = lookup_cells(bins.hash(other_idx3), cell_hash)
 
-``SphericalBins.neighbor_hashes`` remains available for the wider 3x3x1
-elevation/azimuth stencil; its self cell is slot ``SELF_SLOT`` = 4.
+``SphericalBins.neighbor_hashes`` (3x3x1, self slot ``SELF_SLOT`` = 4) and
+``azimuth_neighbor_hashes`` (1x3x1, self slot ``AZIMUTH_SELF_SLOT`` = 1)
+remain available as pure-geometry utilities, but the current head looks at
+the anchor's own cell only.
 """
 from __future__ import annotations
 
@@ -188,6 +186,28 @@ class SphericalBins:
         i_theta = torch.remainder(rest, self.n_theta)
         i_lr = torch.div(rest, self.n_theta, rounding_mode="floor")
         return torch.stack([i_theta, i_phi, i_lr], dim=-1)
+
+    # ------------------------------------------------------------- geometry
+    def cell_center_xyz(self, idx3):
+        """``(...,3)`` ``[i_theta,i_phi,i_lr]`` -> ``(...,3)`` fp32 xyz centres.
+
+        The centre is taken in bin space -- ``theta``/``phi`` at half-bin
+        offsets and ``r`` at the half-``dlogr`` geometric midpoint -- then
+        converted back with the inverse of the :func:`xyz_to_theta_phi_r`
+        convention. Only defined for in-range indices (``-1`` sentinels must
+        be filtered out first); the clamped boundary bins (theta poles, last
+        log-r bin) return the centre of their nominal, unclamped extent.
+        """
+        idxf = idx3.to(torch.float32)
+        theta = (idxf[..., 0] + 0.5) * self.dtheta - _HALF_PI
+        phi = (idxf[..., 1] + 0.5) * self.dphi - math.pi
+        r = self.r_min * torch.exp((idxf[..., 2] + 0.5) * self.dlogr)
+        cos_theta = torch.cos(theta)
+        return torch.stack([
+            r * cos_theta * torch.cos(phi),
+            r * cos_theta * torch.sin(phi),
+            r * torch.sin(theta),
+        ], dim=-1)
 
     # ------------------------------------------------------------- neighbours
     def neighbor_hashes(self, idx3):
