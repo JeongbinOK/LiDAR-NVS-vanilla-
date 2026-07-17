@@ -110,7 +110,10 @@ def main(cfg):
 
 
 if __name__ == '__main__':
-    base_conf = OmegaConf.load('/data/jeongbin/utonia/config/nuscene_train.yaml')
+    base_conf = OmegaConf.load(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                     'config', 'nuscene_train.yaml')
+    )
     cli_conf = OmegaConf.from_cli()
     cfg = OmegaConf.merge(base_conf, cli_conf)
     if 'mode' not in cfg:
