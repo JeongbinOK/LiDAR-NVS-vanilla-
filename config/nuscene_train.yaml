@@ -88,6 +88,13 @@ p2g:
     r_min: 2.0
     r_max: 110.0
     max_kv: 64                # anchor당 K/V 토큰 cap (cell 중심 기준 nearest)
+    # RoPE metric scale. "adaptive" = anchor별 pi/(실측 support) — 최저밴드
+    # (inv_freq[0]=1) 위상이 절대 pi를 넘지 않음. "fixed"는 예전 상수(bg 1.75/
+    # fg 1.35). fg 1.35는 instance-wide K/V 지원(max 7.8m)에서 최대 31% aliasing,
+    # bg 1.75는 dr_m 전환 후 pi 범위의 47~63%만 사용 (2026-07-21 실측).
+    # 두 스위치를 분리해 from-scratch A/B에서 원인 귀속이 가능하게 둠.
+    rope_scale_bg: adaptive   # adaptive | fixed
+    rope_scale_fg: adaptive   # adaptive | fixed
     attn_chunk: 8192
     n_layers: 2                # bg·fg 공유 cross-attn depth (query refinement 라운드 수)
   grid_query:                   # 공유 temporal fusion(bg_radius_m/bg_max_kv_per_frame/

@@ -75,6 +75,33 @@ _SPHERICAL_ROPE_BASE = 10.0
 _SPHERICAL_BG_ROPE_POSITION_SCALE = 1.75
 _SPHERICAL_FG_ROPE_POSITION_SCALE = 1.35
 
+# --- adaptive per-anchor metric scale (default) ------------------------------
+# The constants above are single numbers fitted to one p95 measured under an
+# EARLIER bin config. Re-measured 2026-07-21 on the current config
+# (dr_m=0.8, r_max=110, instance-wide fg K/V), 5 windows:
+#   bg: support p95 1.77 -> 0.85..1.13 m  => 1.75 spends only 47..63% of the
+#       usable pi range (wasted resolution, not a correctness bug)
+#   fg: support p95 1.77..3.96 m, max 7.8 m => 1.35 puts 1.0 / 4.6 / 31.4% of
+#       fg pairs past the wrap threshold pi/1.35 = 2.33 m (ALIASING: two
+#       different displacements collapse onto the same phase)
+# `Rotary3D.inv_freq[0] == 1`, so the lowest band's relative phase is exactly
+# |delta_axis| * scale and it wraps beyond pi/scale metres.
+#
+# A per-object bound (pi / max(w,l,h)) does NOT fix fg: the fg K/V is
+# instance-wide and deliberately keeps tokens whose box-local centroid drifts
+# OUTSIDE the box, which is where the 7.8 m tail comes from. So the bound is
+# taken from each anchor's REALIZED support -- the axis-aligned extent of that
+# anchor's own {K/V positions} U {query seeds} -- which upper-bounds every
+# pairwise |delta_axis| in that attention group by construction. RoPE phases
+# are only ever compared within one anchor, so a per-anchor metric scale is the
+# natural normalisation (and `position_scale` already accepts an (A,) tensor
+# without splitting any learned weights).
+_SPHERICAL_ROPE_SCALE_MIN = 0.25   # support <= 12.3 m
+_SPHERICAL_ROPE_SCALE_MAX = 8.0    # support >= 0.38 m
+# The pair that DEFINES the support would otherwise land exactly on pi, where
+# +pi and -pi are the same phase and fp32 rounding puts it on either side.
+_SPHERICAL_ROPE_PHASE_MARGIN = 0.98
+
 
 def _segment_rank(sorted_ids, num_segments):
     """Ranks 0,1,2,... within each contiguous id block of an ascending id tensor."""
@@ -179,6 +206,12 @@ class SphericalQueryHead(nn.Module):
 
         self.bg_rope_position_scale = _SPHERICAL_BG_ROPE_POSITION_SCALE
         self.fg_rope_position_scale = _SPHERICAL_FG_ROPE_POSITION_SCALE
+        # Separate switches so a from-scratch A/B can attribute the two effects
+        # (fg is a real aliasing bug, bg is only under-utilisation).
+        self.bg_rope_adaptive = str(
+            getattr(squery_cfg, "rope_scale_bg", "adaptive")) == "adaptive"
+        self.fg_rope_adaptive = str(
+            getattr(squery_cfg, "rope_scale_fg", "adaptive")) == "adaptive"
 
         self.attn = AnchorQueryCrossAttention(
             self.dim, num_heads=8,
@@ -339,6 +372,35 @@ class SphericalQueryHead(nn.Module):
             "label": anchor_label, "box": anchor_box, "is_dyn": is_dyn,
             "sensor": anchor_sensor, "ref": anchor_ref, "out": anchor_out, "r": anchor_r,
         }
+
+    @staticmethod
+    def _adaptive_rope_scale(num_anchors, kv_anchor, kv_pos, query_anchor,
+                             query_pos):
+        """Per-anchor metric RoPE scale = pi / (that anchor's realized support).
+
+        Support = the largest axis-aligned extent of the anchor's own
+        {K/V positions} U {query seeds}, which upper-bounds |delta_axis| for
+        every (query, K/V) pair inside that anchor. Setting scale = pi / support
+        therefore keeps the lowest RoPE band (inv_freq[0] == 1) strictly below a
+        half turn -- no two displacements in the group can share a phase -- while
+        spending the full usable range instead of a fraction of it.
+
+        Purely geometric: no learned state, no gradient path (positions are
+        detached bookkeeping), and clamped so a degenerate group cannot produce
+        an extreme wavelength.
+        """
+        A = int(num_anchors)
+        pos = torch.cat([kv_pos, query_pos], dim=0).detach().float()
+        idx = torch.cat([kv_anchor, query_anchor], dim=0)
+        hi = pos.new_full((A, 3), float("-inf")).index_reduce_(
+            0, idx, pos, "amax", include_self=False)
+        lo = pos.new_full((A, 3), float("inf")).index_reduce_(
+            0, idx, pos, "amin", include_self=False)
+        support = (hi - lo).max(dim=-1).values                      # (A,)
+        support = torch.where(torch.isfinite(support), support,
+                              torch.zeros_like(support))
+        scale = (_SPHERICAL_ROPE_PHASE_MARGIN * torch.pi) / support.clamp_min(1e-3)
+        return scale.clamp(_SPHERICAL_ROPE_SCALE_MIN, _SPHERICAL_ROPE_SCALE_MAX)
 
     # ------------------------------------------------------------------ forward
     def forward(self, feat, tok_pos, raw_point_sensor, raw_token_index,
@@ -602,6 +664,14 @@ class SphericalQueryHead(nn.Module):
             torch.full((A,), self.fg_rope_position_scale, device=device),
             torch.full((A,), self.bg_rope_position_scale, device=device),
         )
+        adaptive = self._adaptive_rope_scale(
+            A, pair_anchor, pair_pos, query_anchor, seed_out)
+        use_adaptive = torch.where(
+            anchor_is_dyn,
+            torch.tensor(self.fg_rope_adaptive, device=device),
+            torch.tensor(self.bg_rope_adaptive, device=device),
+        )
+        anchor_rope_scale = torch.where(use_adaptive, adaptive, anchor_rope_scale)
         out_feat = self.attn(
             queries, kv_feat, kv_pos, pair_anchor, A, seed_out,
             position_scale=anchor_rope_scale,
