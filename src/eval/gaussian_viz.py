@@ -211,7 +211,11 @@ def _box_lines(boxes: np.ndarray):
                     [-1, -1, 1], [1, -1, 1], [1, 1, 1], [-1, 1, 1]], np.float32)
     for box in boxes:
         c, d, yaw = box[:3], box[3:6], float(box[6])
-        corners = sgn * (0.5 * d)[None, :]                         # [8,3] local
+        # d is nuScenes (w, l, h); yaw rotates the LENGTH onto local +x, so the
+        # local extents are (l, w, h) -- using (w, l, h) draws every non-square
+        # box rotated by 90 deg (see boxes.point_in_box).
+        extent = np.array([d[1], d[0], d[2]], np.float32)
+        corners = sgn * (0.5 * extent)[None, :]                    # [8,3] local
         cos_y, sin_y = np.cos(yaw), np.sin(yaw)
         rx = cos_y * corners[:, 0] - sin_y * corners[:, 1]
         ry = sin_y * corners[:, 0] + cos_y * corners[:, 1]

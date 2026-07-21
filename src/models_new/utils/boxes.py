@@ -82,6 +82,12 @@ def point_in_box(points: Tensor, boxes: Tensor) -> Tensor:
     boxes  : (B_f, 7) x,y,z,w,l,h,yaw, same frame as points.
     return : (N,) long, -1 = background, 0..B_f-1 = box index. Ties (point
              inside more than one box) resolve to the lowest box index.
+
+    Size convention: columns 3:6 are nuScenes `size` = (width, length, height)
+    and yaw rotates the box's LENGTH axis onto local +x (nuScenes `Box.corners`
+    builds x from l and y from w). So local x is tested against l/2 and local y
+    against w/2 -- testing x against w/2 rotates every non-square box by 90 deg
+    and was measured to capture 2.2x fewer points on seq_1250_1300.
     """
     N, B_f = points.shape[0], boxes.shape[0]
     if B_f == 0:
@@ -101,8 +107,8 @@ def point_in_box(points: Tensor, boxes: Tensor) -> Tensor:
     local_y = sin_y * dx + cos_y * dy
 
     inside = (
-        (local_x.abs() <= w.unsqueeze(0) / 2) &
-        (local_y.abs() <= l.unsqueeze(0) / 2) &
+        (local_x.abs() <= l.unsqueeze(0) / 2) &   # local +x spans the LENGTH
+        (local_y.abs() <= w.unsqueeze(0) / 2) &   # local +y spans the WIDTH
         (dz.abs()      <= h.unsqueeze(0) / 2)
     )  # (N, B_f)
 

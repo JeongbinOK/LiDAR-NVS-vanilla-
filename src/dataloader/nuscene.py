@@ -201,7 +201,9 @@ def _point_iid_for_frame(points: torch.Tensor, boxes: torch.Tensor,
         lx = cos_y * dx - sin_y * dy
         ly = sin_y * dx + cos_y * dy
  
-        inside = (lx.abs() <= w / 2) & (ly.abs() <= l / 2) & (dz.abs() <= h / 2)
+        # nuScenes size = (w, l, h) and yaw rotates the LENGTH axis onto local
+        # +x, so x is bounded by l/2 and y by w/2 (see boxes.point_in_box).
+        inside = (lx.abs() <= l / 2) & (ly.abs() <= w / 2) & (dz.abs() <= h / 2)
         iid[inside] = inst_id
  
     return iid
