@@ -37,26 +37,52 @@ class Loss(nn.Module):
             self.lpips_fn = None
 
     def _calculate_psnr(self, pred, gt, mask=None, peak=1.0):
-        """GS-LiDAR eval-style PSNR.
+        """Per-frame LiDAR4D / GS-LiDAR PSNR, averaged over frames.
 
         GS-LiDAR clamps depth/intensity to [1e-6, peak] before computing
-        10*log10(peak^2 / MSE). `mask` preserves this repo's valid-only variants.
+        10*log10(peak^2 / MSE). Official evaluation updates its meter once per
+        frame and then averages the resulting PSNR values, so a flattened
+        multi-camera batch must not form one global MSE. ``mask`` preserves this
+        repo's valid-only diagnostic while retaining the same per-frame order.
+
+        This implementation stays on the input device. The previous NumPy path
+        synchronized and copied every training batch even though PSNR itself is
+        a simple reduction.
         """
         with torch.no_grad():
             out_device = pred.device
             out_dtype = pred.dtype
+            pred = pred.clamp(1e-6, peak).float()
+            gt = gt.clamp(1e-6, peak).float()
+            squared_error = (pred - gt).square()
+            if squared_error.ndim == 0:
+                squared_error = squared_error.reshape(1, 1)
+            elif squared_error.ndim == 1:
+                squared_error = squared_error.unsqueeze(0)
+            else:
+                squared_error = squared_error.reshape(squared_error.shape[0], -1)
+
             if mask is not None:
                 mask = mask.bool()
-                if not bool(mask.any()):
+                if mask.ndim == 0:
+                    mask = mask.reshape(1, 1)
+                elif mask.ndim == 1:
+                    mask = mask.unsqueeze(0)
+                else:
+                    mask = mask.reshape(mask.shape[0], -1)
+                counts = mask.sum(dim=1)
+                keep = counts > 0
+                if not bool(keep.any()):
                     return torch.tensor(0.0, device=out_device, dtype=out_dtype)
-                pred = pred[mask]
-                gt = gt[mask]
-            pred = pred.clamp(1e-6, peak)
-            gt = gt.clamp(1e-6, peak)
-            pred_np = pred.detach().cpu().numpy()
-            gt_np = gt.detach().cpu().numpy()
-            psnr = 10.0 * np.log10(peak ** 2 / np.mean((pred_np - gt_np) ** 2))
-            return torch.tensor(float(psnr), device=out_device, dtype=out_dtype)
+                mse = (
+                    (squared_error * mask.to(squared_error.dtype)).sum(dim=1)
+                    / counts.clamp_min(1).to(squared_error.dtype)
+                )[keep]
+            else:
+                mse = squared_error.mean(dim=1)
+            peak_sq = squared_error.new_tensor(float(peak) ** 2)
+            psnr = 10.0 * torch.log10(peak_sq / mse)
+            return psnr.mean().to(device=out_device, dtype=out_dtype)
 
     def _calculate_ssim(self, pred, gt, peak=1.0):
         """GS-LiDAR eval-style SSIM.
@@ -150,7 +176,15 @@ class Loss(nn.Module):
             return reference.new_zeros(())
         return torch.stack(sample_losses).mean()
 
-    def forward(self, all_renders, *, gaussians=None, metric_mode="train"):
+    def forward(
+        self,
+        all_renders,
+        *,
+        gaussians=None,
+        metric_mode="train",
+        compute_valid_metrics=True,
+        compute_raydrop_metrics=True,
+    ):
         losses = {}
 
         # 데이터 세팅
@@ -232,64 +266,91 @@ class Loss(nn.Module):
         # ----------------------------------------------------------
         # 2. 로그 및 평가 전용 Metrics 계산 (역전파 제외 / 단순 로깅용)
         # ----------------------------------------------------------
-        # valid metrics: depth/intensity 품질을 raydrop과 분리해서 보기 위한 train/debug 지표.
-        p_depth_2d, g_depth_2d, p_int_2d, g_int_2d, valid_2d = self._flatten_maps(
-            pred_depth,
-            gt_depth,
-            pred_intensity,
-            gt_intensity,
-            valid,
-        )
+        primary_intensity_pred = None
+        primary_depth_pred = None
+        if compute_valid_metrics or compute_raydrop_metrics:
+            p_depth_2d, g_depth_2d, p_int_2d, g_int_2d, valid_2d = self._flatten_maps(
+                pred_depth,
+                gt_depth,
+                pred_intensity,
+                gt_intensity,
+                valid,
+            )
 
-        p_depth_valid_2d = p_depth_2d * valid_2d
-        g_depth_valid_2d = g_depth_2d * valid_2d
-        p_int_valid_2d = p_int_2d * valid_2d
-        g_int_valid_2d = g_int_2d * valid_2d
+        if compute_valid_metrics:
+            # Diagnostic only: measure value quality on GT-hit support while
+            # separating it from predicted raydrop quality.
+            p_depth_valid_2d = p_depth_2d * valid_2d
+            g_depth_valid_2d = g_depth_2d * valid_2d
+            p_int_valid_2d = p_int_2d * valid_2d
+            g_int_valid_2d = g_int_2d * valid_2d
+            losses["intensity_psnr_valid"] = self._calculate_psnr(
+                p_int_2d, g_int_2d, mask=valid_2d
+            )
+            losses["intensity_ssim_valid"] = self._calculate_ssim(
+                p_int_valid_2d, g_int_valid_2d, peak=1.0
+            )
+            losses["depth_psnr_valid"] = self._calculate_psnr(
+                p_depth_2d, g_depth_2d, mask=valid_2d, peak=80.0
+            )
+            losses["depth_ssim_valid"] = self._calculate_ssim(
+                p_depth_valid_2d, g_depth_valid_2d, peak=80.0
+            )
 
-        losses["intensity_psnr_valid"] = self._calculate_psnr(p_int_2d, g_int_2d, mask=valid_2d)
-        losses["intensity_ssim_valid"] = self._calculate_ssim(p_int_valid_2d, g_int_valid_2d, peak=1.0)
-        losses["depth_psnr_valid"] = self._calculate_psnr(p_depth_2d, g_depth_2d, mask=valid_2d, peak=80.0)
-        losses["depth_ssim_valid"] = self._calculate_ssim(p_depth_valid_2d, g_depth_valid_2d, peak=80.0)
-
-        # raydrop metrics: GS-LiDAR eval 방식처럼 predicted drop 픽셀을 no-return(0)으로 만든 뒤
-        # full-map PSNR/SSIM을 계산한다. val/test의 기본 metric alias로 사용한다.
-        pred_keep = (pred_raydrop.detach() <= 0.5).to(dtype=pred_depth.dtype)
-        pred_depth_raydrop = pred_depth * pred_keep
-        pred_intensity_raydrop = pred_intensity * pred_keep
-        p_depth_raydrop_2d, p_int_raydrop_2d = self._flatten_maps(
-            pred_depth_raydrop,
-            pred_intensity_raydrop,
-        )
-
-        losses["intensity_psnr_raydrop"] = self._calculate_psnr(p_int_raydrop_2d, g_int_2d)
-        losses["intensity_ssim_raydrop"] = self._calculate_ssim(p_int_raydrop_2d, g_int_2d, peak=1.0)
-        losses["depth_psnr_raydrop"] = self._calculate_psnr(p_depth_raydrop_2d, g_depth_2d, peak=80.0)
-        losses["depth_ssim_raydrop"] = self._calculate_ssim(p_depth_raydrop_2d, g_depth_2d, peak=80.0)
+        if compute_raydrop_metrics:
+            # Official LiDAR4D / GS-LiDAR image protocol: hard-mask predicted
+            # no-return rays, then evaluate the full depth/intensity maps.
+            pred_keep = (pred_raydrop.detach() <= 0.5).to(dtype=pred_depth.dtype)
+            pred_depth_raydrop = pred_depth * pred_keep
+            pred_intensity_raydrop = pred_intensity * pred_keep
+            p_depth_raydrop_2d, p_int_raydrop_2d = self._flatten_maps(
+                pred_depth_raydrop,
+                pred_intensity_raydrop,
+            )
+            losses["intensity_psnr_raydrop"] = self._calculate_psnr(
+                p_int_raydrop_2d, g_int_2d
+            )
+            losses["intensity_ssim_raydrop"] = self._calculate_ssim(
+                p_int_raydrop_2d, g_int_2d, peak=1.0
+            )
+            losses["depth_psnr_raydrop"] = self._calculate_psnr(
+                p_depth_raydrop_2d, g_depth_2d, peak=80.0
+            )
+            losses["depth_ssim_raydrop"] = self._calculate_ssim(
+                p_depth_raydrop_2d, g_depth_2d, peak=80.0
+            )
 
         use_raydrop_metrics = metric_mode in {"val", "test", "eval"}
-        if use_raydrop_metrics:
+        if use_raydrop_metrics and compute_raydrop_metrics:
             primary_intensity_pred = p_int_raydrop_2d
             primary_depth_pred = p_depth_raydrop_2d
             losses["intensity_psnr"] = losses["intensity_psnr_raydrop"]
             losses["intensity_ssim"] = losses["intensity_ssim_raydrop"]
             losses["depth_psnr"] = losses["depth_psnr_raydrop"]
             losses["depth_ssim"] = losses["depth_ssim_raydrop"]
-        else:
+        elif compute_valid_metrics:
             primary_intensity_pred = p_int_valid_2d
             primary_depth_pred = p_depth_valid_2d
             losses["intensity_psnr"] = losses["intensity_psnr_valid"]
             losses["intensity_ssim"] = losses["intensity_ssim_valid"]
             losses["depth_psnr"] = losses["depth_psnr_valid"]
             losses["depth_ssim"] = losses["depth_ssim_valid"]
+        elif compute_raydrop_metrics:
+            primary_intensity_pred = p_int_raydrop_2d
+            primary_depth_pred = p_depth_raydrop_2d
+            losses["intensity_psnr"] = losses["intensity_psnr_raydrop"]
+            losses["intensity_ssim"] = losses["intensity_ssim_raydrop"]
+            losses["depth_psnr"] = losses["depth_psnr_raydrop"]
+            losses["depth_ssim"] = losses["depth_ssim_raydrop"]
 
         # Intensity Metrics
-        if self.enable_lpips:
+        if self.enable_lpips and primary_intensity_pred is not None:
             intensity_lpips = self._calculate_lpips(primary_intensity_pred, g_int_2d)
             if intensity_lpips is not None:
                 losses["intensity_lpips"] = intensity_lpips
 
         # Depth Metrics (depth는 raw 미터값이므로 peak/data_range를 실제 범위 80m로 지정)
-        if self.enable_lpips:
+        if self.enable_lpips and primary_depth_pred is not None:
             depth_lpips = self._calculate_lpips(primary_depth_pred, g_depth_2d)
             if depth_lpips is not None:
                 losses["depth_lpips"] = depth_lpips

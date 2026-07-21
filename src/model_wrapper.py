@@ -52,6 +52,13 @@ class ModelWrapper(LightningModule):
         self.g2p_model = GausRender(self.g2p_cfg)
         self.loss = Loss(self.cfg.loss)
         self._eval_pair_summaries: dict[str, list[dict]] = {}
+        self._metric_interval = int(self._cfg_get("metrics.interval", 50))
+        if self._metric_interval <= 0:
+            raise ValueError("metrics.interval must be positive")
+        # With gradient accumulation, multiple training batches can share one
+        # Lightning global_step. Compute sparse metrics only once for that
+        # optimizer step.
+        self._last_train_metric_step = -1
 
         # --- NaN-collapse diagnostics (see scripts/nan_collapse_diagnosis.md) ---
         self._dbg_finite = bool(getattr(self.p2g_cfg, "debug_finite_check", False))
@@ -91,7 +98,16 @@ class ModelWrapper(LightningModule):
         out = self.g2g_model(out, _input["timestamps"])
         all_renders = self.g2p_model(out, gt)
 
-        loss_dict = self.loss(all_renders, gaussians=out, metric_mode=prefix)
+        compute_valid_metrics, compute_official_metrics = self._metric_schedule(
+            prefix, batch_idx
+        )
+        loss_dict = self.loss(
+            all_renders,
+            gaussians=out,
+            metric_mode=prefix,
+            compute_valid_metrics=compute_valid_metrics,
+            compute_raydrop_metrics=compute_official_metrics,
+        )
         self._log_losses(loss_dict, prefix=prefix, batch_size=self._batch_size(_input))
 
         if self._dbg_finite and prefix == "train":
@@ -104,6 +120,28 @@ class ModelWrapper(LightningModule):
             self._record_eval_summary(loss_dict, batch_idx=batch_idx, prefix=prefix)
 
         return loss_dict["total"]
+
+    def _metric_schedule(self, prefix: str, batch_idx: int) -> tuple[bool, bool]:
+        """Return ``(valid, official_raydrop)`` metric switches for this batch.
+
+        Train computes both diagnostic and official metrics once per configured
+        optimizer-step interval. Validation/test computes official LiDAR4D /
+        GS-LiDAR metrics for every frame, while the valid-only diagnostics stay
+        sparse. Every rank follows the same schedule, so conditional
+        ``sync_dist=True`` logging cannot deadlock under DDP.
+        """
+        if prefix == "train":
+            step = int(self.global_step)
+            due = (
+                step % self._metric_interval == 0
+                and step != self._last_train_metric_step
+            )
+            if due:
+                self._last_train_metric_step = step
+            return due, due
+        if prefix in {"val", "test", "eval"}:
+            return int(batch_idx) % self._metric_interval == 0, True
+        return True, True
 
     def _debug_forward(self, out, all_renders, loss_dict, batch_idx):
         """Log raw gaussian/render magnitudes and report the first non-finite
