@@ -51,7 +51,6 @@ CLAUDE.md
 # Local-only experiments and validation helpers
 scripts/
 tests/
-!tests/
 tests/*
 !tests/test_grid_query_head.py
 !tests/test_anchor_modes.py
