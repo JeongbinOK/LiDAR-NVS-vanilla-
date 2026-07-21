@@ -90,6 +90,22 @@ class Point2Gaus(nn.Module):
         gs_out_dim = sum(self.gs_param_sizes)
         trunk_dim = int(self.agg_mlp.out_dim)
 
+        # Both anchor modes share the token temporal-fusion stage (background
+        # 0.8 m radius cross-frame attention + per-instance self-attention).
+        # The attribute keeps its grid-era name so grid checkpoints load
+        # unchanged; spherical runs it without seed geometry.
+        from .grid_query_head import GridTemporalAggregator
+
+        grid_query_cfg = getattr(cfg, "grid_query", None)
+        if grid_query_cfg is None:
+            raise ValueError(
+                "p2g.grid_query config block is required for the shared temporal fusion"
+            )
+        self.grid_temporal_agg = GridTemporalAggregator(
+            grid_query_cfg, dim=self.agg_mlp.out_dim,
+            r_far=float(getattr(cfg, "r_far", 70.0)),
+        )
+
         if self.anchor_mode == "spherical":
             from .spherical_query_head import SphericalQueryHead
             squery_cfg = getattr(cfg, "squery", None)
@@ -106,15 +122,8 @@ class Point2Gaus(nn.Module):
                 nn.Linear(trunk_dim, gs_out_dim),
             )
         else:  # grid; validated by build_token_builder
-            from .grid_query_head import GridSlotHead, GridTemporalAggregator
+            from .grid_query_head import GridSlotHead
 
-            grid_query_cfg = getattr(cfg, "grid_query", None)
-            if grid_query_cfg is None:
-                raise ValueError("p2g.grid_query config block is required for anchor_mode='grid'")
-            self.grid_temporal_agg = GridTemporalAggregator(
-                grid_query_cfg, dim=self.agg_mlp.out_dim,
-                r_far=float(getattr(cfg, "r_far", 70.0)),
-            )
             self.grid_slot_head = GridSlotHead(
                 grid_query_cfg, cfg.gs_params, dim=self.agg_mlp.out_dim,
             )
@@ -296,6 +305,7 @@ class Point2Gaus(nn.Module):
 
         if self.anchor_mode == "spherical":
             seeds = build_spherical_gaussian_seeds(
+                self.grid_temporal_agg,
                 self.squery_head,
                 agg_feat_i,
                 all_pos,
@@ -306,6 +316,7 @@ class Point2Gaus(nn.Module):
                 pose,
                 bbox,
                 bbox_instance_ids,
+                _input.get("timestamps"),
             )
         else:
             seeds = build_grid_gaussian_seeds(

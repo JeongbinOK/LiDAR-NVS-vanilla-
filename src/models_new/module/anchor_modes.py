@@ -1,18 +1,24 @@
 """Mode-specific conversion from fused grid tokens to Gaussian seeds.
 
-Both anchor modes consume the same refined Utonia/intensity tokens.  This
-module is the only boundary where their spatial/temporal semantics differ:
+Both anchor modes consume the same refined Utonia/intensity tokens AND the
+same temporal-fusion stage (``GridTemporalAggregator``: background 0.8 m
+radius cross-frame attention + per-instance box-local self-attention), so
+every token-feature operation is identical across modes.  This module is the
+only boundary where the gaussian-generation semantics differ:
 
-* ``spherical`` bins each frame's bbox-labelled raw points into spherical
-  cells about its sensor origin; every occupied (cell, label) group is a query
-  anchor that emits up to three raw-seeded queries (count-limited below three
-  raw points), so mixed boundary cells split into pure bg/instance anchors.
-* ``grid`` keeps each occupied Cartesian token as an anchor, aggregates its
-  temporal feature, and expands it into a raw-count-dependent number of slots.
+* ``spherical`` runs the shared aggregator without grid seeds, then bins each
+  frame's bbox-labelled raw points into spherical cells about its sensor
+  origin; every occupied (cell, label) group is a context anchor, while every
+  unique (anchor, supporting token) pair emits one raw-surface-seeded query
+  that attends only to own-frame tokens. Mixed boundary cells split into pure
+  bg/instance anchors.
+* ``grid`` keeps each occupied Cartesian token as an anchor, runs the shared
+  aggregator with its padded seed geometry, and expands each token into a
+  raw-count-dependent number of slots via joint K heads.
 
 The caller owns all trainable modules so their existing state-dict prefixes
 (``squery_head.*``, ``grid_temporal_agg.*``, and ``grid_slot_head.*``) stay
-unchanged.
+unchanged; ``grid_temporal_agg.*`` is now instantiated for both modes.
 """
 from __future__ import annotations
 
@@ -36,6 +42,7 @@ class GaussianSeedBatch:
 
 
 def build_spherical_gaussian_seeds(
+    temporal_aggregator,
     query_head,
     fused_feature,
     token_position,
@@ -46,8 +53,21 @@ def build_spherical_gaussian_seeds(
     pose,
     bbox,
     bbox_instance_ids,
+    timestamps,
 ):
-    """Run spherical query aggregation and expose the shared seed contract."""
+    """Fuse tokens across frames, then run the own-frame spherical query head."""
+    fused_feature, _coord_out, _seed_out, _seed_delta, _agg_meta = temporal_aggregator(
+        fused_feature,
+        token_position,
+        None,
+        None,
+        token_offset,
+        frame_batch_idx,
+        pose,
+        bbox,
+        bbox_instance_ids,
+        timestamps,
+    )
     feature, position, delta, _anchor_range, frame_offset, metadata = query_head(
         fused_feature,
         token_position,

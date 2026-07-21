@@ -274,7 +274,14 @@ class _FullSelfAttention(nn.Module):
 
 
 class GridTemporalAggregator(nn.Module):
-    """Grid-only background radius cross-attention and foreground self-attention."""
+    """Background radius cross-attention and foreground self-attention.
+
+    This is the token temporal-fusion stage shared by BOTH anchor modes:
+    grid runs it with its padded seed tensors (which it additionally
+    transforms into ref/box-local frames), while spherical passes
+    ``seed_sensor=None`` and consumes only the fused features -- its own
+    raw-point seed geometry is built downstream by the spherical head.
+    """
 
     def __init__(self, cfg, dim, r_far):
         super().__init__()
@@ -312,17 +319,21 @@ class GridTemporalAggregator(nn.Module):
                         bbox_instance_ids_list, timestamps_list):
         device, dtype = anchor.device, anchor.dtype
         N = anchor.shape[0]
-        if seed_sensor.shape != delta_sensor.shape:
-            raise ValueError("seed_sensor and delta_sensor must have identical shapes")
-        if seed_sensor.ndim != 3 or seed_sensor.shape[0] != N or seed_sensor.shape[2] != 3:
-            raise ValueError("grid seeds must have shape (num_anchors, K_max, 3)")
+        has_seeds = seed_sensor is not None
+        if has_seeds:
+            if delta_sensor is None or seed_sensor.shape != delta_sensor.shape:
+                raise ValueError("seed_sensor and delta_sensor must have identical shapes")
+            if seed_sensor.ndim != 3 or seed_sensor.shape[0] != N or seed_sensor.shape[2] != 3:
+                raise ValueError("grid seeds must have shape (num_anchors, K_max, 3)")
+        elif delta_sensor is not None:
+            raise ValueError("delta_sensor requires seed_sensor")
         n_frames = int(frame_batch_idx.numel())
         token_frame = torch.zeros(N, dtype=torch.long, device=device)
         coord_ref = torch.zeros_like(anchor)
         coord_out = torch.zeros_like(anchor)
-        seed_ref = torch.zeros_like(seed_sensor)
-        seed_out = torch.zeros_like(seed_sensor)
-        center_out = torch.zeros_like(seed_sensor)
+        seed_ref = torch.zeros_like(seed_sensor) if has_seeds else None
+        seed_out = torch.zeros_like(seed_sensor) if has_seeds else None
+        center_out = torch.zeros_like(seed_sensor) if has_seeds else None
         is_dynamic = torch.zeros(N, dtype=torch.bool, device=device)
         instance_id = torch.full((N,), -1, dtype=torch.long, device=device)
         box_assign = torch.full((N,), -1, dtype=torch.long, device=device)
@@ -356,18 +367,19 @@ class GridTemporalAggregator(nn.Module):
                 coord_ref[start:end] = ref_f
                 coord_out[start:end] = ref_f
 
-                seed_sensor_f = seed_sensor[start:end]
-                center_sensor_f = seed_sensor_f - delta_sensor[start:end]
-                seed_shape = seed_sensor_f.shape
-                seed_ref_f = box_utils.apply_pose(
-                    seed_sensor_f.reshape(-1, 3), pose_f
-                ).reshape(seed_shape)
-                center_ref_f = box_utils.apply_pose(
-                    center_sensor_f.reshape(-1, 3), pose_f
-                ).reshape(seed_shape)
-                seed_ref[start:end] = seed_ref_f
-                seed_out[start:end] = seed_ref_f
-                center_out[start:end] = center_ref_f
+                if has_seeds:
+                    seed_sensor_f = seed_sensor[start:end]
+                    center_sensor_f = seed_sensor_f - delta_sensor[start:end]
+                    seed_shape = seed_sensor_f.shape
+                    seed_ref_f = box_utils.apply_pose(
+                        seed_sensor_f.reshape(-1, 3), pose_f
+                    ).reshape(seed_shape)
+                    center_ref_f = box_utils.apply_pose(
+                        center_sensor_f.reshape(-1, 3), pose_f
+                    ).reshape(seed_shape)
+                    seed_ref[start:end] = seed_ref_f
+                    seed_out[start:end] = seed_ref_f
+                    center_out[start:end] = center_ref_f
 
                 bbox_sensor_f = bbox_b[local_f].to(device=device, dtype=dtype)
                 bbox_ref_f = box_utils.transform_boxes_to_ref(bbox_sensor_f, pose_f)
@@ -404,17 +416,18 @@ class GridTemporalAggregator(nn.Module):
                             ref_f[selected], bbox_ref_f[box_index]
                         )
                         coord_out[start:end] = out_f
-                        seed_out_f = seed_out[start:end]
-                        center_out_f = center_out[start:end]
-                        selected_shape = seed_out_f[selected].shape
-                        seed_out_f[selected] = box_utils.points_to_box_local(
-                            seed_ref_f[selected].reshape(-1, 3), bbox_ref_f[box_index]
-                        ).reshape(selected_shape)
-                        center_out_f[selected] = box_utils.points_to_box_local(
-                            center_ref_f[selected].reshape(-1, 3), bbox_ref_f[box_index]
-                        ).reshape(selected_shape)
-                        seed_out[start:end] = seed_out_f
-                        center_out[start:end] = center_out_f
+                        if has_seeds:
+                            seed_out_f = seed_out[start:end]
+                            center_out_f = center_out[start:end]
+                            selected_shape = seed_out_f[selected].shape
+                            seed_out_f[selected] = box_utils.points_to_box_local(
+                                seed_ref_f[selected].reshape(-1, 3), bbox_ref_f[box_index]
+                            ).reshape(selected_shape)
+                            center_out_f[selected] = box_utils.points_to_box_local(
+                                center_ref_f[selected].reshape(-1, 3), bbox_ref_f[box_index]
+                            ).reshape(selected_shape)
+                            seed_out[start:end] = seed_out_f
+                            center_out[start:end] = center_out_f
 
         return {
             "frame": token_frame,
@@ -422,7 +435,7 @@ class GridTemporalAggregator(nn.Module):
             "out": coord_out,
             "seed_ref": seed_ref,
             "seed_out": seed_out,
-            "seed_delta": seed_out - center_out,
+            "seed_delta": (seed_out - center_out) if has_seeds else None,
             "is_dynamic": is_dynamic,
             "instance_id": instance_id,
             "box_assign": box_assign,

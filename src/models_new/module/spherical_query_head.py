@@ -10,34 +10,33 @@ of voting, so no gaussian is ever seeded on the other label's points and no
 raw point is dropped. This equals running the same spherical binning on the
 bg-only and per-instance point subsets separately.
 
-Each anchor emits up to three gaussians. Their coarse centres are
-deterministic range-quantile raw points of the group; one raw point activates
-the middle query, two activate the outer queries, and three or more activate
-all three. The queries cross-attend to the token K/V set with their raw seed
-positions as Q-side 3D RoPE coordinates. A bounded learned offset is applied
-by the caller. The anchor reference position is the geometric spherical-cell
-centre (shared by the split anchors of one cell), so both the head's delta_p
-(seed - centre) and the max_kv capping distance are measured from the cell
-centre in the output frame.
+Every unique ``(anchor, supporting token)`` pair is one evidence query and one
+nominal gaussian. Its coarse centre is an actually observed raw point: among
+the raw points shared by that anchor and token, choose the point nearest their
+Cartesian mean. This gives surface-supported seeds without FPS. The query
+starts from that token's own fused feature rather than a pooled anchor feature,
+then cross-attends to the anchor's K/V memory with the raw seed as its Q-side
+3D RoPE coordinate. The caller applies a bounded learned offset.
 
-Anchor embedding: raw-count weighted sum of the group tokens' fused features
-(a group whose 10 raw points map 3/6/1 onto three tokens pools 0.3/0.6/0.1 of
-their features), followed by LayerNorm. Deliberately no per-token MLP: K/V
-consumes the same fused features directly (below), so the query-side summary
-stays in the same representation space; the count weights are data-fixed, and
-adaptive per-query selection belongs to the cross-attention.
+The spherical anchor is therefore a context/routing set, not an output
+compression unit. Query count is ragged and data-defined; there is no fixed
+three-slot query bank. The head's explicit position conditioning is
+``(seed - source_token_position) / token_stride_m``. The geometric spherical
+cell centre remains useful only for shared K/V capping and anchor geometry.
 
-Tokens carry no fg/bg labels anywhere -- they are only ever reached through
-raw-point membership:
+Cross-frame temporal context is NOT assembled here. The caller first runs the
+shared grid temporal aggregator (background 0.8 m radius cross-frame attention
++ per-instance box-local self-attention) over the fused tokens, so this head
+receives temporally fused features and every K/V route stays within the
+anchor's OWN frame. Tokens carry no fg/bg labels anywhere -- they are only
+ever reached through raw-point membership:
 - bg anchors live in the batch's ref frame (frame 0). K/V = the tokens of the
-  group's own raw points (exactly the anchor-embedding set, dedup'd) + other
-  frames' bg raw points ego-compensated into this frame's sensor coords,
-  re-binned into the same cell, each contributing the token it is assigned to.
+  group's own raw points (exactly the anchor-embedding set, dedup'd).
 - fg anchors live in bbox-local coords. K/V = the tokens reached by the SAME
-  instance's raw points across both frames (dedup'd); each token's RoPE
-  position is its own frame's instance-box-local position, so the two frames'
-  tokens concatenate in one motion-compensated frame (spherical reprojection
-  breaks for movers).
+  instance's raw points in the anchor's own frame (dedup'd, instance-wide
+  rather than cell-member-only -- objects hold few tokens); each token's RoPE
+  position is the own-frame instance-box-local position, matching the query
+  seed frame.
 - K/V features are the fused token features themselves (LayerNorm + the
   attention's W_k/W_v only, no extra embedding); K/V RoPE positions are the
   Utonia token positions (features['coord']-derived, not grid_coord).
@@ -45,9 +44,8 @@ raw-point membership:
 - BG/FG share learned query/cross-attention weights, but use independent RoPE
   metric scales selected per anchor to respect their different spatial support.
 
-Outputs are packed per active gaussian (anchor-major, slot fastest) and feed
-the shared `gs_predictor` in m1_p2g.py together with the seed-minus-cell-centre
-delta.
+Outputs are packed frame-major and anchor-major and feed the shared
+``gs_predictor`` together with the normalized seed-minus-source-token delta.
 """
 from __future__ import annotations
 
@@ -59,7 +57,6 @@ from ..utils.attention import AnchorQueryCrossAttention
 from .spherical_bins import (
     SphericalBins,
     build_cells,
-    lookup_cells,
 )
 
 
@@ -69,7 +66,11 @@ from .spherical_bins import (
 # the raw-cell label-group pair assembly
 # (scripts/attention_rope_pair_stats_train_100_rawsplit: bg p95 1.772 m ->
 # pi/p95 = 1.77 -> 1.75; fg p95 2.325 m -> 1.35 -- both land on the pre-split
-# values, so the constants carry over measured, not assumed).
+# values, so the constants carry over measured, not assumed). The own-frame
+# K/V restriction only removes pairs from that measured assembly (bg drops
+# the same-cell cross-frame rebin, fg drops the other frame's box-local
+# tokens), so the p95 support can only shrink and the scales stay valid
+# upper-bound picks.
 _SPHERICAL_ROPE_BASE = 10.0
 _SPHERICAL_BG_ROPE_POSITION_SCALE = 1.75
 _SPHERICAL_FG_ROPE_POSITION_SCALE = 1.35
@@ -84,20 +85,32 @@ def _segment_rank(sorted_ids, num_segments):
     return torch.arange(sorted_ids.numel(), device=sorted_ids.device) - starts[sorted_ids]
 
 
-def _select_raw_seed_slots(raw_points, raw_anchor, anchor_sensor):
-    """Select canonical 1/2/3 raw-point slots for every spherical anchor.
+def _select_evidence_seeds(raw_points, raw_anchor, raw_token, num_anchors, num_tokens):
+    """One observed medoid-like seed per unique ``(anchor, token)`` evidence.
 
-    Points are sorted deterministically by ``(anchor, range, x, y, z)``. For
-    three or more points, slots use midpoint quantiles 1/6, 1/2, and 5/6.
+    For each non-empty pair, compute its raw-point Cartesian mean and select the
+    actually observed point nearest that mean. Ties use deterministic x/y/z
+    ordering. The discrete grouping and argmin operate only on observation
+    geometry; gathered token features remain fully differentiable downstream.
     """
-    A = anchor_sensor.shape[0]
+    A = int(num_anchors)
+    N = int(num_tokens)
     if raw_points.ndim != 2 or raw_points.shape[-1] != 3:
         raise ValueError(f"raw_points must have shape (R,3), got {tuple(raw_points.shape)}")
     if raw_anchor.ndim != 1 or raw_anchor.shape[0] != raw_points.shape[0]:
         raise ValueError("raw_anchor must provide one anchor index per raw point")
+    if raw_token.ndim != 1 or raw_token.shape[0] != raw_points.shape[0]:
+        raise ValueError("raw_token must provide one token index per raw point")
+    if raw_points.shape[0] == 0:
+        raise RuntimeError("occupied spherical anchors require non-empty raw membership")
+    if (
+        (raw_anchor < 0).any() or (raw_anchor >= A).any()
+        or (raw_token < 0).any() or (raw_token >= N).any()
+    ):
+        raise ValueError("raw anchor/token membership contains an out-of-range index")
 
-    counts = torch.bincount(raw_anchor, minlength=A)
-    missing = counts == 0
+    anchor_counts = torch.bincount(raw_anchor, minlength=A)
+    missing = anchor_counts == 0
     if missing.any():
         missing_ids = missing.nonzero(as_tuple=True)[0]
         raise RuntimeError(
@@ -105,67 +118,59 @@ def _select_raw_seed_slots(raw_points, raw_anchor, anchor_sensor):
             f"missing {int(missing_ids.numel())} / {A} anchors"
         )
 
-    point_range = raw_points.norm(dim=-1)
+    pair_key = raw_anchor * N + raw_token
+    unique_key, point_to_evidence = torch.unique(
+        pair_key, sorted=True, return_inverse=True
+    )
+    query_anchor = torch.div(unique_key, N, rounding_mode="floor")
+    query_token = unique_key - query_anchor * N
+    E = int(unique_key.numel())
+    evidence_counts = torch.bincount(point_to_evidence, minlength=E)
+    point_sum = raw_points.new_zeros(E, 3)
+    point_sum.index_add_(0, point_to_evidence, raw_points)
+    point_mean = point_sum / evidence_counts.to(raw_points.dtype).unsqueeze(-1)
+    distance2 = ((raw_points - point_mean[point_to_evidence]) ** 2).sum(dim=-1)
+    # Raw coordinates are fp32, so analytically symmetric points can differ by
+    # about 1e-7 m^2 after the mean/subtraction (especially at long range).
+    # Quantize only the ordering key at 1e-6 m^2 so such numerical ties obey the
+    # documented x/y/z rule; selected coordinates remain the original raw row.
+    distance_key = torch.round(distance2 * 1.0e6)
+
+    # Stable least-to-most-significant sorting gives
+    # (evidence id, distance-to-mean, x, y, z). The first row of every evidence
+    # block is therefore the deterministic observed seed.
     order = torch.arange(raw_points.shape[0], device=raw_points.device)
-    # Stable least-to-most-significant sorting gives (anchor, r, x, y, z).
     for value in (
-        raw_points[:, 2], raw_points[:, 1], raw_points[:, 0], point_range, raw_anchor,
+        raw_points[:, 2], raw_points[:, 1], raw_points[:, 0],
+        distance_key, point_to_evidence,
     ):
         order = order[torch.argsort(value[order], stable=True)]
-    sorted_points = raw_points[order]
-    starts = torch.cumsum(counts, dim=0) - counts
-
-    seeds = anchor_sensor[:, None, :].expand(A, 3, 3).clone()
-    active = torch.zeros((A, 3), dtype=torch.bool, device=raw_points.device)
-
-    one = counts == 1
-    seeds[one, 1] = sorted_points[starts[one]]
-    active[one, 1] = True
-
-    two = counts == 2
-    seeds[two, 0] = sorted_points[starts[two]]
-    seeds[two, 2] = sorted_points[starts[two] + 1]
-    active[two, 0] = True
-    active[two, 2] = True
-
-    many_ids = (counts >= 3).nonzero(as_tuple=True)[0]
-    if many_ids.numel() > 0:
-        slot = torch.arange(3, device=raw_points.device).view(1, 3)
-        count_many = counts[many_ids].view(-1, 1)
-        rank = torch.div(
-            (2 * slot + 1) * count_many, 6, rounding_mode="floor"
-        )
-        rows = starts[many_ids].view(-1, 1) + rank
-        seeds[many_ids] = sorted_points[rows]
-        active[many_ids] = True
-
-    return seeds, active, counts
+    starts = torch.cumsum(evidence_counts, dim=0) - evidence_counts
+    seed_row = order[starts]
+    return (
+        raw_points[seed_row], query_anchor, query_token, seed_row,
+        anchor_counts, evidence_counts,
+    )
 
 
 class SphericalQueryHead(nn.Module):
     def __init__(self, squery_cfg, dim, r_far):
         super().__init__()
         self.dim = int(dim)
-        self.K = int(squery_cfg.K)
-        if self.K != 3:
-            raise ValueError(
-                "raw-seeded spherical queries require p2g.squery.K == 3 "
-                f"for canonical middle/outer slots, got {self.K}"
-            )
         self.max_kv = int(squery_cfg.max_kv)
+        self.token_stride_m = float(getattr(squery_cfg, "token_stride_m", 0.4))
+        if self.token_stride_m <= 0.0:
+            raise ValueError("p2g.squery.token_stride_m must be positive")
+        dr_m = getattr(squery_cfg, "dr_m", None)
         self.bins = SphericalBins(
             float(squery_cfg.dtheta_deg), float(squery_cfg.dphi_deg),
-            float(squery_cfg.dlogr), float(squery_cfg.r_min), float(squery_cfg.r_max),
+            getattr(squery_cfg, "dlogr", None),
+            float(squery_cfg.r_min), float(squery_cfg.r_max),
+            dr_m=float(dr_m) if dr_m is not None else None,
         )
 
-        # K learnable queries, shared by every anchor; each anchor differentiates
-        # them through its pooled anchor embedding (query_k = learnable_k + emb).
-        self.query_embed = nn.Parameter(torch.randn(self.K, self.dim) * 0.02)
-
-        # Anchor embedding: raw-count weighted token pooling -> LN. There is no
-        # token MLP on purpose -- K/V uses the same un-embedded fused features,
-        # so the query-side summary stays in the same space and the following
-        # cross-attention owns all adaptive/query-specific selection.
+        # Keep the checkpoint-facing normalization name, but normalize each
+        # evidence's own source-token feature rather than an anchor-pooled P0.
         self.p0_norm = nn.LayerNorm(self.dim)
 
         # The fused token trunk has no final normalization. Normalize raw token
@@ -272,12 +277,11 @@ class SphericalQueryHead(nn.Module):
         """Anchors of one frame: occupied (spherical cell, raw label) groups.
 
         Returns None when the frame has no in-range raw point, else a dict
-        with the per-frame bg cell table (for cross-frame lookups) and the
-        anchor arrays. A mixed boundary cell splits into one anchor per label
-        (bg first, then instances in ascending id order) instead of voting, so
-        every group is label-pure and no raw point is dropped. This equals
-        binning the bg-only and per-instance point subsets separately. All
-        split anchors of one cell share the geometric cell centre as their
+        with the anchor arrays. A mixed boundary cell splits into one anchor
+        per label (bg first, then instances in ascending id order) instead of
+        voting, so every group is label-pure and no raw point is dropped. This
+        equals binning the bg-only and per-instance point subsets separately.
+        All split anchors of one cell share the geometric cell centre as their
         reference position."""
         device = raw_sensor.device
         pi = (tm["raw_frame"] == global_f).nonzero(as_tuple=True)[0]
@@ -330,13 +334,7 @@ class SphericalQueryHead(nn.Module):
                 sel[dyn_idx[bidx == box_i]] = True
                 anchor_out[sel] = box_utils.points_to_box_local(anchor_ref[sel], bbox_ref_f[box_i])
 
-        # bg cell table for cross-frame lookups: one bg anchor per cell at
-        # most, and group keys ascend by (cell, label idx), so the bg subset
-        # stays sorted and unique in cell hash.
-        bg_rows = (~is_dyn).nonzero(as_tuple=True)[0]
-
         return {
-            "bg_cell_hash": anchor_cell[bg_rows], "bg_rows": bg_rows,
             "pt2anchor": pt2anchor, "pi": pi, "num_anchors": U,
             "label": anchor_label, "box": anchor_box, "is_dyn": is_dyn,
             "sensor": anchor_sensor, "ref": anchor_ref, "out": anchor_out, "r": anchor_r,
@@ -356,11 +354,10 @@ class SphericalQueryHead(nn.Module):
 
         Returns (out_feat (G,D), seed (G,3), delta_p (G,3), r_anchor (G,),
         gauss_offset (n_frames,) long, meta) with a variable G, ordered
-        frame-major, anchor-major, active-slot fastest. seed lives in the
-        output coordinate frame (bg: ref frame, fg: box-local); delta_p is the
-        seed minus the anchor's spherical-cell centre in that same frame; meta
-        follows the shared seed contract (box_assign / instance_id /
-        is_dynamic / coord_ref / bbox_ref_by_frame).
+        frame-major, anchor-major, source-token-major. seed lives in the output
+        coordinate frame (bg: ref frame, fg: box-local); delta_p is the
+        normalized seed-minus-source-token position in that same frame; meta
+        follows the shared seed contract.
         """
         device = feat.device
         n_frames = len(frame_batch_idx)
@@ -404,6 +401,11 @@ class SphericalQueryHead(nn.Module):
                 "is_dynamic": torch.zeros(0, dtype=torch.bool, device=device),
                 "coord_ref": tok_pos.new_zeros(0, 3),
                 "bbox_ref_by_frame": tm["bbox_ref_by_frame"],
+                "slot_index": torch.zeros(0, dtype=torch.long, device=device),
+                "anchor_index": torch.zeros(0, dtype=torch.long, device=device),
+                "source_token_index": torch.zeros(0, dtype=torch.long, device=device),
+                "anchor_raw_count": torch.zeros(0, dtype=torch.long, device=device),
+                "evidence_raw_count": torch.zeros(0, dtype=torch.long, device=device),
             }
             zero_off = torch.zeros(n_frames, dtype=torch.long, device=device)
             return (
@@ -411,7 +413,6 @@ class SphericalQueryHead(nn.Module):
                 tok_pos.new_zeros(0, 3), tok_pos.new_zeros(0), zero_off, empty_meta,
             )
 
-        anchor_sensor = torch.cat([fa["sensor"] for fa in frame_anchor if fa is not None])
         anchor_out = torch.cat([fa["out"] for fa in frame_anchor if fa is not None])
         anchor_r = torch.cat([fa["r"] for fa in frame_anchor if fa is not None])
         anchor_label = torch.cat([fa["label"] for fa in frame_anchor if fa is not None])
@@ -422,7 +423,7 @@ class SphericalQueryHead(nn.Module):
             for g, fa in enumerate(frame_anchor) if fa is not None
         ])
 
-        # ---- Stage B1: flat raw membership -> range-quantile seed slots ----
+        # ---- Stage B1: one evidence query per unique (anchor, source token) ----
         raw_rows = []       # retained (in-range) raw-point rows, frame-major
         raw_anchor = []     # matching global anchor ids
         for g, fa in enumerate(frame_anchor):
@@ -434,62 +435,54 @@ class SphericalQueryHead(nn.Module):
         raw_anchor = torch.cat(raw_anchor)
         raw_token = raw_token_index[raw_rows]
 
-        seed_sensor, active_slot, anchor_raw_count = _select_raw_seed_slots(
-            raw_point_sensor[raw_rows], raw_anchor, anchor_sensor,
+        (
+            _seed_sensor, query_anchor, query_token, seed_local_row,
+            anchor_raw_count, evidence_raw_count,
+        ) = _select_evidence_seeds(
+            raw_point_sensor[raw_rows], raw_anchor, raw_token, A, N,
         )
-
-        # Seeds and cell centres are transformed with the same own-frame pose.
-        # Dynamic anchors then use the same own-frame bbox-local coordinate
-        # system as their K/V.
-        seed_ref = torch.zeros_like(seed_sensor)
-        for b, frame_indices in tm["batch_frame_map"].items():
-            pose_b = pose_list[b]
-            for local_f, global_f in enumerate(frame_indices):
-                fa = frame_anchor[global_f]
-                if fa is None:
-                    continue
-                start = anchor_base[global_f]
-                end = start + fa["num_anchors"]
-                pose_f = pose_b[local_f].to(device=device, dtype=seed_sensor.dtype)
-                transformed = box_utils.apply_pose(
-                    seed_sensor[start:end].reshape(-1, 3), pose_f
-                )
-                seed_ref[start:end] = transformed.reshape(-1, self.K, 3)
-
+        seed_raw_row = raw_rows[seed_local_row]
+        seed_ref = tm["raw_ref"][seed_raw_row]
+        source_token_ref = tm["ref"][query_token]
         seed_out = seed_ref.clone()
+        source_token_out = source_token_ref.clone()
         for global_f, fa in enumerate(frame_anchor):
             if fa is None or not fa["is_dyn"].any():
                 continue
             bbox_ref_f = tm["bbox_ref_by_frame"][global_f]
             for box_i in fa["box"][fa["is_dyn"]].unique().tolist():
                 box_i = int(box_i)
-                local_anchor = fa["is_dyn"] & (fa["box"] == box_i)
-                rows = local_anchor.nonzero(as_tuple=True)[0] + anchor_base[global_f]
-                local = box_utils.points_to_box_local(
-                    seed_ref[rows].reshape(-1, 3), bbox_ref_f[box_i]
+                rows = (
+                    (anchor_frame[query_anchor] == global_f)
+                    & anchor_is_dyn[query_anchor]
+                    & (anchor_box[query_anchor] == box_i)
+                ).nonzero(as_tuple=True)[0]
+                if rows.numel() == 0:
+                    continue
+                seed_out[rows] = box_utils.points_to_box_local(
+                    seed_ref[rows], bbox_ref_f[box_i]
                 )
-                seed_out[rows] = local.reshape(-1, self.K, 3)
-        # Precomputed head conditioning: seed minus the spherical cell centre,
-        # both expressed in the anchor's output frame (bg: ref, fg: box-local).
-        delta_p = seed_out - anchor_out[:, None, :]
+                source_token_out[rows] = box_utils.points_to_box_local(
+                    source_token_ref[rows], bbox_ref_f[box_i]
+                )
 
-        # ---- Stage C: anchor embedding = raw-count weighted token pooling ----
-        # index_add over raw points realises the count weighting exactly: a
-        # token holding k of the cell's n raw points contributes k/n of its
-        # feature. No MLP (see module docstring); LayerNorm keeps the pooled
-        # scale stable before the learnable queries are added.
-        emb = feat.new_zeros(A, self.dim)
-        emb.index_add_(0, raw_anchor, feat[raw_token])
-        emb = emb / anchor_raw_count.to(feat.dtype).clamp_min(1.0).unsqueeze(-1)
-        emb = self.p0_norm(emb)
-        queries = self.query_embed.unsqueeze(0) + emb.unsqueeze(1)   # (A, K, D)
+        # The head sees only local position within the 0.4m source-token support.
+        # Absolute metric positions stay on the seed/base-centre and RoPE paths.
+        delta_p = (seed_out - source_token_out) / self.token_stride_m
+
+        # ---- Stage C: source-token feature is the query identity ----
+        # Gather/indexing preserves gradient to feat[query_token]. No anchor P0,
+        # raw-count feature, fixed slot embedding, or range metadata is injected.
+        queries = self.p0_norm(feat[query_token])                    # (G, D)
 
         # ---- Stage D: K/V pairs, each carrying its own RoPE position ----
+        # Every route stays within the anchor's own frame: cross-frame context
+        # already lives in the features via the shared temporal aggregator.
         pair_anchor_parts, pair_token_parts, pair_pos_parts = [], [], []
 
-        # bg anchors, own frame: the group's member tokens = exactly the
-        # anchor-embedding set, dedup'd to one K/V entry per (anchor, token).
-        # Token positions live in the ref frame.
+        # bg anchors: the group's member tokens = exactly the anchor-embedding
+        # set, dedup'd to one K/V entry per (anchor, token). Token positions
+        # live in the ref frame.
         own_bg = ~anchor_is_dyn[raw_anchor]
         if own_bg.any():
             key = torch.unique(raw_anchor[own_bg] * N + raw_token[own_bg])
@@ -499,128 +492,70 @@ class SphericalQueryHead(nn.Module):
             pair_token_parts.append(own_token)
             pair_pos_parts.append(tm["ref"][own_token])
 
-        # bg anchors, other frames: bg-labelled raw points are ego-compensated
-        # into this frame's sensor coords, re-binned into the same 1x1x1 cell,
-        # and contribute the token they are assigned to (dedup'd). fg raw
-        # points are excluded: without motion compensation their re-binned
-        # location is stale.
-        for b, frame_indices in tm["batch_frame_map"].items():
-            pose_b = pose_list[b]
-            for local_f, global_f in enumerate(frame_indices):
-                fa = frame_anchor[global_f]
-                if fa is None or fa["bg_rows"].numel() == 0:
-                    continue
-                pose_f = pose_b[local_f].to(device)
-                inv_pose_f = torch.linalg.inv(pose_f)
-                for global_g in frame_indices:
-                    if global_g == global_f:
-                        continue
-                    cand = (
-                        (tm["raw_frame"] == global_g) & (tm["raw_label"] == -1)
-                    ).nonzero(as_tuple=True)[0]
-                    if cand.numel() == 0:
-                        continue
-                    x_f = box_utils.apply_pose(tm["raw_ref"][cand], inv_pose_f)
-                    idx3_2, valid_2 = self.bins.bin_coords(x_f)
-                    cand = cand[valid_2]
-                    if cand.numel() == 0:
-                        continue
-                    cell_idx2, found2 = lookup_cells(
-                        self.bins.hash(idx3_2[valid_2]), fa["bg_cell_hash"]
-                    )
-                    cand = cand[found2]
-                    if cand.numel() == 0:
-                        continue
-                    a_ids = anchor_base[global_f] + fa["bg_rows"][cell_idx2[found2]]
-                    key = torch.unique(a_ids * N + raw_token_index[cand])
-                    a_u = torch.div(key, N, rounding_mode="floor")
-                    t_u = key - a_u * N
-                    pair_anchor_parts.append(a_u)
-                    pair_token_parts.append(t_u)
-                    pair_pos_parts.append(tm["ref"][t_u])
-
-        # fg anchors: the tokens reached by the SAME instance's raw points
-        # across both frames (dedup'd per instance), each expressed in its own
-        # frame's instance-box-local coordinates so the two frames concatenate
-        # in one motion-compensated frame. Tokens carry no labels here -- the
-        # membership is raw-point-defined, so instance tokens survive even
-        # when a token's centroid drifts outside the box.
-        for b, frame_indices in tm["batch_frame_map"].items():
-            fg_a, fg_lab = [], []
-            for global_f in frame_indices:
-                fa = frame_anchor[global_f]
-                if fa is None:
-                    continue
-                du = fa["is_dyn"].nonzero(as_tuple=True)[0]
-                fg_a.append(anchor_base[global_f] + du)
-                fg_lab.append(fa["label"][du])
-            if not fg_a:
+        # fg anchors: the tokens reached by the SAME instance's raw points in
+        # the anchor's OWN frame (dedup'd per instance, instance-wide rather
+        # than cell-member-only -- objects hold few tokens). Each token's RoPE
+        # position is the own-frame instance-box-local position, the same
+        # frame the anchor's query seeds live in. Tokens carry no labels here
+        # -- the membership is raw-point-defined, so instance tokens survive
+        # even when a token's centroid drifts outside the box.
+        for global_f, fa in enumerate(frame_anchor):
+            if fa is None or not bool(fa["is_dyn"].any()):
                 continue
-            fg_a = torch.cat(fg_a)
-            fg_lab = torch.cat(fg_lab)
-            if fg_a.numel() == 0:
-                continue
-            frames_b = torch.zeros_like(tm["raw_frame"], dtype=torch.bool)
-            for global_f in frame_indices:
-                frames_b |= tm["raw_frame"] == global_f
-            fg_raw = (frames_b & (tm["raw_label"] >= 0)).nonzero(as_tuple=True)[0]
+            fg_raw = (
+                (tm["raw_frame"] == global_f) & (tm["raw_label"] >= 0)
+            ).nonzero(as_tuple=True)[0]
             if fg_raw.numel() == 0:
                 continue
-            # (instance, token) membership, dedup'd across every raw point.
+            # (instance, token) membership, dedup'd across the frame's points.
             uniq_inst, inst_c = torch.unique(
                 tm["raw_label"][fg_raw], return_inverse=True
             )
             pair_key = torch.unique(inst_c * N + raw_token_index[fg_raw])
             it_inst = torch.div(pair_key, N, rounding_mode="floor")
             it_tok = pair_key - it_inst * N
-            # Box-local position of each token w.r.t. its OWN frame's box of
-            # that instance (a dynamic instance has a box in both endpoint
-            # frames by definition; drop the pair defensively otherwise).
-            # Positions stay in the position dtype (fp32), never the feature
-            # dtype: under a bf16 trunk the box-local write would crash, and
-            # bf16 positions cost centimeters at range.
+            # Box-local position w.r.t. this frame's box of the pair's
+            # instance. A dynamic raw label is produced by indexing this
+            # frame's own iids, so a lookup miss is impossible -- fail loudly
+            # rather than route K/V through a bogus box. Positions stay in
+            # the position dtype (fp32), never the feature dtype: under a
+            # bf16 trunk the box-local write would crash, and bf16 positions
+            # cost centimeters at range.
+            iids_f = tm["iids_by_frame"][global_f]
+            bbox_ref_f = tm["bbox_ref_by_frame"][global_f]
+            eq = uniq_inst[it_inst].unsqueeze(1) == iids_f.unsqueeze(0)
+            if not bool(eq.any(dim=1).all()):
+                raise RuntimeError(
+                    "dynamic raw label without a matching own-frame box; "
+                    "raw labelling and bbox inputs are inconsistent"
+                )
+            bidx = eq.long().argmax(dim=1)
             it_pos = tm["ref"].new_zeros(it_tok.shape[0], 3)
-            it_valid = torch.zeros(it_tok.shape[0], dtype=torch.bool, device=device)
-            tok_frame_it = tm["frame"][it_tok]
-            for global_f in frame_indices:
-                m_rows = (tok_frame_it == global_f).nonzero(as_tuple=True)[0]
-                iids_f = tm["iids_by_frame"][global_f]
-                if m_rows.numel() == 0 or iids_f.numel() == 0:
-                    continue
-                bbox_ref_f = tm["bbox_ref_by_frame"][global_f]
-                eq = uniq_inst[it_inst[m_rows]].unsqueeze(1) == iids_f.unsqueeze(0)
-                has = eq.any(dim=1)
-                bidx = eq.long().argmax(dim=1)
-                for box_i in bidx[has].unique().tolist():
-                    box_i = int(box_i)
-                    sel = m_rows[has & (bidx == box_i)]
-                    it_pos[sel] = box_utils.points_to_box_local(
-                        tm["ref"][it_tok[sel]], bbox_ref_f[box_i]
-                    )
-                it_valid[m_rows[has]] = True
-            keep = it_valid.nonzero(as_tuple=True)[0]
-            if keep.numel() == 0:
-                continue
-            it_inst = it_inst[keep]
-            it_tok = it_tok[keep]
-            it_pos = it_pos[keep]
-            # per-instance CSR over tokens, then expand each anchor to its block
+            for box_i in bidx.unique().tolist():
+                box_i = int(box_i)
+                sel = (bidx == box_i).nonzero(as_tuple=True)[0]
+                it_pos[sel] = box_utils.points_to_box_local(
+                    tm["ref"][it_tok[sel]], bbox_ref_f[box_i]
+                )
+            # per-instance CSR over tokens, then expand each fg anchor of this
+            # frame to its instance block. Anchor labels are built from the
+            # frame's own in-range raw points, a subset of fg_raw, so every
+            # anchor label must resolve -- fail loudly otherwise.
+            du = fa["is_dyn"].nonzero(as_tuple=True)[0]
+            fg_a = anchor_base[global_f] + du
+            fg_lab = fa["label"][du]
             counts = torch.bincount(it_inst, minlength=uniq_inst.numel())
-            starts = torch.zeros(uniq_inst.numel(), dtype=torch.long, device=device)
-            if uniq_inst.numel() > 1:
-                starts[1:] = torch.cumsum(counts, dim=0)[:-1]
+            starts = torch.cumsum(counts, dim=0) - counts
             a_lc = torch.searchsorted(uniq_inst, fg_lab)
-            a_lc_c = a_lc.clamp(max=uniq_inst.numel() - 1)
-            matched = (a_lc < uniq_inst.numel()) & (uniq_inst[a_lc_c] == fg_lab)
-            fg_a = fg_a[matched]
-            a_lc = a_lc_c[matched]
-            if fg_a.numel() == 0:
-                continue
+            a_lc = a_lc.clamp(max=uniq_inst.numel() - 1)
+            if not bool((uniq_inst[a_lc] == fg_lab).all()):
+                raise RuntimeError(
+                    "fg anchor instance without own-frame raw membership; "
+                    "anchor formation and raw labelling are inconsistent"
+                )
             a_cnt = counts[a_lc]
             rep = torch.repeat_interleave(torch.arange(fg_a.numel(), device=device), a_cnt)
-            blk = torch.zeros(fg_a.numel(), dtype=torch.long, device=device)
-            if fg_a.numel() > 1:
-                blk[1:] = torch.cumsum(a_cnt, dim=0)[:-1]
+            blk = torch.cumsum(a_cnt, dim=0) - a_cnt
             within = torch.arange(int(a_cnt.sum().item()), device=device) - blk[rep]
             sel = starts[a_lc][rep] + within
             pair_anchor_parts.append(fg_a[rep])
@@ -667,25 +602,25 @@ class SphericalQueryHead(nn.Module):
             torch.full((A,), self.fg_rope_position_scale, device=device),
             torch.full((A,), self.bg_rope_position_scale, device=device),
         )
-        out, _weighted_kv_pos = self.attn(
+        out_feat = self.attn(
             queries, kv_feat, kv_pos, pair_anchor, A, seed_out,
             position_scale=anchor_rope_scale,
+            query_anchor_ids=query_anchor,
         )
 
-        # ---- Stage E4: pack only active slots (anchor-major, slot fastest) ----
-        anchor_index, slot_index = active_slot.nonzero(as_tuple=True)
-        out_feat = out[anchor_index, slot_index]
-        p_flat = seed_out[anchor_index, slot_index]
-        delta_flat = delta_p[anchor_index, slot_index]
-        r_g = anchor_r[anchor_index]
+        # ---- Stage E4: queries are already flat, frame/anchor/token-major ----
+        query_rank = _segment_rank(query_anchor, A)
+        p_flat = seed_out
+        delta_flat = delta_p
+        r_g = anchor_r[query_anchor]
 
-        is_dyn_g = anchor_is_dyn[anchor_index]
-        label_g = anchor_label[anchor_index]
+        is_dyn_g = anchor_is_dyn[query_anchor]
+        label_g = anchor_label[query_anchor]
         box_g = torch.where(
-            is_dyn_g, anchor_box[anchor_index], torch.full_like(label_g, -1)
+            is_dyn_g, anchor_box[query_anchor], torch.full_like(label_g, -1)
         )
-        frame_g = anchor_frame[anchor_index]
-        coord_ref = seed_ref[anchor_index, slot_index]
+        frame_g = anchor_frame[query_anchor]
+        coord_ref = seed_ref
 
         counts_f = torch.bincount(frame_g, minlength=n_frames)
         gauss_offset = torch.cumsum(counts_f, dim=0)
@@ -696,7 +631,12 @@ class SphericalQueryHead(nn.Module):
             "is_dynamic": is_dyn_g,
             "coord_ref": coord_ref,
             "bbox_ref_by_frame": tm["bbox_ref_by_frame"],
-            "slot_index": slot_index,
-            "anchor_raw_count": anchor_raw_count[anchor_index],
+            # Retained name for downstream diagnostics; it is now the rank of
+            # the source-token evidence inside its anchor, not a learned slot id.
+            "slot_index": query_rank,
+            "anchor_index": query_anchor,
+            "source_token_index": query_token,
+            "anchor_raw_count": anchor_raw_count[query_anchor],
+            "evidence_raw_count": evidence_raw_count,
         }
         return out_feat, p_flat, delta_flat, r_g, gauss_offset, meta
