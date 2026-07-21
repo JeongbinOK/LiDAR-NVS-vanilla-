@@ -2,7 +2,9 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 from ..gaussian_renderer import render
-from ..utils.graphics_utils import pano_to_lidar 
+from ..utils.graphics_utils import lidar4d_range_image_to_points
+
+
 class GausRender(nn.Module):
     def __init__(self, cfg):
         super().__init__()
@@ -190,15 +192,16 @@ class GausRender(nn.Module):
                 gt_raydrop = 1.0 - (gt_depth > 0).float()
 
 
-                # chamfer용 포인트는 mean depth로 역투영 (gradient가 α·T로 분산되어 안정적).
-                # median은 단일 gaussian에 집중된 불연속 gradient라 학습 불안정 → 사용 안 함.
-                # GS-LiDAR(train.py:189)처럼 pred를 GT-valid 픽셀로 제한 → pred/gt support 정렬, 안정적.
-                gt_valid = (gt_depth > 0).to(render_pkg["depth"].dtype)
-                render_points = pano_to_lidar(
-                    render_pkg["depth"] * gt_valid,
+                # LiDAR4D CD protocol: hard-mask predicted no-return rays at
+                # 0.5, discard target-sensor ranges >=80 m, and back-project
+                # the remaining mean depths. The hard masks are detached inside
+                # the helper, while gradients still flow to retained depths.
+                render_points = lidar4d_range_image_to_points(
+                    render_pkg["depth"],
                     gt_cam.vfov,
                     gt_cam.hfov,
                     row_to_theta=gt_cam.row_to_theta,
+                    raydrop=render_pkg["raydrop"],
                 )
 
                 # 픽셀 기반 맵 모으기
@@ -212,12 +215,12 @@ class GausRender(nn.Module):
                 b_gt_raydrops.append(gt_raydrop)
 
                 # 포인트 데이터 모으기 (개수가 다를 수 있으므로 리스트 유지)
-                # gt도 pred와 동일한 pano_to_lidar 복원으로 통일 (GS-LiDAR train.py:190).
+                # gt도 pred와 동일한 LiDAR4D range/mapping 규칙으로 복원한다.
                 # raw gt_cam.points(z-up 센서)는 pano(y-up view) pred와 프레임이 달라 chamfer 폭증 →
                 # round-trip 검증상 pano는 rasterizer를 정확히 역변환하므로 양쪽을 pano로 맞춘다.
                 b_render_points.append(render_points)
                 b_gt_points.append(
-                    pano_to_lidar(
+                    lidar4d_range_image_to_points(
                         gt_depth,
                         gt_cam.vfov,
                         gt_cam.hfov,

@@ -30,7 +30,7 @@ except ImportError:  # pragma: no cover
     _lpips = None
 
 from ..models_new.utils.chamfer.chamfer3D.dist_chamfer_3D import chamfer_3DDist
-from ..models_new.utils.graphics_utils import pano_to_lidar
+from ..models_new.utils.graphics_utils import lidar4d_range_image_to_points
 
 
 # ---------------------------------------------------------------------------
@@ -162,20 +162,27 @@ def _fscore(dist1, dist2, threshold: float = 0.05):
 
 
 def _range_to_points(depth_1hw, row_to_theta, vfov, hfov, near, far):
-    depth = depth_1hw.clone()
-    depth[depth > far] = 0.0  # GS-LiDAR drops returns beyond `far`
-    pts = pano_to_lidar(depth, vfov, hfov, row_to_theta=row_to_theta)  # [M, 3], range>0
-    if pts.shape[0] > 0:
-        pts = pts[pts.norm(dim=1) > near]
-    return pts.contiguous()
+    return lidar4d_range_image_to_points(
+        depth_1hw,
+        vfov,
+        hfov,
+        row_to_theta=row_to_theta,
+        min_range=near,
+        max_range=far,
+    ).contiguous()
 
 
 def point_metrics(pred_depth, gt_depth, row_to_theta, backends: MetricBackends,
                   vfov, hfov=(-180.0, 180.0), scale: float = 1.0,
-                  near: float = 0.2, far: float = 80.0,
+                  near: float = 0.0, far: float = 80.0,
                   fscore_threshold: float = 0.05) -> dict:
-    """pred_depth / gt_depth: [1, H, W] depth (meters) on CUDA. `pred_depth`
-    should already be raydrop-masked (GS-LiDAR masks before back-projecting)."""
+    """LiDAR4D point metrics for ``[1,H,W]`` range images in metres.
+
+    ``pred_depth`` should already be hard-masked by predicted raydrop. We apply
+    the LiDAR4D/GS-LiDAR 80 m support symmetrically and do not add a CD-only
+    near crop, hence the default ``near=0``. Both point sets use symmetric
+    squared Chamfer distance.
+    """
     pred_depth = pred_depth / scale
     gt_depth = gt_depth / scale
     if not torch.is_tensor(row_to_theta):

@@ -151,3 +151,59 @@ def pano_to_lidar(range_image, vfov, hfov, row_to_theta=None):
     points_xyz = (directions * range_image)[:, mask[0]].permute(1, 0)
 
     return points_xyz
+
+
+LIDAR4D_CD_MAX_RANGE_M = 80.0
+LIDAR4D_RAYDROP_THRESHOLD = 0.5
+
+
+def lidar4d_range_image_to_points(
+    range_image,
+    vfov,
+    hfov,
+    row_to_theta=None,
+    *,
+    raydrop=None,
+    raydrop_threshold=LIDAR4D_RAYDROP_THRESHOLD,
+    min_range=0.0,
+    max_range=LIDAR4D_CD_MAX_RANGE_M,
+):
+    """Build the point set used by this repo's LiDAR4D-style CD protocol.
+
+    Official LiDAR4D removes predicted no-return rays with a hard 0.5 mask and
+    back-projects the remaining non-zero range pixels; its GT range-view
+    preprocessing excludes returns at or beyond 80 metres. GS-LiDAR makes the
+    80 m filtering explicit for both point sets. We use that symmetric rule so
+    training and evaluation cannot disagree on support. ``raydrop`` follows
+    this repository's convention (1 means no return), which is the inverse of
+    LiDAR4D's official return-mask convention.
+
+    The binary masks are intentionally detached: Chamfer gradients should flow
+    to retained depth values, not through the discontinuous raydrop/range test.
+    ``min_range`` is optional because official LiDAR4D does not apply a separate
+    near-range crop when constructing its evaluation point clouds.
+    """
+    if range_image.ndim != 3 or range_image.shape[0] != 1:
+        raise ValueError(
+            "range_image must have shape [1, H, W], got "
+            f"{tuple(range_image.shape)}"
+        )
+    if raydrop is not None and raydrop.shape != range_image.shape:
+        raise ValueError(
+            "raydrop must match range_image shape, got "
+            f"{tuple(raydrop.shape)} vs {tuple(range_image.shape)}"
+        )
+
+    valid = range_image.detach() > float(min_range)
+    if max_range is not None:
+        valid = valid & (range_image.detach() < float(max_range))
+    if raydrop is not None:
+        valid = valid & (raydrop.detach() <= float(raydrop_threshold))
+
+    masked_range = range_image * valid.to(dtype=range_image.dtype)
+    return pano_to_lidar(
+        masked_range,
+        vfov,
+        hfov,
+        row_to_theta=row_to_theta,
+    )
