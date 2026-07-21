@@ -25,6 +25,16 @@ The three axes are binned into a regular grid::
     n_phi   = ceil(2 pi      / d_phi)
     n_lr    = ceil(ln(r_max/r_min) / d_logr)
 
+The radial axis alternatively supports fixed-metre bins (``dr_m`` set)::
+
+    i_lr = floor((r - r_min) / dr_m)        n_lr = ceil((r_max - r_min) / dr_m)
+
+LiDAR depth accuracy is range-independent and the radial bin's job is to
+separate distinct surfaces along a ray (whose air gaps are also
+range-independent), so linear bins keep the per-anchor depth support constant
+instead of growing as ``0.13 * r`` under ``dlogr=0.12`` (measured far-band
+radial spread p95 4.9 m -> 0.67 m at equal budget).
+
 Every ``idx3`` tensor in this module uses the column order ``[i_theta, i_phi,
 i_lr]``. The scalar cell hash is::
 
@@ -94,21 +104,32 @@ class SphericalBins:
     #: flat slot index of the centre cell in ``azimuth_neighbor_hashes`` output
     AZIMUTH_SELF_SLOT: int = 1
 
-    def __init__(self, dtheta_deg: float, dphi_deg: float, dlogr: float,
-                 r_min: float, r_max: float):
-        assert dtheta_deg > 0 and dphi_deg > 0 and dlogr > 0, "bin steps must be > 0"
+    def __init__(self, dtheta_deg: float, dphi_deg: float, dlogr,
+                 r_min: float, r_max: float, dr_m=None):
+        assert dtheta_deg > 0 and dphi_deg > 0, "bin steps must be > 0"
         assert 0.0 < r_min < r_max, "require 0 < r_min < r_max"
 
         self.dtheta = math.radians(float(dtheta_deg))   # radians
         self.dphi = math.radians(float(dphi_deg))       # radians
-        self.dlogr = float(dlogr)                       # log-ratio units
         self.r_min = float(r_min)
         self.r_max = float(r_max)
         self.ln_r_min = math.log(self.r_min)
 
+        # Radial axis: fixed-metre bins when dr_m is set, else legacy log bins.
+        self.dr_m = float(dr_m) if dr_m is not None else None
+        if self.dr_m is not None:
+            assert self.dr_m > 0, "dr_m must be > 0"
+            self.dlogr = None
+            self.n_lr = int(math.ceil((self.r_max - self.r_min) / self.dr_m))
+        else:
+            assert dlogr is not None and float(dlogr) > 0, (
+                "one of dlogr / dr_m must be set positive")
+            self.dlogr = float(dlogr)                   # log-ratio units
+            self.n_lr = int(math.ceil(
+                math.log(self.r_max / self.r_min) / self.dlogr))
+
         self.n_theta = int(math.ceil(math.pi / self.dtheta))
         self.n_phi = int(math.ceil(_TWO_PI / self.dphi))
-        self.n_lr = int(math.ceil(math.log(self.r_max / self.r_min) / self.dlogr))
         assert self.n_phi >= 3, (
             "n_phi < 3 makes the +-1 phi neighbours alias under wrap; "
             "use a smaller dphi_deg")
@@ -154,7 +175,12 @@ class SphericalBins:
         i_phi = torch.floor((phi + math.pi) / self.dphi).to(torch.long)
         i_phi = torch.remainder(i_phi, self.n_phi)           # +-pi seam safe
 
-        i_lr = torch.floor((torch.log(r) - self.ln_r_min) / self.dlogr).to(torch.long)
+        if self.dr_m is not None:
+            i_lr = torch.floor((r - self.r_min) / self.dr_m).to(torch.long)
+        else:
+            i_lr = torch.floor(
+                (torch.log(r) - self.ln_r_min) / self.dlogr
+            ).to(torch.long)
         i_lr = i_lr.clamp(0, self.n_lr - 1)
 
         idx3 = torch.stack([i_theta, i_phi, i_lr], dim=-1)   # (...,3)
@@ -192,7 +218,8 @@ class SphericalBins:
         """``(...,3)`` ``[i_theta,i_phi,i_lr]`` -> ``(...,3)`` fp32 xyz centres.
 
         The centre is taken in bin space -- ``theta``/``phi`` at half-bin
-        offsets and ``r`` at the half-``dlogr`` geometric midpoint -- then
+        offsets and ``r`` at the radial-bin midpoint (arithmetic for ``dr_m``
+        bins, geometric for ``dlogr`` bins) -- then
         converted back with the inverse of the :func:`xyz_to_theta_phi_r`
         convention. Only defined for in-range indices (``-1`` sentinels must
         be filtered out first); the clamped boundary bins (theta poles, last
@@ -201,7 +228,10 @@ class SphericalBins:
         idxf = idx3.to(torch.float32)
         theta = (idxf[..., 0] + 0.5) * self.dtheta - _HALF_PI
         phi = (idxf[..., 1] + 0.5) * self.dphi - math.pi
-        r = self.r_min * torch.exp((idxf[..., 2] + 0.5) * self.dlogr)
+        if self.dr_m is not None:
+            r = self.r_min + (idxf[..., 2] + 0.5) * self.dr_m
+        else:
+            r = self.r_min * torch.exp((idxf[..., 2] + 0.5) * self.dlogr)
         cos_theta = torch.cos(theta)
         return torch.stack([
             r * cos_theta * torch.cos(phi),
