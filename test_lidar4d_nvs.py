@@ -43,7 +43,7 @@ from src.eval.gaussian_viz import (
 from src.eval.gaussian_stats import collect_window_stats, analyze_gaussian_sizes
 from src.models_new.utils.render import visualize_depth
 
-CONFIG_PATH = "/data/jeongbin/utonia/config/nuscene_train.yaml"
+CONFIG_PATH = "/data1/jeongbin/utonia/config/nuscene_train.yaml"
 RAYDROP_THRESHOLD = 0.5
 
 
@@ -205,15 +205,26 @@ def main(cfg):
                  depth_keep, gt_depth, intensity_keep, gt_intensity,
                  raydrop, gt_raydrop)
 
+        # Raw LiDAR in the same (ref) frame as the Gaussian means, so the HTML
+        # can show whether a Gaussian actually sits on a measured surface: the
+        # two input endpoints (what the model saw) and the GT sweep at the
+        # target time (what it must reproduce).
+        in_pts = _input["lidar_points"][:, :3].detach().cpu().numpy()
+        gt_off = gt["offset"].tolist()
+        gt_start = ([0] + gt_off[:-1])[target_cam]
+        gt_pts = gt["lidar_points"][gt_start:gt_off[target_cam], :3].detach().cpu().numpy()
+
         # Gaussian centers + 1σ surfels at this window's target time (per-seq HTML).
         static_xyz, dynamic_xyz = gaussians_from_output(
             model.g2p_model, out[b], float(gt_cam.timestamp))
         seq_gauss[seq_name].append({
-            "label": f"T={target_s}s", "static": static_xyz, "dynamic": dynamic_xyz})
+            "label": f"T={target_s}s", "static": static_xyz, "dynamic": dynamic_xyz,
+            "input_points": in_pts, "gt_points": gt_pts})
         surf = surfels_from_output(model.g2p_model, out[b], float(gt_cam.timestamp))
         seq_surfel[seq_name].append({
             "label": f"T={target_s}s", "static": surf["static"],
-            "dynamic": surf["dynamic"], "boxes": surf["boxes"]})
+            "dynamic": surf["dynamic"], "boxes": surf["boxes"],
+            "input_points": in_pts, "gt_points": gt_pts})
 
         # per-window Gaussian-size statistics (effective radius vs geometry)
         st = collect_window_stats(model.g2p_model, out[b], float(gt_cam.timestamp))

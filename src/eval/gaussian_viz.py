@@ -44,73 +44,114 @@ _HTML = """<!DOCTYPE html>
 <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
 <style>
 body{font-family:sans-serif;margin:0;background:#111;color:#eee}
-#bar{padding:8px 12px;background:#1c1c1c;border-bottom:1px solid #333}
-button{font-size:16px;margin:3px;padding:6px 16px;cursor:pointer;border:1px solid #555;
+#bar{padding:8px 12px;background:#1c1c1c;border-bottom:1px solid #333;font-size:14px}
+button{font-size:14px;margin:3px;padding:5px 14px;cursor:pointer;border:1px solid #555;
        background:#333;color:#eee;border-radius:4px}
 button.active{background:#2a9d8f;color:#000;font-weight:bold;border-color:#2a9d8f}
-#plot{width:100vw;height:91vh}
+#plot{width:100vw;height:89vh}
 .lg{color:#888;font-size:13px}
+.sep{color:#666;margin:0 8px}
 </style></head>
 <body>
-<div id="bar"><b>__TITLE__</b> &nbsp;&nbsp; ref frame: __BUTTONS__
-  <span class="lg">&nbsp; (height-colored = static, <span style="color:#e63946">red</span> = dynamic)</span>
+<div id="bar"><b>__TITLE__</b> <span class="sep">|</span> ref frame: <span id="frames"></span>
+  <span class="sep">|</span> layers: <span id="layers"></span>
   <span id="info" class="lg"></span></div>
 <div id="plot"></div>
 <script>
 var TRACES = __TRACES__;
 var LABELS = __LABELS__;
-var NPER = __NPER__;
-var NF = LABELS.length;
-var layout = {paper_bgcolor:'#111',showlegend:false,margin:{l:0,r:0,t:0,b:0},
+var TAG = __TAG__;          // [frame_index, layer_name] per trace
+var LAYERS = __LAYERS__;
+var OFF = __OFF__;          // layers that start hidden
+var cur = 0, on = {};
+LAYERS.forEach(function(l){on[l] = OFF.indexOf(l) < 0;});
+var layout = {paper_bgcolor:'#111',showlegend:true,margin:{l:0,r:0,t:0,b:0},
+  legend:{font:{color:'#ccc'}},
   scene:{aspectmode:'data',bgcolor:'#111',
     xaxis:{color:'#777',title:'x'},yaxis:{color:'#777',title:'y'},zaxis:{color:'#777',title:'z'}}};
 Plotly.newPlot('plot',TRACES,layout,{responsive:true});
-function showFrame(i){
-  var vis=[];
-  for(var k=0;k<NF;k++){for(var p=0;p<NPER;p++){vis.push(k===i);}}
-  Plotly.restyle('plot','visible',vis);
-  var bs=document.getElementsByClassName('fbtn');
-  for(var b=0;b<bs.length;b++){bs[b].className='fbtn'+(b===i?' active':'');}
-  document.getElementById('info').textContent='  showing '+LABELS[i];
+function refresh(){
+  Plotly.restyle('plot','visible',TAG.map(function(t){return t[0]===cur && on[t[1]];}));
+  document.querySelectorAll('.fbtn').forEach(function(b,i){
+    b.className='fbtn'+(i===cur?' active':'');});
+  document.querySelectorAll('.lbtn').forEach(function(b){
+    b.className='lbtn'+(on[b.dataset.l]?' active':'');});
+  document.getElementById('info').textContent='   '+LABELS[cur];
 }
-showFrame(0);
+LABELS.forEach(function(lb,i){
+  var e=document.createElement('button'); e.className='fbtn'; e.textContent=(i+1);
+  e.onclick=function(){cur=i;refresh();}; document.getElementById('frames').appendChild(e);});
+LAYERS.forEach(function(l){
+  var e=document.createElement('button'); e.className='lbtn'; e.dataset.l=l; e.textContent=l;
+  e.onclick=function(){on[l]=!on[l];refresh();}; document.getElementById('layers').appendChild(e);});
+refresh();
 </script></body></html>"""
+
+# layer names shared by both viewers
+L_STATIC = "gaussians (static)"
+L_DYN = "gaussians (dynamic)"
+L_BOX = "bbox"
+L_INPUT = "input LiDAR (2 endpoints)"
+L_GT = "GT LiDAR @ target t"
+
+
+def _point_trace(xyz, color, size, name, sub=120000, seed=0):
+    """Raw-LiDAR scatter trace (subsampled so a 4-frame page stays loadable)."""
+    xyz = np.asarray(xyz, np.float32).reshape(-1, 3)
+    if xyz.shape[0] > sub:
+        xyz = xyz[np.random.default_rng(seed).choice(xyz.shape[0], sub, replace=False)]
+    xyz = np.round(xyz, 2)
+    return {"type": "scatter3d", "mode": "markers",
+            "x": xyz[:, 0].tolist(), "y": xyz[:, 1].tolist(), "z": xyz[:, 2].tolist(),
+            "marker": {"size": size, "color": color, "opacity": 0.75},
+            "name": name, "visible": False, "hoverinfo": "skip"}
+
+
+def _render(path, title, labels, traces, tags, layers, off):
+    html = (_HTML
+            .replace("__TITLE__", str(title))
+            .replace("__TRACES__", json.dumps(traces))
+            .replace("__TAG__", json.dumps(tags))
+            .replace("__LABELS__", json.dumps(labels))
+            .replace("__LAYERS__", json.dumps(layers))
+            .replace("__OFF__", json.dumps(off)))
+    Path(path).write_text(html)
+    return path
 
 
 def save_sequence_html(path, title: str, frames: list, point_size: float = 1.6):
-    """frames: list of {"label": str, "static": [N,3], "dynamic": [M,3]} (numpy)."""
-    traces = []
+    """frames: list of {"label", "static" [N,3], "dynamic" [M,3],
+    optional "input_points" [P,3] and "gt_points" [Q,3]} (numpy, ref frame).
+
+    The raw-LiDAR layers are what make the Gaussian centres readable: without
+    them you cannot tell a misplaced centre from a correctly placed one.
+    """
+    traces, tags = [], []
     for fi, fr in enumerate(frames):
-        s = np.asarray(fr["static"], dtype=np.float32)
-        d = np.asarray(fr["dynamic"], dtype=np.float32)
-        s = np.round(s, 2)
-        d = np.round(d, 2)
+        s = np.round(np.asarray(fr["static"], np.float32), 2)
+        d = np.round(np.asarray(fr["dynamic"], np.float32), 2)
         traces.append({
             "type": "scatter3d", "mode": "markers",
             "x": s[:, 0].tolist(), "y": s[:, 1].tolist(), "z": s[:, 2].tolist(),
             "marker": {"size": point_size, "color": s[:, 2].tolist(),
                        "colorscale": "Viridis", "opacity": 0.8},
-            "name": f"{fr['label']} static", "visible": fi == 0, "hoverinfo": "skip",
-        })
+            "name": L_STATIC, "visible": False, "hoverinfo": "skip"})
+        tags.append([fi, L_STATIC])
         traces.append({
             "type": "scatter3d", "mode": "markers",
             "x": d[:, 0].tolist(), "y": d[:, 1].tolist(), "z": d[:, 2].tolist(),
             "marker": {"size": point_size + 1.8, "color": "#e63946", "opacity": 0.95},
-            "name": f"{fr['label']} dynamic", "visible": fi == 0, "hoverinfo": "skip",
-        })
+            "name": L_DYN, "visible": False, "hoverinfo": "skip"})
+        tags.append([fi, L_DYN])
+        traces.append(_point_trace(fr.get("input_points", np.zeros((0, 3))),
+                                   "#9aa0a6", 1.2, L_INPUT))
+        tags.append([fi, L_INPUT])
+        traces.append(_point_trace(fr.get("gt_points", np.zeros((0, 3))),
+                                   "#f4a261", 1.3, L_GT))
+        tags.append([fi, L_GT])
 
-    buttons = " ".join(
-        f'<button class="fbtn" onclick="showFrame({fi})">{fi + 1}</button>'
-        for fi in range(len(frames))
-    )
-    html = (_HTML
-            .replace("__TITLE__", str(title))
-            .replace("__BUTTONS__", buttons)
-            .replace("__NPER__", "2")
-            .replace("__TRACES__", json.dumps(traces))
-            .replace("__LABELS__", json.dumps([fr["label"] for fr in frames])))
-    Path(path).write_text(html)
-    return path
+    return _render(path, title, [fr["label"] for fr in frames], traces, tags,
+                   [L_STATIC, L_DYN, L_INPUT, L_GT], off=[L_INPUT])
 
 
 # ===========================================================================
@@ -255,23 +296,23 @@ def _box_trace(boxes, visible, name):
 
 
 def save_sequence_surfel_html(path, title: str, frames: list):
-    """frames: list of {"label", "static": (V,F), "dynamic": (V,F), "boxes": [M,7]}."""
-    traces = []
+    """frames: list of {"label", "static": (V,F), "dynamic": (V,F), "boxes": [M,7],
+    optional "input_points" [P,3] and "gt_points" [Q,3]}."""
+    traces, tags = [], []
     for fi, fr in enumerate(frames):
-        traces.append(_mesh_trace(fr["static"], True, fi == 0,
-                                  f"{fr['label']} static", 0.65))
-        traces.append(_mesh_trace(fr["dynamic"], False, fi == 0,
-                                  f"{fr['label']} dynamic", 0.9, red=True))
-        traces.append(_box_trace(fr.get("boxes", np.zeros((0, 7))), fi == 0,
-                                 f"{fr['label']} bbox"))
-    buttons = " ".join(
-        f'<button class="fbtn" onclick="showFrame({fi})">{fi + 1}</button>'
-        for fi in range(len(frames)))
-    html = (_HTML
-            .replace("__TITLE__", str(title) + " — 1σ surfels")
-            .replace("__BUTTONS__", buttons)
-            .replace("__NPER__", "3")
-            .replace("__TRACES__", json.dumps(traces))
-            .replace("__LABELS__", json.dumps([fr["label"] for fr in frames])))
-    Path(path).write_text(html)
-    return path
+        traces.append(_mesh_trace(fr["static"], True, False, L_STATIC, 0.65))
+        tags.append([fi, L_STATIC])
+        traces.append(_mesh_trace(fr["dynamic"], False, False, L_DYN, 0.9, red=True))
+        tags.append([fi, L_DYN])
+        traces.append(_box_trace(fr.get("boxes", np.zeros((0, 7))), False, L_BOX))
+        tags.append([fi, L_BOX])
+        traces.append(_point_trace(fr.get("input_points", np.zeros((0, 3))),
+                                   "#9aa0a6", 1.2, L_INPUT))
+        tags.append([fi, L_INPUT])
+        traces.append(_point_trace(fr.get("gt_points", np.zeros((0, 3))),
+                                   "#f4a261", 1.3, L_GT))
+        tags.append([fi, L_GT])
+
+    return _render(path, str(title) + " — 1σ surfels",
+                   [fr["label"] for fr in frames], traces, tags,
+                   [L_STATIC, L_DYN, L_BOX, L_INPUT, L_GT], off=[L_INPUT])
