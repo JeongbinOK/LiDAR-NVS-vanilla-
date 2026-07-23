@@ -11,7 +11,7 @@ loss:
   w_depth_median: 0.0   # 미사용 (median은 total에 들어가지 않음)
   w_intensity: 0.2
   w_raydrop: 0.5
-  w_scale: 0.02          # softplus scale의 5m 초과분만 규제; 0.0이면 비활성화
+  w_scale: 0.02          # softplus max scale>2.5m인 위반 Gaussian만 평균; 0.0이면 비활성화
   enable_lpips: false
 
 metrics:

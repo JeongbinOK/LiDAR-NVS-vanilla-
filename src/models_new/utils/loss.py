@@ -138,12 +138,14 @@ class Loss(nn.Module):
         return score
 
     def _scale_regularization(self, gaussians, reference):
-        """Penalize only activated Gaussian semi-axes larger than 5 meters.
+        """Penalize only Gaussians exceeding ``SCALE_REG_MAX_M``.
 
-        The penalty is a squared log-ratio, averaged per sample and then over
-        the batch.  This keeps the loss independent of the number of Gaussians
-        in each sample and avoids the extreme gradients of a meter-space
-        squared hinge.  ``w_scale=0`` is a true off switch and does not require
+        The squared log-ratio is averaged over violating Gaussians in each
+        violating sample, then over only those samples. Non-violating Gaussians
+        and samples therefore contribute neither gradients nor reduction
+        denominator. This keeps the per-sample loss independent of the number
+        of valid Gaussians and avoids the extreme gradients of a meter-space
+        squared hinge. ``w_scale=0`` is a true off switch and does not require
         Gaussian tensors to be passed.
         """
         if self.w_scale == 0.0:
@@ -156,6 +158,7 @@ class Loss(nn.Module):
             raise ValueError("Could not find batch Gaussian outputs for scale regularization")
 
         sample_losses = []
+        connected_zero = reference.new_zeros(())
         for batch_item in gaussians:
             if batch_item is None:
                 continue
@@ -164,16 +167,19 @@ class Loss(nn.Module):
                 raise KeyError("Gaussian output is missing 'scaling'")
             if raw_scale.shape[0] == 0:
                 continue
+            connected_zero = connected_zero + raw_scale.sum() * 0.0
             scales = F.softplus(raw_scale[:, :2])
             max_scale = scales.amax(dim=-1)
             excess = F.relu(
                 torch.log(max_scale.clamp_min(1e-6))
                 - max_scale.new_tensor(SCALE_REG_MAX_M).log()
             )
-            sample_losses.append(excess.square().mean())
+            violated = excess > 0
+            if violated.any():
+                sample_losses.append(excess[violated].square().mean())
 
         if not sample_losses:
-            return reference.new_zeros(())
+            return connected_zero
         return torch.stack(sample_losses).mean()
 
     def forward(
