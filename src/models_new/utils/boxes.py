@@ -112,11 +112,12 @@ def point_in_box(points: Tensor, boxes: Tensor) -> Tensor:
         (dz.abs()      <= h.unsqueeze(0) / 2)
     )  # (N, B_f)
 
-    box_idx = torch.full((N,), -1, dtype=torch.long, device=points.device)
-    for b in range(B_f):
-        mask = inside[:, b] & (box_idx == -1)
-        box_idx[mask] = b
-    return box_idx
+    # ``argmax`` returns the first maximum, preserving the existing lowest-box
+    # tie break without launching one masked-assignment kernel per box.  Rows
+    # with no match need an explicit guard because argmax would return 0 there.
+    has_match = inside.any(dim=1)
+    first_match = inside.to(dtype=torch.uint8).argmax(dim=1).long()
+    return torch.where(has_match, first_match, torch.full_like(first_match, -1))
 
 
 def common_instance_ids(first_ids, last_ids) -> set:
