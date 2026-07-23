@@ -452,6 +452,46 @@ def test_background_excludes_same_frame_and_no_match_keeps_normalized_query():
     torch.testing.assert_close(out[1:3], expected[1:3], rtol=0.0, atol=0.0)
 
 
+def test_temporal_aggregator_runs_without_seeds_for_spherical_reuse():
+    torch.manual_seed(5)
+    aggregator = GridTemporalAggregator(_cfg(), dim=ATTN_DIM, r_far=80.0).eval()
+    anchor = torch.tensor([
+        [0.0, 0.0, 0.0], [20.0, 0.0, 0.0], [20.1, 0.0, 0.0],
+        [0.4, 0.0, 0.0],
+    ])
+    feat = torch.randn(4, ATTN_DIM)
+    offset = torch.tensor([3, 4])
+    frame_batch = torch.tensor([0, 0])
+    pose, bbox, bbox_iids, timestamps = _empty_scene(2)
+    seed, delta = _seed_inputs(anchor)
+
+    out_seeded, coord_seeded, _, _, _ = aggregator(
+        feat, anchor, seed, delta, offset, frame_batch,
+        pose, bbox, bbox_iids, timestamps,
+    )
+    out_none, coord_none, seed_none, delta_none, meta = aggregator(
+        feat, anchor, None, None, offset, frame_batch,
+        pose, bbox, bbox_iids, timestamps,
+    )
+
+    # Seed geometry is grid-only; the fused features and coordinates that the
+    # spherical head consumes must not depend on its presence.
+    assert seed_none is None and delta_none is None
+    assert meta["seed_ref"] is None
+    torch.testing.assert_close(out_none, out_seeded, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(coord_none, coord_seeded, rtol=0.0, atol=0.0)
+
+    try:
+        aggregator(
+            feat, anchor, None, delta, offset, frame_batch,
+            pose, bbox, bbox_iids, timestamps,
+        )
+    except ValueError as error:
+        assert "delta_sensor requires seed_sensor" in str(error)
+    else:
+        raise AssertionError("delta_sensor without seed_sensor was accepted")
+
+
 def test_background_seeds_and_delta_use_each_tokens_own_frame_pose():
     aggregator = GridTemporalAggregator(_cfg(), dim=ATTN_DIM, r_far=80.0).eval()
     anchor = torch.tensor([[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
