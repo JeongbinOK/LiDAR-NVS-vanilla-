@@ -41,9 +41,13 @@ from src.eval.gaussian_viz import (
     surfels_from_output, save_sequence_surfel_html,
 )
 from src.eval.gaussian_stats import collect_window_stats, analyze_gaussian_sizes
+from src.models_new.utils.graphics_utils import lidar4d_range_image_to_points
 from src.models_new.utils.render import visualize_depth
 
-CONFIG_PATH = "/data1/jeongbin/utonia/config/nuscene_train.yaml"
+CONFIG_PATH = os.environ.get(
+    "UTONIA_CONFIG_PATH",
+    "/data1/jeongbin/utonia/config/nuscene_train.yaml",
+)
 RAYDROP_THRESHOLD = 0.5
 
 
@@ -88,6 +92,26 @@ def _viz_depth_black_holes(depth_1hw, near=2, far=50):
 def _binary_raydrop(raydrop, threshold=RAYDROP_THRESHOLD):
     """Return 1 for predicted/GT drop and 0 for non-drop (keep)."""
     return (raydrop > float(threshold)).to(raydrop.dtype)
+
+
+def prediction_points_ref(depth, raydrop, camera):
+    """Back-project raydrop-kept prediction ranges into the Gaussian ref frame.
+
+    ``lidar4d_range_image_to_points`` returns points in the target panorama's
+    swapped camera frame.  The surfel meshes and raw LiDAR overlays live in the
+    window's frame-0 reference coordinates, so apply the camera-to-ref matrix
+    before serializing the point trace.
+    """
+    points_camera = lidar4d_range_image_to_points(
+        depth,
+        camera.vfov,
+        camera.hfov,
+        row_to_theta=camera.row_to_theta,
+        raydrop=raydrop,
+        raydrop_threshold=RAYDROP_THRESHOLD,
+    )
+    c2w = camera.c2w.to(device=points_camera.device, dtype=points_camera.dtype)
+    return points_camera @ c2w[:3, :3].T + c2w[:3, 3]
 
 
 def save_viz(
@@ -186,6 +210,7 @@ def main(cfg):
 
         gt_cam = gt["cameras"][b][target_cam]
         row_to_theta = gt_cam.row_to_theta
+        pred_pts = prediction_points_ref(depth, raydrop, gt_cam).detach().cpu().numpy()
 
         wm = {
             "seq_name": seq_name,
@@ -224,7 +249,8 @@ def main(cfg):
         seq_surfel[seq_name].append({
             "label": f"T={target_s}s", "static": surf["static"],
             "dynamic": surf["dynamic"], "boxes": surf["boxes"],
-            "input_points": in_pts, "gt_points": gt_pts})
+            "input_points": in_pts, "gt_points": gt_pts,
+            "pred_points": pred_pts})
 
         # per-window Gaussian-size statistics (effective radius vs geometry)
         st = collect_window_stats(model.g2p_model, out[b], float(gt_cam.timestamp))

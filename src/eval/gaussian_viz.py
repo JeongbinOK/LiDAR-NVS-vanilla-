@@ -93,6 +93,7 @@ L_DYN = "gaussians (dynamic)"
 L_BOX = "bbox"
 L_INPUT = "input LiDAR (2 endpoints)"
 L_GT = "GT LiDAR @ target t"
+L_PRED = "predicted LiDAR (raydrop kept)"
 
 
 def _point_trace(xyz, color, size, name, sub=120000, seed=0):
@@ -297,7 +298,8 @@ def _box_trace(boxes, visible, name):
 
 def save_sequence_surfel_html(path, title: str, frames: list):
     """frames: list of {"label", "static": (V,F), "dynamic": (V,F), "boxes": [M,7],
-    optional "input_points" [P,3] and "gt_points" [Q,3]}."""
+    optional "input_points" [P,3], "gt_points" [Q,3], and
+    "pred_points" [R,3]} (all point sets in the Gaussian ref frame)."""
     traces, tags = [], []
     for fi, fr in enumerate(frames):
         traces.append(_mesh_trace(fr["static"], True, False, L_STATIC, 0.65))
@@ -312,7 +314,10 @@ def save_sequence_surfel_html(path, title: str, frames: list):
         traces.append(_point_trace(fr.get("gt_points", np.zeros((0, 3))),
                                    "#f4a261", 1.3, L_GT))
         tags.append([fi, L_GT])
+        traces.append(_point_trace(fr.get("pred_points", np.zeros((0, 3))),
+                                   "#00d4ff", 1.3, L_PRED))
+        tags.append([fi, L_PRED])
 
     return _render(path, str(title) + " — 1σ surfels",
                    [fr["label"] for fr in frames], traces, tags,
-                   [L_STATIC, L_DYN, L_BOX, L_INPUT, L_GT], off=[L_INPUT])
+                   [L_STATIC, L_DYN, L_BOX, L_INPUT, L_GT, L_PRED], off=[L_INPUT])
