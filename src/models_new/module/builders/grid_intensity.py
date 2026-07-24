@@ -79,7 +79,16 @@ class OccupiedGridTokenBuilder(nn.Module):
                 raise ValueError("p2g.grid_query.K_max must be positive")
             if points_per_gaussian <= 0:
                 raise ValueError("p2g.grid_query.points_per_gaussian must be positive")
-            self.grid_seed_config = (points_per_gaussian, k_max)
+            exp = getattr(grid_query, "exp", None)
+            if exp is not None:
+                exp = int(exp)
+                if exp not in (1, 2):
+                    raise ValueError("p2g.grid_query.exp must be null, 1, or 2")
+                if exp > k_max:
+                    raise ValueError(
+                        f"p2g.grid_query.exp={exp} requires K_max >= {exp}"
+                    )
+            self.grid_seed_config = (points_per_gaussian, k_max, exp)
         (
             self.intensity_mode,
             self.intensity_encoder,
@@ -121,11 +130,11 @@ class OccupiedGridTokenBuilder(nn.Module):
                 upos, ufeat, int5, occ, raw_count, membership = result
                 membership_list.append(membership)
             else:
-                points_per_gaussian, k_max = self.grid_seed_config
+                points_per_gaussian, k_max, exp = self.grid_seed_config
                 result = aggregate_points_to_cells_with_seeds(
                     xyz, inten, grid_coord_list[i], feat_list[i],
                     coord_list[i], origins[i], mapper,
-                    points_per_gaussian, k_max,
+                    points_per_gaussian, k_max, exp=exp,
                 )
                 upos, ufeat, int5, occ, raw_count, seed_data = result
                 seed_data_list.append(seed_data)

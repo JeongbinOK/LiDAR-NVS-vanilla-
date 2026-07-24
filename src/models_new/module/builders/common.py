@@ -118,6 +118,15 @@ class UtoniaGridMapper:
         return (points - metric_origin.unsqueeze(0)) / self.feature_grid_size
 
 
+def _cell_centers(grid_coord, occupied, metric_origin, mapper, dtype):
+    """Geometric centers for the compact occupied-token row order."""
+    occupied_index = occupied.nonzero(as_tuple=True)[0]
+    return (
+        (grid_coord[occupied_index].to(dtype) + 0.5) * mapper.feature_grid_size
+        + metric_origin.to(device=grid_coord.device, dtype=dtype).unsqueeze(0)
+    )
+
+
 def _r_quantile_seed_data(points, cell_idx, counts, grid_coord, occupied,
                           metric_origin, mapper, points_per_gaussian, k_max):
     """Select deterministic range-quantile points for each occupied cell."""
@@ -151,12 +160,71 @@ def _r_quantile_seed_data(points, cell_idx, counts, grid_coord, occupied,
     sorted_row = starts[occupied_index].view(-1, 1) + rank
     seeds[valid] = sorted_points[sorted_row[valid]]
 
-    cell_center = (
-        (grid_coord[occupied_index].to(points.dtype) + 0.5)
-        * mapper.feature_grid_size
-        + metric_origin.to(device=points.device, dtype=points.dtype).unsqueeze(0)
+    cell_center = _cell_centers(
+        grid_coord, occupied, metric_origin, mapper, points.dtype
     )
     delta[valid] = seeds[valid] - cell_center[:, None, :].expand_as(seeds)[valid]
+    return GridSeedData(seeds, delta, anchor_k)
+
+
+def _medoid_seed_data(points, cell_idx, counts, grid_coord, occupied,
+                      metric_origin, mapper, k_max):
+    """One observed centroid-medoid seed per occupied token.
+
+    The seed is the raw point nearest its token's Cartesian raw-point mean.
+    This is the same deterministic, observed-point medoid convention used by
+    the spherical query path.  It avoids an O(n^2) exact pairwise-medoid cost
+    while retaining a surface-supported seed even for sparse cells.
+    """
+    occupied_index = occupied.nonzero(as_tuple=True)[0]
+    num_cells = occupied_index.numel()
+    seeds = points.new_zeros((num_cells, k_max, 3))
+    delta = points.new_zeros((num_cells, k_max, 3))
+    anchor_k = torch.ones(num_cells, dtype=torch.long, device=points.device)
+    if num_cells == 0:
+        return GridSeedData(seeds, delta, anchor_k)
+
+    count_long = counts.long()
+    point_sum = points.new_zeros((counts.numel(), 3))
+    point_sum.index_add_(0, cell_idx, points)
+    point_mean = point_sum / count_long.clamp_min(1).to(points.dtype).unsqueeze(-1)
+    distance2 = ((points - point_mean[cell_idx]) ** 2).sum(dim=-1)
+    distance_key = torch.round(distance2 * 1.0e6)
+
+    # Stable least-to-most-significant sorting gives (cell, distance, x, y, z).
+    order = torch.arange(points.shape[0], device=points.device)
+    for value in (points[:, 2], points[:, 1], points[:, 0], distance_key, cell_idx):
+        order = order[torch.argsort(value[order], stable=True)]
+    starts = torch.cumsum(count_long, dim=0) - count_long
+    seeds[:, 0] = points[order[starts[occupied_index]]]
+
+    cell_center = _cell_centers(
+        grid_coord, occupied, metric_origin, mapper, points.dtype
+    )
+    delta[:, 0] = seeds[:, 0] - cell_center
+    return GridSeedData(seeds, delta, anchor_k)
+
+
+def _token_position_seed_data(token_position, grid_coord, occupied,
+                              metric_origin, mapper, k_max):
+    """Two identical token-coordinate seeds per occupied token.
+
+    Their slot identity is the output order of the K=2 joint head: slot 0 and
+    slot 1 own distinct parameter (including offset) blocks, so they start at
+    the same coordinate but learn independent displacement predictions.
+    """
+    if k_max < 2:
+        raise ValueError("p2g.grid_query.exp=2 requires K_max >= 2")
+    num_cells = token_position.shape[0]
+    seeds = token_position.new_zeros((num_cells, k_max, 3))
+    delta = token_position.new_zeros((num_cells, k_max, 3))
+    anchor_k = torch.full((num_cells,), 2, dtype=torch.long, device=token_position.device)
+    seeds[:, :2] = token_position[:, None, :]
+
+    cell_center = _cell_centers(
+        grid_coord, occupied, metric_origin, mapper, token_position.dtype
+    )
+    delta[:, :2] = seeds[:, :2] - cell_center[:, None, :]
     return GridSeedData(seeds, delta, anchor_k)
 
 
@@ -260,10 +328,24 @@ def _aggregate_points_to_cells(points_xyz, intensity, grid_coord, voxel_feats,
             token_index=full_to_compact[cell_idx],
         ),)
     if seed_config is not None:
-        seed_data = _r_quantile_seed_data(
-            pts, cell_idx, counts, grid_coord, occ, metric_origin, mapper,
-            points_per_gaussian=int(seed_config[0]), k_max=int(seed_config[1]),
-        )
+        points_per_gaussian, k_max, exp = seed_config
+        if exp is None:
+            seed_data = _r_quantile_seed_data(
+                pts, cell_idx, counts, grid_coord, occ, metric_origin, mapper,
+                points_per_gaussian=int(points_per_gaussian), k_max=int(k_max),
+            )
+        elif exp == 1:
+            seed_data = _medoid_seed_data(
+                pts, cell_idx, counts, grid_coord, occ, metric_origin, mapper,
+                k_max=int(k_max),
+            )
+        elif exp == 2:
+            seed_data = _token_position_seed_data(
+                util_pos[occ], grid_coord, occ, metric_origin, mapper,
+                k_max=int(k_max),
+            )
+        else:
+            raise ValueError(f"Unsupported grid seed experiment exp={exp!r}")
         result = result + (seed_data,)
     return result
 
@@ -291,11 +373,16 @@ def aggregate_points_to_cells_with_membership(
 
 def aggregate_points_to_cells_with_seeds(
     points_xyz, intensity, grid_coord, voxel_feats, voxel_coord, metric_origin,
-    mapper, points_per_gaussian, k_max,
+    mapper, points_per_gaussian, k_max, exp=None,
 ):
-    """Aggregate raw points and construct padded grid-mode seed tensors."""
+    """Aggregate raw points and construct padded grid-mode seed tensors.
+
+    ``exp=None`` retains raw-count-driven range-quantile slots. ``exp=1``
+    emits one raw-point medoid per token; ``exp=2`` emits two identical
+    token-coordinate seeds whose independently predicted offsets separate them.
+    """
     return _aggregate_points_to_cells(
         points_xyz, intensity, grid_coord, voxel_feats,
         voxel_coord, metric_origin, mapper,
-        seed_config=(points_per_gaussian, k_max),
+        seed_config=(points_per_gaussian, k_max, exp),
     )

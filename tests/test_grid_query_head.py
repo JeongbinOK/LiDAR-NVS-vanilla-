@@ -62,7 +62,7 @@ class _UnitMapper:
         return input_coord.new_zeros(3)
 
 
-def _aggregate_seed_cell(points, points_per_gaussian, k_max=3, voxel_coord=None):
+def _aggregate_seed_cell(points, points_per_gaussian, k_max=3, voxel_coord=None, exp=None):
     intensity = torch.arange(1, points.shape[0] + 1, dtype=points.dtype)
     grid_coord = torch.tensor([[0, 0, 0]])
     voxel_feature = torch.tensor([[3.0, 4.0]])
@@ -70,7 +70,7 @@ def _aggregate_seed_cell(points, points_per_gaussian, k_max=3, voxel_coord=None)
         voxel_coord = torch.tensor([[0.5, 0.5, 0.5]])
     return aggregate_points_to_cells_with_seeds(
         points, intensity, grid_coord, voxel_feature, voxel_coord,
-        torch.zeros(3), _UnitMapper(), points_per_gaussian, k_max,
+        torch.zeros(3), _UnitMapper(), points_per_gaussian, k_max, exp=exp,
     )
 
 
@@ -79,10 +79,10 @@ def _seed_inputs(anchor, k_max=1):
     return seed, torch.zeros_like(seed)
 
 
-def _builder_cfg(anchor_mode):
+def _builder_cfg(anchor_mode, **grid_overrides):
     return SimpleNamespace(
         anchor_mode=anchor_mode,
-        grid_query=_cfg(),
+        grid_query=_cfg(**grid_overrides),
         intensity_encoder=SimpleNamespace(type="mlp"),
         int_proj=SimpleNamespace(in_dim=5, out_dim=4),
         r_far=80.0,
@@ -213,6 +213,45 @@ def test_r_quantile_seeds_for_k1_k2_k3():
     torch.testing.assert_close(seed_k3[0], points[[1, 3, 5]])
     torch.testing.assert_close(seed_k1[0, 1:], torch.zeros(2, 3))
     torch.testing.assert_close(seed_k2[0, 2], torch.zeros(3))
+
+
+def test_exp1_uses_one_observed_centroid_medoid_per_token_independent_of_raw_count():
+    points = torch.tensor([
+        [0.05, 0.1, 0.1], [0.15, 0.1, 0.1], [0.25, 0.1, 0.1],
+        [0.35, 0.1, 0.1], [0.45, 0.1, 0.1],
+    ])
+    seed_data = _aggregate_seed_cell(
+        points, points_per_gaussian=1, k_max=3, exp=1
+    )[-1]
+
+    # The mean is x=0.25, so the observed medoid is that raw point, not a
+    # synthetic cell center or an extra raw-count-driven slot.
+    assert seed_data.anchor_k.tolist() == [1]
+    torch.testing.assert_close(seed_data.seed_sensor[0, 0], points[2])
+    torch.testing.assert_close(seed_data.seed_sensor[0, 1:], torch.zeros(2, 3))
+
+
+def test_exp2_uses_two_identical_token_coordinate_seeds_with_two_slots():
+    points = torch.tensor([[0.1, 0.1, 0.1], [0.9, 0.1, 0.1]])
+    token_coord = torch.tensor([[0.2, 0.3, 0.4]])
+    seed_data = _aggregate_seed_cell(
+        points, points_per_gaussian=99, k_max=3, voxel_coord=token_coord, exp=2
+    )[-1]
+
+    assert seed_data.anchor_k.tolist() == [2]
+    torch.testing.assert_close(seed_data.seed_sensor[0, :2], token_coord.expand(2, -1))
+    torch.testing.assert_close(
+        seed_data.delta_sensor[0, :2],
+        (token_coord - torch.tensor([[0.5, 0.5, 0.5]])).expand(2, -1),
+    )
+    torch.testing.assert_close(seed_data.seed_sensor[0, 2], torch.zeros(3))
+
+
+def test_grid_builder_exp_switches_only_grid_seed_construction():
+    grid_builder = OccupiedGridTokenBuilder(_builder_cfg("grid", exp=2))
+    assert grid_builder.grid_seed_config == (4, 3, 2)
+    spherical_builder = OccupiedGridTokenBuilder(_builder_cfg("spherical", exp=2))
+    assert spherical_builder.grid_seed_config is None
 
 
 def test_equal_range_ties_use_xyz_order_and_ignore_input_permutation():

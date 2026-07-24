@@ -102,6 +102,8 @@ p2g:
                                 # grid mode 전용 joint K-head 설정(K_max/points_per_gaussian/grad_balance)
     K_max: 3                    # maximum Gaussians emitted by one occupied 0.4m cell
     points_per_gaussian: 4      # K_i = ceil(own-frame raw_count / this), capped by K_max
+    exp: null                   # null: raw_count-driven range-quantile K_i (default);
+                                # 1: one raw-point medoid/token; 2: two token-coordinate seeds/token
     bg_radius_m: 0.8
     bg_max_kv_per_frame: 8
     num_heads: 8
