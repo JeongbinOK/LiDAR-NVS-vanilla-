@@ -192,12 +192,13 @@ class GausRender(nn.Module):
                 gt_raydrop = 1.0 - (gt_depth > 0).float()
 
 
-                # LiDAR4D CD protocol: hard-mask predicted no-return rays at
+                # Chamfer supervision: hard-mask predicted no-return rays at
                 # 0.5, discard target-sensor ranges >=80 m, and back-project
-                # the remaining mean depths. The hard masks are detached inside
-                # the helper, while gradients still flow to retained depths.
+                # the remaining median depths. The hard masks are detached
+                # inside the helper, while gradients still flow to retained
+                # depths.
                 render_points = lidar4d_range_image_to_points(
-                    render_pkg["depth"],
+                    render_pkg["depth_median"],
                     gt_cam.vfov,
                     gt_cam.hfov,
                     row_to_theta=gt_cam.row_to_theta,

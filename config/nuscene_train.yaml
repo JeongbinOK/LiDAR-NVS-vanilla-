@@ -7,8 +7,8 @@ mode: train
 
 loss:
   w_chamfer: 0.02
-  w_depth: 1.0          # mean depth only (median은 학습 제외, detached metric)
-  w_depth_median: 0.0   # 미사용 (median은 total에 들어가지 않음)
+  w_depth: 0.5          # depth supervision = 0.5 * mean-depth L1
+  w_depth_median: 0.5   #                   + 0.5 * median-depth L1
   w_intensity: 0.2
   w_raydrop: 0.5
   w_scale: 0.02          # softplus max scale>2.5m인 위반 Gaussian만 평균; 0.0이면 비활성화
