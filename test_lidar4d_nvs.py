@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 from collections import defaultdict
 from pathlib import Path
 
@@ -49,6 +50,7 @@ CONFIG_PATH = os.environ.get(
     "/data1/jeongbin/utonia/config/nuscene_train.yaml",
 )
 RAYDROP_THRESHOLD = 0.5
+EVAL_MAX_DEPTH_M = 80.0
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +111,7 @@ def prediction_points_ref(depth, raydrop, camera):
         row_to_theta=camera.row_to_theta,
         raydrop=raydrop,
         raydrop_threshold=RAYDROP_THRESHOLD,
+        max_range=EVAL_MAX_DEPTH_M,
     )
     c2w = camera.c2w.to(device=points_camera.device, dtype=points_camera.dtype)
     return points_camera @ c2w[:3, :3].T + c2w[:3, 3]
@@ -155,14 +158,34 @@ def summarize(window_metrics):
 # ---------------------------------------------------------------------------
 @torch.no_grad()
 def main(cfg):
+    seed = int(cfg.get("seed", 0))
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
     device = f"cuda:{int(cfg.device[0])}" if len(cfg.device) else "cuda:0"
     torch.cuda.set_device(device)
     out_dir = Path(str(cfg.get("out_dir", os.path.join(cfg.logger.dir, "lidar4d_eval"))))
     viz_dir = out_dir / "viz"
     viz_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[setup] device={device} mode={cfg.data.mode} out_dir={out_dir}")
+    print(
+        f"[setup] device={device} seed={seed} "
+        f"mode={cfg.data.mode} out_dir={out_dir}"
+    )
     print("[setup] scale_factor=1.0 (depth already in meters; GS-LiDAR rescale N/A)")
+    depth_statistic = str(cfg.get("depth_statistic", "median")).lower()
+    depth_key = {"mean": "depth", "median": "depth_median"}.get(depth_statistic)
+    if depth_key is None:
+        raise ValueError(
+            "depth_statistic must be one of {'mean', 'median'}, got "
+            f"{depth_statistic!r}"
+        )
+    print(
+        f"[setup] depth_statistic={depth_statistic} "
+        f"metric_clamp=[1e-6,{EVAL_MAX_DEPTH_M:g}]m"
+    )
 
     model = load_model(cfg, cfg.test.ckpt_path, device)
     backends = MetricBackends(lpips_net="alex")
@@ -196,7 +219,10 @@ def main(cfg):
         renders = model.g2p_model(out, gt)
 
         b = 0
-        depth = renders["depth"][b, target_cam]            # [1,H,W]
+        # Keep the image metrics, point metrics, PNGs, and predicted LiDAR HTML
+        # on the same renderer statistic. This evaluator defaults to median
+        # depth; pass depth_statistic=mean for an explicit ablation.
+        depth = renders[depth_key][b, target_cam]           # [1,H,W]
         intensity = renders["intensity_sh"][b, target_cam]
         raydrop = renders["raydrop"][b, target_cam]
         gt_depth = renders["gt_depth"][b, target_cam]
@@ -217,13 +243,21 @@ def main(cfg):
             "target_s": target_s,
             "scene": scene,
             "nuscenes_split": nuscenes_split,
-            "depth": depth_errors(depth_keep, gt_depth, backends),
+            # GS-LiDAR-style capped range-image metric: no-return stays zero
+            # until depth_errors maps it to epsilon, while positive Pred/GT
+            # returns above 80 m saturate at 80 m.
+            "depth": depth_errors(
+                depth_keep, gt_depth, backends,
+                max_depth=EVAL_MAX_DEPTH_M,
+            ),
             "intensity": intensity_errors(intensity_keep, gt_intensity, backends),
             "raydrop": raydrop_errors(
                 raydrop, gt_raydrop, ratio=RAYDROP_THRESHOLD
             ),
-            "points": point_metrics(depth_keep, gt_depth, row_to_theta, backends,
-                                    vfov=vfov),
+            "points": point_metrics(
+                depth_keep, gt_depth, row_to_theta, backends,
+                vfov=vfov, far=EVAL_MAX_DEPTH_M,
+            ),
         }
         window_metrics.append(wm)
         save_viz(viz_dir / f"{seq_name}_T{target_s}s.png",
@@ -301,6 +335,10 @@ def main(cfg):
     payload = {
         "config": {"ckpt": cfg.test.ckpt_path, "mode": cfg.data.mode,
                    "version": cfg.data.version, "scale_factor": 1.0,
+                   "seed": seed,
+                   "depth_statistic": depth_statistic,
+                   "max_depth_m": EVAL_MAX_DEPTH_M,
+                   "gt_range_policy": "clamp_positive_returns",
                    "vfov": list(vfov), "target_seconds": [1, 2, 3, 4]},
         "overall": overall,
         "per_nuscenes_split": per_split,
