@@ -56,7 +56,7 @@ def build_spherical_gaussian_seeds(
     timestamps,
 ):
     """Fuse tokens across frames, then run the own-frame spherical query head."""
-    fused_feature, _coord_out, _seed_out, _seed_delta, _agg_meta = temporal_aggregator(
+    fused_feature, _coord_out, _seed_out, _seed_delta, agg_meta = temporal_aggregator(
         fused_feature,
         token_position,
         None,
@@ -68,6 +68,10 @@ def build_spherical_gaussian_seeds(
         bbox_instance_ids,
         timestamps,
     )
+    # The aggregator already produced per-token ref coords and per-frame
+    # ref-frame boxes; the spherical head reuses them instead of recomputing
+    # the bit-identical apply_pose / transform_boxes_to_ref (its frame loop
+    # still runs for the head-specific raw-point labelling).
     feature, position, delta, _anchor_range, frame_offset, metadata = query_head(
         fused_feature,
         token_position,
@@ -78,6 +82,8 @@ def build_spherical_gaussian_seeds(
         pose,
         bbox,
         bbox_instance_ids,
+        token_ref=agg_meta.get("coord_ref"),
+        bbox_ref_by_frame=agg_meta.get("bbox_ref_by_frame"),
     )
     return GaussianSeedBatch(
         feature=feature,

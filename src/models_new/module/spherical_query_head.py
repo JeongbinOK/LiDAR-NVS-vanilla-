@@ -226,26 +226,39 @@ class SphericalQueryHead(nn.Module):
 
     # ------------------------------------------------------------------ stages
     def _token_meta(self, tok_pos, raw_sensor, raw_token_index, new_offset,
-                    frame_batch_idx, pose_list, bbox_list, bbox_iids_list):
+                    frame_batch_idx, pose_list, bbox_list, bbox_iids_list,
+                    token_ref=None, bbox_ref_by_frame=None):
         """Per-token AND per-raw-point metadata over ALL frames (computed once,
         carried everywhere). Tokens get only their frame and ref coordinates --
         they carry no fg/bg label and are reached exclusively through raw-point
         membership. Raw points get ref coordinates, bbox labels, and their
-        global frame (they drive anchor formation and every K/V route)."""
+        global frame (they drive anchor formation and every K/V route).
+
+        ``token_ref`` (per-token ref coords) and ``bbox_ref_by_frame`` are
+        bit-identical to what the shared GridTemporalAggregator already produced
+        upstream (same pure ``apply_pose`` / ``transform_boxes_to_ref`` on the
+        same token positions, poses and boxes). The caller threads them in so
+        this head reuses them instead of recomputing; only the raw-point
+        labelling in the frame loop below is head-specific. When absent (e.g.
+        direct unit-test calls) both fall back to being recomputed here."""
         device = tok_pos.device
         N = tok_pos.shape[0]
         R = raw_sensor.shape[0]
         n_frames = len(frame_batch_idx)
 
-        tok_frame = torch.zeros(N, dtype=torch.long, device=device)
-        tok_ref = torch.zeros_like(tok_pos)
+        reuse_ref = token_ref is not None
+        tok_ref = token_ref if reuse_ref else torch.zeros_like(tok_pos)
+        reuse_bbox = bbox_ref_by_frame is not None
+        bbox_ref_by_frame = (
+            list(bbox_ref_by_frame) if reuse_bbox else [None] * n_frames
+        )
 
+        tok_frame = torch.zeros(N, dtype=torch.long, device=device)
         raw_frame = torch.zeros(R, dtype=torch.long, device=device)
         raw_ref = torch.zeros_like(raw_sensor)
         raw_label = torch.full((R,), -1, dtype=torch.long, device=device)
 
         frame_slices = [None] * n_frames             # (start, end) per global frame
-        bbox_ref_by_frame = [None] * n_frames
         iids_by_frame = [None] * n_frames
 
         batch_frame_map = {}
@@ -269,11 +282,14 @@ class SphericalQueryHead(nn.Module):
 
                 pose_f = pose_b[local_f].to(device)
                 tok_frame[sl] = global_f
-                tok_ref[sl] = box_utils.apply_pose(tok_pos[sl], pose_f)
+                if not reuse_ref:
+                    tok_ref[sl] = box_utils.apply_pose(tok_pos[sl], pose_f)
 
                 bbox_sensor_f = bbox_b[local_f].to(device)
-                bbox_ref_f = box_utils.transform_boxes_to_ref(bbox_sensor_f, pose_f)
-                bbox_ref_by_frame[global_f] = bbox_ref_f
+                if not reuse_bbox:
+                    bbox_ref_by_frame[global_f] = box_utils.transform_boxes_to_ref(
+                        bbox_sensor_f, pose_f
+                    )
                 if iids_b is not None:
                     iids_f = iids_b[local_f].to(device)
                 else:
@@ -405,7 +421,8 @@ class SphericalQueryHead(nn.Module):
     # ------------------------------------------------------------------ forward
     def forward(self, feat, tok_pos, raw_point_sensor, raw_token_index,
                 new_offset, frame_batch_idx, pose_list, bbox_list,
-                bbox_instance_ids_list=None):
+                bbox_instance_ids_list=None, token_ref=None,
+                bbox_ref_by_frame=None):
         """Convert fused grid tokens + raw points into spherical Gaussian seeds.
 
         feat (N,D) fused token features; tok_pos (N,3) per-frame sensor coords
@@ -436,7 +453,9 @@ class SphericalQueryHead(nn.Module):
 
         tm = self._token_meta(tok_pos, raw_point_sensor, raw_token_index,
                               new_offset, frame_batch_idx,
-                              pose_list, bbox_list, bbox_instance_ids_list)
+                              pose_list, bbox_list, bbox_instance_ids_list,
+                              token_ref=token_ref,
+                              bbox_ref_by_frame=bbox_ref_by_frame)
 
         # ---- Stage B: per-frame anchors from raw-occupied spherical cells ----
         frame_anchor = [None] * n_frames
