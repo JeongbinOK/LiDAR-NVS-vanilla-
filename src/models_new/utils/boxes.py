@@ -57,6 +57,28 @@ def points_to_box_local(points_ref: Tensor, box_ref: Tensor) -> Tensor:
     return torch.stack([local_x, local_y, shifted[:, 2]], dim=-1)
 
 
+def points_to_box_local_batched(points_ref: Tensor, box_ref: Tensor) -> Tensor:
+    """Vectorized ``points_to_box_local`` with one box PER point.
+
+    Same yaw-aligned local transform as ``points_to_box_local`` but each point
+    carries its own box, so a caller can transform points assigned to many
+    different boxes in a single launch instead of looping one call per box.
+
+    points_ref : (N, 3)
+    box_ref    : (N, 7) [x,y,z,w,l,h,yaw], the box each point belongs to.
+    return     : (N, 3), elementwise-identical to looping ``points_to_box_local``
+                 over per-box groups.
+    """
+    center = box_ref[:, :3]
+    yaw = box_ref[:, 6]
+    shifted = points_ref - center
+    cos_y = torch.cos(-yaw)
+    sin_y = torch.sin(-yaw)
+    local_x = cos_y * shifted[:, 0] - sin_y * shifted[:, 1]
+    local_y = sin_y * shifted[:, 0] + cos_y * shifted[:, 1]
+    return torch.stack([local_x, local_y, shifted[:, 2]], dim=-1)
+
+
 def box_local_to_ref(points_local: Tensor, box_ref: Tensor) -> Tensor:
     """Inverse of `points_to_box_local`: box-local (N, 3) points -> box_ref's frame.
 

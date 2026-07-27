@@ -361,11 +361,11 @@ class SphericalQueryHead(nn.Module):
                 )
             bidx = eq.long().argmax(dim=1)
             anchor_box[dyn_idx] = bidx
-            for box_i in bidx.unique().tolist():
-                box_i = int(box_i)
-                sel = torch.zeros(U, dtype=torch.bool, device=device)
-                sel[dyn_idx[bidx == box_i]] = True
-                anchor_out[sel] = box_utils.points_to_box_local(anchor_ref[sel], bbox_ref_f[box_i])
+            # One batched box-local transform (each anchor gathers its own box)
+            # instead of a launch per unique box.
+            anchor_out[dyn_idx] = box_utils.points_to_box_local_batched(
+                anchor_ref[dyn_idx], bbox_ref_f[bidx]
+            )
 
         return {
             "pt2anchor": pt2anchor, "pi": pi, "num_anchors": U,
@@ -512,21 +512,21 @@ class SphericalQueryHead(nn.Module):
             if fa is None or not fa["is_dyn"].any():
                 continue
             bbox_ref_f = tm["bbox_ref_by_frame"][global_f]
-            for box_i in fa["box"][fa["is_dyn"]].unique().tolist():
-                box_i = int(box_i)
-                rows = (
-                    (anchor_frame[query_anchor] == global_f)
-                    & anchor_is_dyn[query_anchor]
-                    & (anchor_box[query_anchor] == box_i)
-                ).nonzero(as_tuple=True)[0]
-                if rows.numel() == 0:
-                    continue
-                seed_out[rows] = box_utils.points_to_box_local(
-                    seed_ref[rows], bbox_ref_f[box_i]
-                )
-                source_token_out[rows] = box_utils.points_to_box_local(
-                    source_token_ref[rows], bbox_ref_f[box_i]
-                )
+            # All dynamic queries of this frame at once: each row gathers its own
+            # anchor's box, one batched transform instead of a launch per box.
+            rows = (
+                (anchor_frame[query_anchor] == global_f)
+                & anchor_is_dyn[query_anchor]
+            ).nonzero(as_tuple=True)[0]
+            if rows.numel() == 0:
+                continue
+            boxes_row = bbox_ref_f[anchor_box[query_anchor[rows]]]
+            seed_out[rows] = box_utils.points_to_box_local_batched(
+                seed_ref[rows], boxes_row
+            )
+            source_token_out[rows] = box_utils.points_to_box_local_batched(
+                source_token_ref[rows], boxes_row
+            )
 
         # The head sees only local position within the 0.4m source-token support.
         # Absolute metric positions stay on the seed/base-centre and RoPE paths.
@@ -592,13 +592,10 @@ class SphericalQueryHead(nn.Module):
                     "raw labelling and bbox inputs are inconsistent"
                 )
             bidx = eq.long().argmax(dim=1)
-            it_pos = tm["ref"].new_zeros(it_tok.shape[0], 3)
-            for box_i in bidx.unique().tolist():
-                box_i = int(box_i)
-                sel = (bidx == box_i).nonzero(as_tuple=True)[0]
-                it_pos[sel] = box_utils.points_to_box_local(
-                    tm["ref"][it_tok[sel]], bbox_ref_f[box_i]
-                )
+            # One batched transform: each (instance, token) pair gathers its box.
+            it_pos = box_utils.points_to_box_local_batched(
+                tm["ref"][it_tok], bbox_ref_f[bidx]
+            )
             # per-instance CSR over tokens, then expand each fg anchor of this
             # frame to its instance block. Anchor labels are built from the
             # frame's own in-range raw points, a subset of fg_raw, so every
