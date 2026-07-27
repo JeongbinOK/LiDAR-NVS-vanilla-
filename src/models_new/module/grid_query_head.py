@@ -248,12 +248,17 @@ class _FullSelfAttention(nn.Module):
             nn.init.zeros_(ffn[-1].weight)
             nn.init.zeros_(ffn[-1].bias)
 
-    def forward(self, feat, position):
+    def forward(self, feat, position, attn_mask=None):
         x = self.input_norm(feat)
         if feat.shape[0] == 0 or self.n_layers == 0:
             return x
         H, dh = self.num_heads, self.head_dim
         rope_angles = self.rope.angles(position)
+        # Optional (N, N) bool mask (True = attend). It lets several disjoint
+        # instances share ONE call through a block-diagonal same-instance mask
+        # instead of one attention launch per instance; None keeps the original
+        # full self-attention (each row attends every row).
+        neg_mask = None if attn_mask is None else ~attn_mask[None]   # (1, N, N)
         for layer in range(self.n_layers):
             qkv = self.qkv[layer](x)
             q, key, value = qkv.chunk(3, dim=-1)
@@ -265,6 +270,8 @@ class _FullSelfAttention(nn.Module):
             scores = torch.einsum(
                 "ihd,jhd->hij", q_rot, key_rot
             ) * self.scale
+            if neg_mask is not None:
+                scores = scores.masked_fill(neg_mask, float("-inf"))
             prob = torch.softmax(scores, dim=-1)
             attended = torch.einsum("hij,jhd->ihd", prob, value.float())
             attended = attended.reshape(-1, self.dim).to(x.dtype)
@@ -308,6 +315,10 @@ class GridTemporalAggregator(nn.Module):
             rope_base=_GRID_ROPE_BASE,
             rope_position_scale=_GRID_FG_ROPE_POSITION_SCALE,
         )
+        # Foreground instances are packed into one block-diagonal masked
+        # self-attention (O(T^2) scores). Above this many fg tokens the scores
+        # tensor gets large, so fall back to the per-instance loop instead.
+        self._fg_dense_cap = int(getattr(cfg, "fg_dense_cap", 2048))
 
     @staticmethod
     def _frame_bounds(new_offset, global_frame):
@@ -484,26 +495,42 @@ class GridTemporalAggregator(nn.Module):
             metadata["out"], metadata["out"][pair_source],
         )
 
-        fg_rows_to_update = []
-        fg_feature_updates = []
+        # Each dynamic instance's tokens fuse only among themselves. They are
+        # disjoint and background attention never touches them, so instead of one
+        # attention launch per instance (measured launch-bound) pack every
+        # instance into a SINGLE block-diagonal masked self-attention and scatter
+        # once. A rare very dense frame exceeds the O(T^2) score budget and falls
+        # back to the per-instance path.
+        fg_rows_list = []
         for frame_indices in metadata["batch_frame_map"].values():
             frame_rows = torch.cat([metadata["frame_indices"][f] for f in frame_indices])
             dynamic_rows = frame_rows[metadata["is_dynamic"][frame_rows]]
-            for item_id in metadata["instance_id"][dynamic_rows].unique().tolist():
-                item_id = int(item_id)
-                rows = dynamic_rows[metadata["instance_id"][dynamic_rows] == item_id]
-                if rows.numel() == 0:
-                    continue
-                # Instances are disjoint and background attention never touches
-                # these rows, so accumulate and scatter once instead of copying
-                # the full N-token tensor once per object.
-                updated = self.fg_attention(feat[rows], metadata["out"][rows])
-                fg_rows_to_update.append(rows)
-                fg_feature_updates.append(updated)
-        if fg_rows_to_update:
-            out_feat = out_feat.index_copy(
-                0, torch.cat(fg_rows_to_update), torch.cat(fg_feature_updates)
-            )
+            if dynamic_rows.numel() == 0:
+                continue
+            instance_ids = metadata["instance_id"][dynamic_rows]
+            for item_id in instance_ids.unique().tolist():
+                rows = dynamic_rows[instance_ids == int(item_id)]
+                if rows.numel() > 0:
+                    fg_rows_list.append(rows)
+        if fg_rows_list:
+            all_rows = torch.cat(fg_rows_list)
+            if int(all_rows.numel()) <= self._fg_dense_cap:
+                lengths = torch.tensor(
+                    [int(r.numel()) for r in fg_rows_list], device=out_feat.device
+                )
+                seg = torch.repeat_interleave(
+                    torch.arange(lengths.numel(), device=out_feat.device), lengths
+                )
+                block_mask = seg[:, None] == seg[None, :]     # True = same instance
+                updated = self.fg_attention(
+                    feat[all_rows], metadata["out"][all_rows], attn_mask=block_mask
+                )
+            else:
+                updated = torch.cat([
+                    self.fg_attention(feat[rows], metadata["out"][rows])
+                    for rows in fg_rows_list
+                ])
+            out_feat = out_feat.index_copy(0, all_rows, updated)
 
         agg_meta = {
             "box_assign": metadata["box_assign"],
