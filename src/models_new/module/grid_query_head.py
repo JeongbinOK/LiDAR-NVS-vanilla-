@@ -2,14 +2,17 @@
 
 Each occupied Utonia token keeps its temporal context while own-frame raw points
 provide range-quantile position seeds. Background seeds live in the reference
-frame and persistent foreground seeds live in box-local coordinates. A shared
-anchor trunk consumes the padded seed offsets, then an independent joint head for
-each possible ``K_i`` predicts all Gaussian parameters for that anchor.
+frame and persistent foreground seeds live in box-local coordinates. In legacy
+mode, deterministic metadata routes each token to an independent joint K head.
+In learned mode, a post-temporal-fusion MLP predicts K logits and hard
+Gumbel-Softmax straight-through routing selects among padded K-specific seed/head
+candidates.
 """
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from ..utils import boxes as box_utils
 from ..utils.attention import Rotary3D
@@ -334,8 +337,15 @@ class GridTemporalAggregator(nn.Module):
         if has_seeds:
             if delta_sensor is None or seed_sensor.shape != delta_sensor.shape:
                 raise ValueError("seed_sensor and delta_sensor must have identical shapes")
-            if seed_sensor.ndim != 3 or seed_sensor.shape[0] != N or seed_sensor.shape[2] != 3:
-                raise ValueError("grid seeds must have shape (num_anchors, K_max, 3)")
+            if (
+                seed_sensor.ndim not in (3, 4)
+                or seed_sensor.shape[0] != N
+                or seed_sensor.shape[-1] != 3
+            ):
+                raise ValueError(
+                    "grid seeds must have shape (N, K_max, 3) or "
+                    "(N, K_choices, K_max, 3)"
+                )
         elif delta_sensor is not None:
             raise ValueError("delta_sensor requires seed_sensor")
         n_frames = int(frame_batch_idx.numel())
@@ -547,14 +557,50 @@ class GridTemporalAggregator(nn.Module):
 
 
 class GridSlotHead(nn.Module):
-    """Predict variable-count Gaussian parameters with independent joint K heads."""
+    """Predict variable-count Gaussian parameters with independent joint K heads.
+
+    ``count_mode="legacy"`` preserves the original module shapes and state-dict
+    keys exactly: external ``anchor_k`` metadata selects one head.
+
+    ``count_mode="learned_gumbel"`` predicts logits from the temporally fused
+    anchor feature. Every K candidate is evaluated and padded to ``K_max`` so a
+    hard straight-through one-hot can mix equal-shaped tensors. Forward values
+    are exactly one selected K head; backward uses the soft categorical
+    relaxation, which is the usual hard Gumbel-Softmax ST estimator adapted to
+    ragged K outputs.
+    """
 
     def __init__(self, cfg, gs_params, dim):
         super().__init__()
         self.dim = int(dim)
-        k_max = getattr(cfg, "K_max", None)
-        if k_max is None:
-            raise ValueError("p2g.grid_query.K_max is required")
+        self.count_mode = str(getattr(cfg, "count_mode", "legacy")).lower()
+        if self.count_mode == "legacy":
+            k_max = getattr(cfg, "K_max", None)
+            if k_max is None:
+                raise ValueError("p2g.grid_query.K_max is required")
+            self.gumbel_tau = None
+        elif self.count_mode == "learned_gumbel":
+            learned_count = getattr(cfg, "learned_count", None)
+            if learned_count is None:
+                raise ValueError(
+                    "p2g.grid_query.learned_count is required for "
+                    "count_mode='learned_gumbel'"
+                )
+            k_max = getattr(learned_count, "K_max", None)
+            if k_max is None:
+                raise ValueError(
+                    "p2g.grid_query.learned_count.K_max is required"
+                )
+            self.gumbel_tau = float(getattr(learned_count, "tau", 1.0))
+            if not self.gumbel_tau > 0.0:
+                raise ValueError(
+                    "p2g.grid_query.learned_count.tau must be positive"
+                )
+        else:
+            raise ValueError(
+                "p2g.grid_query.count_mode must be 'legacy' or "
+                "'learned_gumbel'"
+            )
         self.k_max = int(k_max)
         self.grad_balance = str(getattr(cfg, "grad_balance", "sqrt_k"))
         if self.k_max <= 0:
@@ -584,6 +630,16 @@ class GridSlotHead(nn.Module):
             nn.Linear(self.dim, k * self.param_dim)
             for k in range(1, self.k_max + 1)
         ])
+        if self.count_mode == "learned_gumbel":
+            self.count_predictor = nn.Sequential(
+                nn.Linear(self.dim, self.dim),
+                nn.SiLU(),
+                nn.Linear(self.dim, self.k_max),
+            )
+            # Uniform initial categorical probabilities avoid imposing an
+            # arbitrary K preference before the rendering losses provide signal.
+            nn.init.zeros_(self.count_predictor[-1].weight)
+            nn.init.zeros_(self.count_predictor[-1].bias)
 
     def _gaussian_offset(self, anchor_k, anchor_offset):
         frame_gaussian_counts = []
@@ -596,7 +652,9 @@ class GridSlotHead(nn.Module):
             return torch.zeros(0, dtype=torch.long, device=anchor_k.device)
         return torch.cumsum(torch.stack(frame_gaussian_counts), dim=0).long()
 
-    def forward(self, anchor_feature, anchor_k, delta_p, anchor_offset):
+    def _forward_legacy(self, anchor_feature, anchor_k, delta_p, anchor_offset):
+        if anchor_k is None:
+            raise ValueError("legacy grid count routing requires anchor_k")
         if anchor_k.ndim != 1 or anchor_k.shape[0] != anchor_feature.shape[0]:
             raise ValueError("anchor_k must be one-dimensional and aligned with anchor_feature")
         expected_delta_shape = (anchor_feature.shape[0], self.k_max, 3)
@@ -651,6 +709,112 @@ class GridSlotHead(nn.Module):
             "anchor_k": anchor_k,
             "gaussian_offset": gaussian_offset,
         }
+
+    def _gumbel_selection(self, logits):
+        """Hard one-hot forward; soft categorical derivative backward."""
+        if self.training:
+            return F.gumbel_softmax(
+                logits.float(),
+                tau=self.gumbel_tau,
+                hard=True,
+                dim=-1,
+            ).to(dtype=logits.dtype)
+        selected = logits.argmax(dim=-1)
+        return F.one_hot(selected, num_classes=self.k_max).to(dtype=logits.dtype)
+
+    def _forward_learned(self, anchor_feature, anchor_k, delta_p, anchor_offset):
+        if anchor_k is not None:
+            raise ValueError(
+                "learned_gumbel predicts anchor_k after temporal fusion; "
+                "external anchor_k must be None"
+            )
+        expected_delta_shape = (
+            anchor_feature.shape[0], self.k_max, self.k_max, 3,
+        )
+        if tuple(delta_p.shape) != expected_delta_shape:
+            raise ValueError(
+                "learned_gumbel delta_p must have shape "
+                f"{expected_delta_shape}, got {tuple(delta_p.shape)}"
+            )
+
+        logits = self.count_predictor(anchor_feature)
+        selection = self._gumbel_selection(logits)
+        selected_k = selection.argmax(dim=-1).to(torch.long) + 1
+
+        # One shared trunk is evaluated on each candidate's own K-specific
+        # padded delta set. This keeps the existing head semantics while making
+        # all branch outputs equal-shaped for the ST categorical mixture.
+        num_anchors = anchor_feature.shape[0]
+        candidate_feature = anchor_feature[:, None, :].expand(
+            -1, self.k_max, -1
+        )
+        trunk_input = torch.cat([
+            candidate_feature,
+            delta_p.to(dtype=anchor_feature.dtype).reshape(
+                num_anchors, self.k_max, 3 * self.k_max
+            ),
+        ], dim=-1)
+        trunk_feature = self.trunk(
+            trunk_input.reshape(
+                num_anchors * self.k_max,
+                self.dim + 3 * self.k_max,
+            )
+        ).reshape(num_anchors, self.k_max, self.dim)
+
+        padded_candidates = []
+        for candidate_index, (k, head) in enumerate(
+            zip(range(1, self.k_max + 1), self.k_heads)
+        ):
+            predicted = head(
+                trunk_feature[:, candidate_index]
+            ).reshape(num_anchors, k, self.param_dim)
+            padded_candidates.append(
+                F.pad(predicted, (0, 0, 0, self.k_max - k))
+            )
+        candidate_raw = torch.stack(padded_candidates, dim=1)
+        mixed_raw = (
+            selection[:, :, None, None] * candidate_raw
+        ).sum(dim=1)
+
+        anchor_index = torch.repeat_interleave(
+            torch.arange(num_anchors, device=anchor_feature.device),
+            selected_k,
+        )
+        gaussian_offset = self._gaussian_offset(selected_k, anchor_offset)
+        if anchor_index.numel() == 0:
+            empty_long = torch.zeros(
+                0, dtype=torch.long, device=anchor_feature.device
+            )
+            raw_params = anchor_feature.new_zeros((0, self.param_dim))
+            slot_index = empty_long
+            slot_k = empty_long
+        else:
+            slot_start = torch.cumsum(selected_k, dim=0) - selected_k
+            slot_index = (
+                torch.arange(anchor_index.numel(), device=anchor_feature.device)
+                - torch.repeat_interleave(slot_start, selected_k)
+            )
+            slot_k = selected_k[anchor_index]
+            raw_params = mixed_raw[anchor_index, slot_index]
+
+        return raw_params, {
+            "anchor_index": anchor_index,
+            "slot_index": slot_index,
+            "slot_k": slot_k,
+            "anchor_k": selected_k,
+            "gaussian_offset": gaussian_offset,
+            "k_logits": logits,
+            "k_selection": selection,
+        }
+
+    def forward(self, anchor_feature, anchor_k, delta_p, anchor_offset):
+        if self.count_mode == "learned_gumbel":
+            return self._forward_learned(
+                anchor_feature, anchor_k, delta_p, anchor_offset
+            )
+        return self._forward_legacy(
+            anchor_feature, anchor_k, delta_p, anchor_offset
+        )
 
     def gradient_weight(self, slot_k, dtype):
         if self.grad_balance == "none":

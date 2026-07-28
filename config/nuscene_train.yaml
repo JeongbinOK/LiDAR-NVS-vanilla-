@@ -1,7 +1,7 @@
 device: [0,1,2,3]
 
 project_name: 2dgs-utonia
-exp_name:  ${p2g.anchor_mode}-3slots_loss_w
+exp_name:  ${p2g.anchor_mode}-${p2g.grid_query.count_mode}-3slots_loss_w
 mode: train
 
 
@@ -99,11 +99,16 @@ p2g:
     n_layers: 2                # bg·fg 공유 cross-attn depth (query refinement 라운드 수)
   grid_query:                   # 공유 temporal fusion(bg_radius_m/bg_max_kv_per_frame/
                                 # num_heads/bg_layers/fg_layers는 양 모드 사용) +
-                                # grid mode 전용 joint K-head 설정(K_max/points_per_gaussian/grad_balance)
-    K_max: 3                    # maximum Gaussians emitted by one occupied 0.4m cell
-    points_per_gaussian: 4      # K_i = ceil(own-frame raw_count / this), capped by K_max
-    exp: null                   # null: raw_count-driven range-quantile K_i (default);
-                                # 1: one raw-point medoid/token; 2: two token-coordinate seeds/token
+                                # grid mode 전용 K routing/head 설정
+    count_mode: learned_gumbel  # legacy | learned_gumbel; 이전 config에서 생략 시 legacy
+    K_max: 3                    # legacy only: occupied 0.4m cell당 최대 Gaussian 수
+    points_per_gaussian: 4      # legacy exp=null only: K_i=ceil(raw_count/this), capped by K_max
+    exp: null                   # legacy only: null=raw-count range quantile;
+                                # 1=one raw-point medoid; 2=two token-coordinate seeds
+    learned_count:              # learned_gumbel only; legacy K_max/points_per_gaussian/exp와 독립
+      K_max: 4                  # logits=[K1,K2,K3,K4], K별 독립 joint head
+      tau: 1.0                  # train: hard Gumbel-ST temperature; eval: deterministic argmax
+      seed_mode: range_quantile # K별 range-quantile candidate bank (A안)
     bg_radius_m: 0.8
     bg_max_kv_per_frame: 8
     num_heads: 8

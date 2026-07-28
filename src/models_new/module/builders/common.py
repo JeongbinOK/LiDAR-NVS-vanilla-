@@ -14,11 +14,19 @@ import torch
 
 @dataclass(frozen=True)
 class GridSeedData:
-    """Own-frame variable-K seed geometry aligned with occupied token rows."""
+    """Own-frame seed geometry aligned with occupied token rows.
+
+    Legacy count routing stores one padded seed set with shape
+    ``(N, K_max, 3)`` and its deterministic ``anchor_k``. Learned Gumbel
+    routing stores every K-specific candidate set with shape
+    ``(N, K_max, K_max, 3)``; candidate row ``k - 1`` contains the first
+    ``k`` valid range-quantile seeds and ``anchor_k`` is ``None`` because K is
+    predicted only after temporal feature fusion.
+    """
 
     seed_sensor: torch.Tensor
     delta_sensor: torch.Tensor
-    anchor_k: torch.Tensor
+    anchor_k: torch.Tensor | None
 
 
 @dataclass(frozen=True)
@@ -167,6 +175,58 @@ def _r_quantile_seed_data(points, cell_idx, counts, grid_coord, occupied,
     return GridSeedData(seeds, delta, anchor_k)
 
 
+def _r_quantile_seed_bank(points, cell_idx, counts, grid_coord, occupied,
+                          metric_origin, mapper, k_max):
+    """Precompute the range-quantile seed set for every candidate K.
+
+    The learned count router runs after cross-frame feature fusion, while seed
+    geometry must be transformed into ref/box-local frames by the temporal
+    aggregator.  Therefore all candidates are built up front. Candidate
+    ``k - 1`` follows the same deterministic rule as the legacy K path:
+
+        rank(s, K) = floor(((2s + 1) * N_raw) / (2K)),  s = 0 .. K - 1.
+
+    If ``N_raw < K``, quantiles may intentionally select the same observed raw
+    point more than once; the K-specific Gaussian head can separate those slots
+    through its learned position offsets.
+    """
+    occupied_index = occupied.nonzero(as_tuple=True)[0]
+    num_cells = occupied_index.numel()
+    seeds = points.new_zeros((num_cells, k_max, k_max, 3))
+    delta = points.new_zeros((num_cells, k_max, k_max, 3))
+    if num_cells == 0:
+        return GridSeedData(seeds, delta, None)
+
+    point_range = points.norm(dim=-1)
+    order = torch.arange(points.shape[0], device=points.device)
+    # Stable least-to-most-significant sorting gives (cell, r, x, y, z).
+    for value in (points[:, 2], points[:, 1], points[:, 0], point_range, cell_idx):
+        order = order[torch.argsort(value[order], stable=True)]
+    sorted_points = points[order]
+
+    count_long = counts.long()
+    occupied_count = count_long[occupied_index]
+    starts = torch.cumsum(count_long, dim=0) - count_long
+    cell_start = starts[occupied_index].view(-1, 1)
+    for k in range(1, k_max + 1):
+        slot = torch.arange(k, device=points.device).view(1, -1)
+        rank = torch.div(
+            (2 * slot + 1) * occupied_count.view(-1, 1),
+            2 * k,
+            rounding_mode="floor",
+        )
+        seeds[:, k - 1, :k] = sorted_points[cell_start + rank]
+
+    cell_center = _cell_centers(
+        grid_coord, occupied, metric_origin, mapper, points.dtype
+    )
+    for k in range(1, k_max + 1):
+        delta[:, k - 1, :k] = (
+            seeds[:, k - 1, :k] - cell_center[:, None, :]
+        )
+    return GridSeedData(seeds, delta, None)
+
+
 def _medoid_seed_data(points, cell_idx, counts, grid_coord, occupied,
                       metric_origin, mapper, k_max):
     """One observed centroid-medoid seed per occupied token.
@@ -259,9 +319,14 @@ def _aggregate_points_to_cells(points_xyz, intensity, grid_coord, voxel_feats,
             )
             result = result + (empty_membership,)
         if seed_config is not None:
-            k_max = int(seed_config[1])
-            empty_seed = points_xyz.new_zeros((0, k_max, 3))
-            empty_k = torch.zeros((0,), dtype=torch.long, device=device)
+            count_mode, _points_per_gaussian, k_max, _exp, _seed_mode = seed_config
+            k_max = int(k_max)
+            if count_mode == "learned_gumbel":
+                empty_seed = points_xyz.new_zeros((0, k_max, k_max, 3))
+                empty_k = None
+            else:
+                empty_seed = points_xyz.new_zeros((0, k_max, 3))
+                empty_k = torch.zeros((0,), dtype=torch.long, device=device)
             result = result + (GridSeedData(empty_seed, empty_seed.clone(), empty_k),)
         return result
 
@@ -328,8 +393,17 @@ def _aggregate_points_to_cells(points_xyz, intensity, grid_coord, voxel_feats,
             token_index=full_to_compact[cell_idx],
         ),)
     if seed_config is not None:
-        points_per_gaussian, k_max, exp = seed_config
-        if exp is None:
+        count_mode, points_per_gaussian, k_max, exp, seed_mode = seed_config
+        if count_mode == "learned_gumbel":
+            if seed_mode != "range_quantile":
+                raise ValueError(
+                    f"Unsupported learned grid seed_mode={seed_mode!r}"
+                )
+            seed_data = _r_quantile_seed_bank(
+                pts, cell_idx, counts, grid_coord, occ, metric_origin, mapper,
+                k_max=int(k_max),
+            )
+        elif exp is None:
             seed_data = _r_quantile_seed_data(
                 pts, cell_idx, counts, grid_coord, occ, metric_origin, mapper,
                 points_per_gaussian=int(points_per_gaussian), k_max=int(k_max),
@@ -373,16 +447,27 @@ def aggregate_points_to_cells_with_membership(
 
 def aggregate_points_to_cells_with_seeds(
     points_xyz, intensity, grid_coord, voxel_feats, voxel_coord, metric_origin,
-    mapper, points_per_gaussian, k_max, exp=None,
+    mapper, points_per_gaussian, k_max, exp=None, count_mode="legacy",
+    seed_mode=None,
 ):
     """Aggregate raw points and construct padded grid-mode seed tensors.
 
-    ``exp=None`` retains raw-count-driven range-quantile slots. ``exp=1``
-    emits one raw-point medoid per token; ``exp=2`` emits two identical
-    token-coordinate seeds whose independently predicted offsets separate them.
+    In ``count_mode="legacy"``, ``exp=None`` retains raw-count-driven
+    range-quantile slots, ``exp=1`` emits one raw-point medoid per token, and
+    ``exp=2`` emits two identical token-coordinate seeds. In
+    ``count_mode="learned_gumbel"``, legacy ``exp`` and
+    ``points_per_gaussian`` are ignored and ``seed_mode="range_quantile"``
+    builds the full K-specific candidate bank.
     """
+    count_mode = str(count_mode).lower()
+    if count_mode not in ("legacy", "learned_gumbel"):
+        raise ValueError(
+            "grid count_mode must be 'legacy' or 'learned_gumbel'"
+        )
+    if count_mode == "learned_gumbel":
+        seed_mode = "range_quantile" if seed_mode is None else str(seed_mode).lower()
     return _aggregate_points_to_cells(
         points_xyz, intensity, grid_coord, voxel_feats,
         voxel_coord, metric_origin, mapper,
-        seed_config=(points_per_gaussian, k_max, exp),
+        seed_config=(count_mode, points_per_gaussian, k_max, exp, seed_mode),
     )

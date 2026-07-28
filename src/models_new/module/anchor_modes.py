@@ -13,8 +13,9 @@ only boundary where the gaussian-generation semantics differ:
   that attends only to own-frame tokens. Mixed boundary cells split into pure
   bg/instance anchors.
 * ``grid`` keeps each occupied Cartesian token as an anchor, runs the shared
-  aggregator with its padded seed geometry, and expands each token into a
-  raw-count-dependent number of slots via joint K heads.
+  aggregator with its padded seed geometry, and expands each token through
+  either the legacy metadata-selected K head or a learned hard
+  Gumbel-Softmax ST K router.
 
 The caller owns all trainable modules so their existing state-dict prefixes
 (``squery_head.*``, ``grid_temporal_agg.*``, and ``grid_slot_head.*``) stay
@@ -130,13 +131,45 @@ def build_grid_gaussian_seeds(
         delta_p,
         token_offset,
     )
+    k_selection = packing.get("k_selection")
+    if k_selection is not None:
+        expected_shape = (
+            anchor_feature.shape[0],
+            slot_head.k_max,
+            slot_head.k_max,
+            3,
+        )
+        if tuple(seed_position.shape) != expected_shape:
+            raise ValueError(
+                "learned grid seed_position must have shape "
+                f"{expected_shape}, got {tuple(seed_position.shape)}"
+            )
+        seed_ref = anchor_metadata["seed_ref"]
+        if tuple(seed_ref.shape) != expected_shape:
+            raise ValueError(
+                "learned grid seed_ref must have shape "
+                f"{expected_shape}, got {tuple(seed_ref.shape)}"
+            )
+        geometry_weight = k_selection.to(dtype=seed_position.dtype)
+        # Forward is exactly the selected K candidate because k_selection is
+        # hard one-hot. Its backward derivative is the soft Gumbel relaxation,
+        # so both Gaussian parameters and seed geometry train the K predictor.
+        seed_position = (
+            geometry_weight[:, :, None, None] * seed_position
+        ).sum(dim=1)
+        seed_ref = (
+            geometry_weight[:, :, None, None] * seed_ref
+        ).sum(dim=1)
+    else:
+        seed_ref = anchor_metadata["seed_ref"]
+
     anchor_index = packing["anchor_index"]
     slot_index = packing["slot_index"]
     metadata = {
         "box_assign": anchor_metadata["box_assign"][anchor_index],
         "instance_id": anchor_metadata["instance_id"][anchor_index],
         "is_dynamic": anchor_metadata["is_dynamic"][anchor_index],
-        "coord_ref": anchor_metadata["seed_ref"][anchor_index, slot_index],
+        "coord_ref": seed_ref[anchor_index, slot_index],
         "bbox_ref_by_frame": anchor_metadata["bbox_ref_by_frame"],
     }
     gradient_weight = slot_head.gradient_weight(

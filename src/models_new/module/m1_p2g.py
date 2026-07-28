@@ -279,9 +279,20 @@ class Point2Gaus(nn.Module):
             all_delta_sensor = torch.cat(
                 [item.delta_sensor for item in grid_seed_list], dim=0
             )
-            all_anchor_k = torch.cat(
-                [item.anchor_k for item in grid_seed_list], dim=0
-            )
+            if self.grid_slot_head.count_mode == "legacy":
+                if any(item.anchor_k is None for item in grid_seed_list):
+                    raise RuntimeError(
+                        "legacy grid seed data must provide anchor_k"
+                    )
+                all_anchor_k = torch.cat(
+                    [item.anchor_k for item in grid_seed_list], dim=0
+                )
+            else:
+                if any(item.anchor_k is not None for item in grid_seed_list):
+                    raise RuntimeError(
+                        "learned_gumbel seed data must defer anchor_k prediction"
+                    )
+                all_anchor_k = None
         else:
             all_raw_point_sensor = torch.cat(all_raw_point_sensor, dim=0)
             all_raw_token_index = torch.cat(all_raw_token_index, dim=0)
