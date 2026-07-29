@@ -16,6 +16,7 @@ import torch.nn.functional as F
 
 from ..utils import boxes as box_utils
 from ..utils.attention import Rotary3D
+from .gaussian_assembly import gradient_scale_identity
 
 
 # Fixed query-head geometry constants.  They are intentionally kept out of the
@@ -557,23 +558,23 @@ class GridTemporalAggregator(nn.Module):
 
 
 class GridSlotHead(nn.Module):
-    """Predict variable-count Gaussian parameters with independent joint K heads.
+    """Predict variable-count Gaussian parameters for config-selected routing.
 
     ``count_mode="legacy"`` preserves the original module shapes and state-dict
     keys exactly: external ``anchor_k`` metadata selects one head.
 
     ``count_mode="learned_gumbel"`` predicts logits from the temporally fused
-    anchor feature. Every K candidate is evaluated and padded to ``K_max`` so a
-    hard straight-through one-hot can mix equal-shaped tensors. Forward values
-    are exactly one selected K head; backward uses the soft categorical
-    relaxation, which is the usual hard Gumbel-Softmax ST estimator adapted to
-    ragged K outputs.
+    anchor feature and executes only the selected K-specific head for each
+    token. The selected hard-ST scalar gates the activated opacity of that
+    expert's K outputs: forward rendering is unchanged, while backward connects
+    the rendering loss to all count logits through the softmax Jacobian.
     """
 
     def __init__(self, cfg, gs_params, dim):
         super().__init__()
         self.dim = int(dim)
         self.count_mode = str(getattr(cfg, "count_mode", "legacy")).lower()
+        learned_count = None
         if self.count_mode == "legacy":
             k_max = getattr(cfg, "K_max", None)
             if k_max is None:
@@ -603,10 +604,25 @@ class GridSlotHead(nn.Module):
             )
         self.k_max = int(k_max)
         self.grad_balance = str(getattr(cfg, "grad_balance", "sqrt_k"))
+        configured_scope = getattr(cfg, "grad_balance_scope", "output")
+        if learned_count is not None:
+            configured_scope = getattr(
+                learned_count, "grad_balance_scope", configured_scope
+            )
+        # Missing scope preserves the historical output-level backward. The
+        # active learned experiment nests ``token`` under learned_count, so
+        # switching count_mode back to legacy also restores legacy gradients.
+        self.grad_balance_scope = str(
+            configured_scope
+        ).lower()
         if self.k_max <= 0:
             raise ValueError("grid_query.K_max must be positive")
         if self.grad_balance not in ("sqrt_k", "none"):
             raise ValueError("grid_query.grad_balance must be 'sqrt_k' or 'none'")
+        if self.grad_balance_scope not in ("output", "token"):
+            raise ValueError(
+                "grid_query.grad_balance_scope must be 'output' or 'token'"
+            )
 
         param_names = ["shs", "opacity", "scaling", "rotation"]
         param_sizes = []
@@ -621,6 +637,8 @@ class GridSlotHead(nn.Module):
         self.param_dim = sum(param_sizes)
         if self.param_dim <= 0:
             raise ValueError("p2g.gs_params must define a positive output width")
+        self.opacity_start = param_sizes[0]
+        self.opacity_end = self.opacity_start + param_sizes[1]
 
         self.trunk = nn.Sequential(
             nn.Linear(self.dim + 3 * self.k_max, self.dim),
@@ -630,6 +648,7 @@ class GridSlotHead(nn.Module):
             nn.Linear(self.dim, k * self.param_dim)
             for k in range(1, self.k_max + 1)
         ])
+
         if self.count_mode == "learned_gumbel":
             self.count_predictor = nn.Sequential(
                 nn.Linear(self.dim, self.dim),
@@ -641,6 +660,58 @@ class GridSlotHead(nn.Module):
             nn.init.zeros_(self.count_predictor[-1].weight)
             nn.init.zeros_(self.count_predictor[-1].bias)
 
+    def _pack_selected_prefix(self, selected_k, anchor_offset):
+        num_anchors = selected_k.shape[0]
+        anchor_index = torch.repeat_interleave(
+            torch.arange(num_anchors, device=selected_k.device),
+            selected_k,
+        )
+        gaussian_offset = self._gaussian_offset(selected_k, anchor_offset)
+        if anchor_index.numel() == 0:
+            empty_long = torch.zeros(
+                0, dtype=torch.long, device=selected_k.device
+            )
+            return anchor_index, empty_long, empty_long, gaussian_offset
+
+        slot_start = torch.cumsum(selected_k, dim=0) - selected_k
+        slot_index = (
+            torch.arange(anchor_index.numel(), device=selected_k.device)
+            - torch.repeat_interleave(slot_start, selected_k)
+        )
+        slot_k = selected_k[anchor_index]
+        return anchor_index, slot_index, slot_k, gaussian_offset
+
+    def _opacity_gate_st(self, raw_params, gate):
+        """Forward-identical raw opacity with activated-opacity ST backward.
+
+        The renderer applies sigmoid internally.  We therefore build the exact
+        activated opacity ``sigmoid(raw) * gate``, map it back to a raw logit,
+        and use a straight-through value replacement so the selected expert's
+        opacities are bit-identical in the forward. Only packed selected slots
+        enter this function, hence their hard gate value is one and the renderer
+        never receives zero-opacity placeholders.
+        """
+        if raw_params.shape[0] == 0:
+            return raw_params
+        raw_opacity = raw_params[
+            :, self.opacity_start:self.opacity_end
+        ]
+        work_opacity = raw_opacity.float()
+        work_gate = gate.to(dtype=torch.float32).unsqueeze(-1)
+        activated = torch.sigmoid(work_opacity)
+        gated_activated = (activated * work_gate).clamp(
+            min=1.0e-6, max=1.0 - 1.0e-6
+        )
+        gated_logit = torch.logit(gated_activated).to(raw_opacity.dtype)
+        opacity_st = (
+            raw_opacity.detach() + gated_logit - gated_logit.detach()
+        )
+        return torch.cat([
+            raw_params[:, :self.opacity_start],
+            opacity_st,
+            raw_params[:, self.opacity_end:],
+        ], dim=-1)
+
     def _gaussian_offset(self, anchor_k, anchor_offset):
         frame_gaussian_counts = []
         start = 0
@@ -651,6 +722,15 @@ class GridSlotHead(nn.Module):
         if not frame_gaussian_counts:
             return torch.zeros(0, dtype=torch.long, device=anchor_k.device)
         return torch.cumsum(torch.stack(frame_gaussian_counts), dim=0).long()
+
+    def _balance_token_feature(self, feature, k):
+        """Scale only the gradient returning to the shared token/trunk path."""
+        if (
+            self.grad_balance != "sqrt_k"
+            or self.grad_balance_scope != "token"
+        ):
+            return feature
+        return gradient_scale_identity(feature, float(k) ** -0.5)
 
     def _forward_legacy(self, anchor_feature, anchor_k, delta_p, anchor_offset):
         if anchor_k is None:
@@ -695,7 +775,10 @@ class GridSlotHead(nn.Module):
             anchor_rows = (anchor_k == k).nonzero(as_tuple=True)[0]
             if anchor_rows.numel() == 0:
                 continue
-            predicted = head(trunk_feature[anchor_rows]).reshape(-1, k, self.param_dim)
+            head_input = self._balance_token_feature(
+                trunk_feature[anchor_rows], k
+            )
+            predicted = head(head_input).reshape(-1, k, self.param_dim)
             output_rows = anchor_start[anchor_rows, None] + torch.arange(
                 k, device=anchor_feature.device
             ).view(1, -1)
@@ -739,63 +822,67 @@ class GridSlotHead(nn.Module):
 
         logits = self.count_predictor(anchor_feature)
         selection = self._gumbel_selection(logits)
-        selected_k = selection.argmax(dim=-1).to(torch.long) + 1
-
-        # One shared trunk is evaluated on each candidate's own K-specific
-        # padded delta set. This keeps the existing head semantics while making
-        # all branch outputs equal-shaped for the ST categorical mixture.
+        selected_index = selection.argmax(dim=-1).to(torch.long)
+        selected_k = selected_index + 1
         num_anchors = anchor_feature.shape[0]
-        candidate_feature = anchor_feature[:, None, :].expand(
-            -1, self.k_max, -1
+
+        # K is a hard routing decision in the forward: each token contributes
+        # only its selected candidate geometry and runs only its selected
+        # K-specific output head. The discrete gather deliberately carries no
+        # count-router gradient; that gradient is supplied below by the selected
+        # ST scalar applied to activated opacity.
+        anchor_rows = torch.arange(
+            num_anchors, device=anchor_feature.device
         )
+        selected_delta = delta_p[anchor_rows, selected_index]
         trunk_input = torch.cat([
-            candidate_feature,
-            delta_p.to(dtype=anchor_feature.dtype).reshape(
-                num_anchors, self.k_max, 3 * self.k_max
+            anchor_feature,
+            selected_delta.to(dtype=anchor_feature.dtype).reshape(
+                num_anchors, 3 * self.k_max
             ),
         ], dim=-1)
-        trunk_feature = self.trunk(
-            trunk_input.reshape(
-                num_anchors * self.k_max,
-                self.dim + 3 * self.k_max,
-            )
-        ).reshape(num_anchors, self.k_max, self.dim)
+        trunk_feature = self.trunk(trunk_input)
 
-        padded_candidates = []
-        for candidate_index, (k, head) in enumerate(
-            zip(range(1, self.k_max + 1), self.k_heads)
-        ):
-            predicted = head(
-                trunk_feature[:, candidate_index]
-            ).reshape(num_anchors, k, self.param_dim)
-            padded_candidates.append(
-                F.pad(predicted, (0, 0, 0, self.k_max - k))
-            )
-        candidate_raw = torch.stack(padded_candidates, dim=1)
-        mixed_raw = (
-            selection[:, :, None, None] * candidate_raw
-        ).sum(dim=1)
-
-        anchor_index = torch.repeat_interleave(
-            torch.arange(num_anchors, device=anchor_feature.device),
-            selected_k,
+        (
+            anchor_index,
+            slot_index,
+            slot_k,
+            gaussian_offset,
+        ) = self._pack_selected_prefix(
+            selected_k, anchor_offset
         )
-        gaussian_offset = self._gaussian_offset(selected_k, anchor_offset)
-        if anchor_index.numel() == 0:
-            empty_long = torch.zeros(
-                0, dtype=torch.long, device=anchor_feature.device
+        raw_params = anchor_feature.new_zeros(
+            (anchor_index.numel(), self.param_dim)
+        )
+        anchor_start = torch.cumsum(selected_k, dim=0) - selected_k
+        for k, head in enumerate(self.k_heads, start=1):
+            selected_rows = (selected_k == k).nonzero(as_tuple=True)[0]
+            if selected_rows.numel() == 0:
+                continue
+            head_input = self._balance_token_feature(
+                trunk_feature[selected_rows], k
             )
-            raw_params = anchor_feature.new_zeros((0, self.param_dim))
-            slot_index = empty_long
-            slot_k = empty_long
-        else:
-            slot_start = torch.cumsum(selected_k, dim=0) - selected_k
-            slot_index = (
-                torch.arange(anchor_index.numel(), device=anchor_feature.device)
-                - torch.repeat_interleave(slot_start, selected_k)
+            predicted = head(head_input).reshape(
+                -1, k, self.param_dim
             )
-            slot_k = selected_k[anchor_index]
-            raw_params = mixed_raw[anchor_index, slot_index]
+            output_rows = anchor_start[selected_rows, None] + torch.arange(
+                k, device=anchor_feature.device
+            ).view(1, -1)
+            raw_params = raw_params.index_copy(
+                0,
+                output_rows.reshape(-1),
+                predicted.reshape(-1, self.param_dim),
+            )
+
+        # For token n, gather only y_ST[n, k*_n]. Its forward value is exactly
+        # one. Since that single probability still depends on every logit via
+        # softmax normalization, the opacity gate sends gradients to all K logits
+        # without executing or padding the unselected expert outputs.
+        selected_gate = selection.gather(
+            1, selected_index.unsqueeze(-1)
+        ).squeeze(-1)
+        packed_gate = selected_gate[anchor_index]
+        raw_params = self._opacity_gate_st(raw_params, packed_gate)
 
         return raw_params, {
             "anchor_index": anchor_index,
@@ -805,6 +892,8 @@ class GridSlotHead(nn.Module):
             "gaussian_offset": gaussian_offset,
             "k_logits": logits,
             "k_selection": selection,
+            "packed_selected_gate": packed_gate,
+            "selected_only": True,
         }
 
     def forward(self, anchor_feature, anchor_k, delta_p, anchor_offset):
@@ -817,7 +906,10 @@ class GridSlotHead(nn.Module):
         )
 
     def gradient_weight(self, slot_k, dtype):
-        if self.grad_balance == "none":
+        if (
+            self.grad_balance == "none"
+            or self.grad_balance_scope == "token"
+        ):
             return torch.ones_like(slot_k, dtype=dtype)
         return slot_k.to(dtype=dtype).rsqrt()
 

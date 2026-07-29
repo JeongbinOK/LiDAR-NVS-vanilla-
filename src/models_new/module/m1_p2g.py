@@ -399,4 +399,6 @@ class Point2Gaus(nn.Module):
             "batch": gaussian_batch,
             "pose": pose,
             "timestamps": _input["timestamps"],
+            "routing_stats": seeds.routing_stats,
+            "routing_budget_logits": seeds.routing_budget_logits,
         }

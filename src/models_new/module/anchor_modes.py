@@ -40,6 +40,8 @@ class GaussianSeedBatch:
     delta: Optional[torch.Tensor] = None
     gradient_weight: Optional[torch.Tensor] = None
     raw_params: Optional[torch.Tensor] = None
+    routing_stats: Optional[dict] = None
+    routing_budget_logits: Optional[torch.Tensor] = None
 
 
 def build_spherical_gaussian_seeds(
@@ -132,6 +134,8 @@ def build_grid_gaussian_seeds(
         token_offset,
     )
     k_selection = packing.get("k_selection")
+    routing_stats = None
+    routing_budget_logits = None
     if k_selection is not None:
         expected_shape = (
             anchor_feature.shape[0],
@@ -150,16 +154,27 @@ def build_grid_gaussian_seeds(
                 "learned grid seed_ref must have shape "
                 f"{expected_shape}, got {tuple(seed_ref.shape)}"
             )
-        geometry_weight = k_selection.to(dtype=seed_position.dtype)
-        # Forward is exactly the selected K candidate because k_selection is
-        # hard one-hot. Its backward derivative is the soft Gumbel relaxation,
-        # so both Gaussian parameters and seed geometry train the K predictor.
-        seed_position = (
-            geometry_weight[:, :, None, None] * seed_position
-        ).sum(dim=1)
-        seed_ref = (
-            geometry_weight[:, :, None, None] * seed_ref
-        ).sum(dim=1)
+        selected_index = packing["anchor_k"] - 1
+        anchor_rows = torch.arange(
+            anchor_feature.shape[0], device=anchor_feature.device
+        )
+        # Geometry follows the same hard expert route as its K-specific head.
+        # Do not mix unrelated candidate seed positions in the ST backward:
+        # learned-count gradients are carried solely by the selected expert's
+        # activated-opacity gate inside GridSlotHead.
+        seed_position = seed_position[anchor_rows, selected_index]
+        seed_ref = seed_ref[anchor_rows, selected_index]
+        # This side-output is detached and remains token-level. It never enters
+        # Gaussian assembly, temporal rendering, or the training loss graph.
+        routing_stats = {
+            "k_logits": packing["k_logits"].detach(),
+            "selected_k": packing["anchor_k"].detach(),
+            "token_position_sensor": token_position.detach(),
+            "is_dynamic": anchor_metadata["is_dynamic"].detach(),
+        }
+        # Loss-only side output. Unlike routing_stats, this tensor intentionally
+        # retains autograd and is removed before the temporal model/renderer.
+        routing_budget_logits = packing["k_logits"]
     else:
         seed_ref = anchor_metadata["seed_ref"]
 
@@ -182,6 +197,8 @@ def build_grid_gaussian_seeds(
         metadata=metadata,
         gradient_weight=gradient_weight,
         raw_params=raw_params,
+        routing_stats=routing_stats,
+        routing_budget_logits=routing_budget_logits,
     )
 
 
