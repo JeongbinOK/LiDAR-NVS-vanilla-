@@ -12,6 +12,11 @@ from src.models_new.utils.debug_finite import (
     gaussian_param_absmax,
     tensor_report,
 )
+from src.models_new.utils.routing_logging import (
+    distributed_sum_statistics,
+    range_bin_labels,
+    routing_sufficient_statistics,
+)
 
 WANDB_COMMON_LOSS_KEYS = {
     "loss_depth",
@@ -20,6 +25,11 @@ WANDB_COMMON_LOSS_KEYS = {
     "loss_raydrop",
     "loss_chamfer",
     "loss_scale",
+    "loss_budget",
+    "wc_budget",
+    "budget_expected_mean_k",
+    "budget_violation",
+    "budget_effective_weight",
     "render_points_mean",
     "intensity_psnr_valid",
     "intensity_ssim_valid",
@@ -30,6 +40,14 @@ WANDB_COMMON_LOSS_KEYS = {
     "depth_psnr_raydrop",
     "depth_ssim_raydrop",
     "total",
+}
+
+GLOBAL_REDUCED_LOSS_KEYS = {
+    "loss_budget",
+    "wc_budget",
+    "budget_expected_mean_k",
+    "budget_violation",
+    "budget_effective_weight",
 }
 
 class ModelWrapper(LightningModule):
@@ -55,6 +73,63 @@ class ModelWrapper(LightningModule):
         self._metric_interval = int(self._cfg_get("metrics.interval", 50))
         if self._metric_interval <= 0:
             raise ValueError("metrics.interval must be positive")
+        self._routing_logging_enable = bool(self._cfg_get(
+            "p2g.grid_query.learned_count.logging.enable", False
+        ))
+        self._routing_logging_interval = int(self._cfg_get(
+            "p2g.grid_query.learned_count.logging.interval", 20
+        ))
+        self._routing_range_edges = tuple(float(value) for value in self._cfg_get(
+            "p2g.grid_query.learned_count.logging.range_edges_m",
+            (0, 10, 20, 30, 40, 60, 80, 110),
+        ))
+        if self._routing_logging_interval <= 0:
+            raise ValueError(
+                "p2g.grid_query.learned_count.logging.interval must be positive"
+            )
+        # Validates lower-bound ordering once, before the first train batch.
+        range_bin_labels(self._routing_range_edges)
+        self._last_train_routing_step = -1
+        budget_requested = bool(self._cfg_get(
+            "p2g.grid_query.learned_count.budget.enable", False
+        ))
+        self._budget_enable = (
+            budget_requested
+            and str(self._cfg_get("p2g.anchor_mode", "spherical")).lower() == "grid"
+            and str(
+                self._cfg_get("p2g.grid_query.count_mode", "legacy")
+            ).lower() == "learned_gumbel"
+        )
+        self._budget_target_mean_k = float(self._cfg_get(
+            "p2g.grid_query.learned_count.budget.target_mean_k", 2.0
+        ))
+        self._budget_weight = float(self._cfg_get(
+            "p2g.grid_query.learned_count.budget.weight", 1.0
+        ))
+        self._budget_warmup_steps = int(self._cfg_get(
+            "p2g.grid_query.learned_count.budget.warmup_steps", 500
+        ))
+        self._budget_ramp_steps = int(self._cfg_get(
+            "p2g.grid_query.learned_count.budget.ramp_steps", 1000
+        ))
+        if self._budget_enable:
+            budget_k_max = int(self._cfg_get(
+                "p2g.grid_query.learned_count.K_max", 0
+            ))
+            if not 1.0 <= self._budget_target_mean_k <= float(budget_k_max):
+                raise ValueError(
+                    "learned_count.budget.target_mean_k must be in "
+                    f"[1, {budget_k_max}]"
+                )
+            if self._budget_weight < 0.0:
+                raise ValueError(
+                    "learned_count.budget.weight must be non-negative"
+                )
+            if self._budget_warmup_steps < 0 or self._budget_ramp_steps < 0:
+                raise ValueError(
+                    "learned_count.budget warmup_steps/ramp_steps must be "
+                    "non-negative"
+                )
         # With gradient accumulation, multiple training batches can share one
         # Lightning global_step. Compute sparse metrics only once for that
         # optimizer step.
@@ -94,8 +169,11 @@ class ModelWrapper(LightningModule):
 
     def _shared_step(self, batch, batch_idx, *, prefix: str):
         _input, gt = batch["input"], batch["gt"]
-        out = self.p2g_model(_input, batch_idx=batch_idx, mode=prefix)
-        out = self.g2g_model(out, _input["timestamps"])
+        p2g_out = self.p2g_model(_input, batch_idx=batch_idx, mode=prefix)
+        # Keep detached diagnostics outside the renderer/temporal model input.
+        routing_stats = p2g_out.pop("routing_stats", None)
+        routing_budget_logits = p2g_out.pop("routing_budget_logits", None)
+        out = self.g2g_model(p2g_out, _input["timestamps"])
         all_renders = self.g2p_model(out, gt)
 
         compute_valid_metrics, compute_official_metrics = self._metric_schedule(
@@ -104,11 +182,16 @@ class ModelWrapper(LightningModule):
         loss_dict = self.loss(
             all_renders,
             gaussians=out,
+            routing_budget=self._routing_budget_spec(
+                routing_budget_logits,
+                prefix=prefix,
+            ),
             metric_mode=prefix,
             compute_valid_metrics=compute_valid_metrics,
             compute_raydrop_metrics=compute_official_metrics,
         )
         self._log_losses(loss_dict, prefix=prefix, batch_size=self._batch_size(_input))
+        self._log_routing_stats(routing_stats, prefix=prefix)
 
         if self._dbg_finite and prefix == "train":
             self._debug_forward(out, all_renders, loss_dict, batch_idx)
@@ -220,9 +303,179 @@ class ModelWrapper(LightningModule):
                 on_step=True,
                 on_epoch=True,
                 prog_bar=(key == "total" or key.startswith("loss_")),
-                sync_dist=True,
+                # Budget terms already contain an autograd-safe global token
+                # reduction and therefore have identical forward values on all
+                # ranks. Avoid redundant logging collectives for those keys.
+                sync_dist=(key not in GLOBAL_REDUCED_LOSS_KEYS),
                 batch_size=batch_size,
             )
+
+    def _routing_budget_spec(
+        self,
+        routing_budget_logits: torch.Tensor | None,
+        *,
+        prefix: str,
+    ) -> dict | None:
+        """Build the optional router input consumed by the shared Loss module."""
+        if prefix != "train" or not self._budget_enable:
+            return None
+        if routing_budget_logits is None:
+            raise RuntimeError(
+                "learned-count budget is enabled but routing logits are missing"
+            )
+        return {
+            "logits": routing_budget_logits,
+            "target_mean_k": self._budget_target_mean_k,
+            "weight": self._budget_weight,
+            "step": int(self.global_step),
+            "warmup_steps": self._budget_warmup_steps,
+            "ramp_steps": self._budget_ramp_steps,
+        }
+
+    def _log_routing_stats(self, routing: dict | None, *, prefix: str) -> None:
+        """Log detached learned-count diagnostics without touching render/loss."""
+        if not self._routing_logging_enable or routing is None:
+            return
+        if prefix == "train":
+            step = int(self.global_step)
+            if (
+                step % self._routing_logging_interval != 0
+                or step == self._last_train_routing_step
+            ):
+                return
+            self._last_train_routing_step = step
+
+        statistics = routing_sufficient_statistics(
+            routing, self._routing_range_edges
+        )
+        statistics = distributed_sum_statistics(statistics)
+        token_count = statistics["token_count"]
+        if not bool((token_count > 0).item()):
+            return
+
+        on_step = prefix == "train"
+        base_batch_size = max(1, int(token_count.item()))
+
+        def log_value(name, value, *, batch_size=base_batch_size):
+            self.log(
+                f"{prefix}/routing/{name}",
+                value,
+                on_step=on_step,
+                on_epoch=True,
+                sync_dist=False,  # statistics were explicitly summed above.
+                batch_size=max(1, int(batch_size)),
+            )
+
+        log_value("tokens", token_count)
+        log_value("gaussians", statistics["sampled_k_sum"])
+        log_value(
+            "sampled/mean_k",
+            statistics["sampled_k_sum"] / token_count,
+        )
+        log_value(
+            "policy/expected_mean_k",
+            statistics["expected_k_sum"] / token_count,
+        )
+        log_value(
+            "argmax/mean_k",
+            statistics["argmax_k_sum"] / token_count,
+        )
+        log_value(
+            "policy/normalized_entropy",
+            statistics["entropy_sum"] / token_count,
+        )
+        log_value(
+            "policy/mean_top1_prob",
+            statistics["top1_prob_sum"] / token_count,
+        )
+        log_value(
+            "policy/mean_logit_margin",
+            statistics["logit_margin_sum"] / token_count,
+        )
+
+        k_max = int(statistics["selected_counts"].numel())
+        for index in range(k_max):
+            k = index + 1
+            log_value(
+                f"sampled/frac_k{k}",
+                statistics["selected_counts"][index] / token_count,
+            )
+            log_value(
+                f"argmax/frac_k{k}",
+                statistics["argmax_counts"][index] / token_count,
+            )
+            log_value(
+                f"policy/prob_k{k}",
+                statistics["policy_prob_sums"][index] / token_count,
+            )
+
+        range_labels = range_bin_labels(self._routing_range_edges)
+        for index, label in enumerate(range_labels):
+            count = statistics["range_token_counts"][index]
+            log_value(f"range/{label}/token_frac", count / token_count)
+            if not bool((count > 0).item()):
+                continue
+            bin_batch_size = int(count.item())
+            log_value(
+                f"range/{label}/sampled_mean_k",
+                statistics["range_sampled_k_sums"][index] / count,
+                batch_size=bin_batch_size,
+            )
+            log_value(
+                f"range/{label}/expected_mean_k",
+                statistics["range_expected_k_sums"][index] / count,
+                batch_size=bin_batch_size,
+            )
+            log_value(
+                f"range/{label}/argmax_mean_k",
+                statistics["range_argmax_k_sums"][index] / count,
+                batch_size=bin_batch_size,
+            )
+
+        for group_index, group_name in enumerate(("bg", "fg")):
+            count = statistics["group_token_counts"][group_index]
+            log_value(f"{group_name}/token_frac", count / token_count)
+            if not bool((count > 0).item()):
+                continue
+            group_batch_size = int(count.item())
+            log_value(
+                f"{group_name}/sampled_mean_k",
+                statistics["group_sampled_k_sums"][group_index] / count,
+                batch_size=group_batch_size,
+            )
+            log_value(
+                f"{group_name}/expected_mean_k",
+                statistics["group_expected_k_sums"][group_index] / count,
+                batch_size=group_batch_size,
+            )
+            log_value(
+                f"{group_name}/argmax_mean_k",
+                statistics["group_argmax_k_sums"][group_index] / count,
+                batch_size=group_batch_size,
+            )
+            for index in range(k_max):
+                k = index + 1
+                log_value(
+                    f"{group_name}/sampled_frac_k{k}",
+                    statistics["group_selected_counts"][
+                        group_index, index
+                    ] / count,
+                    batch_size=group_batch_size,
+                )
+                log_value(
+                    f"{group_name}/argmax_frac_k{k}",
+                    statistics["group_argmax_counts"][
+                        group_index, index
+                    ] / count,
+                    batch_size=group_batch_size,
+                )
+                log_value(
+                    f"{group_name}/policy_prob_k{k}",
+                    statistics["group_policy_prob_sums"][
+                        group_index, index
+                    ] / count,
+                    batch_size=group_batch_size,
+                )
 
     def _record_eval_summary(self, losses: dict, *, batch_idx: int, prefix: str) -> None:
         summary = {

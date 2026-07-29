@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from skimage.metrics import structural_similarity
@@ -12,6 +13,138 @@ except ImportError:
     lpips = None
 
 SCALE_REG_MAX_M = 2.5
+
+
+def budget_weight_at_step(
+    max_weight: float,
+    step: int,
+    warmup_steps: int,
+    ramp_steps: int,
+) -> float:
+    """Return a 0 -> max_weight linear schedule in optimizer-step units."""
+    max_weight = float(max_weight)
+    step = int(step)
+    warmup_steps = int(warmup_steps)
+    ramp_steps = int(ramp_steps)
+    if max_weight < 0.0:
+        raise ValueError("budget weight must be non-negative")
+    if warmup_steps < 0 or ramp_steps < 0:
+        raise ValueError("budget warmup_steps and ramp_steps must be non-negative")
+    if step < warmup_steps:
+        return 0.0
+    if ramp_steps == 0:
+        return max_weight
+    progress = min(max((step - warmup_steps) / ramp_steps, 0.0), 1.0)
+    return max_weight * progress
+
+
+def expected_k_sum_from_logits(logits: torch.Tensor) -> torch.Tensor:
+    """Return the noise-free categorical expected-K sum for local tokens."""
+    if logits.ndim != 2 or logits.shape[1] < 2:
+        raise ValueError("budget k_logits must have shape (N, K) with K >= 2")
+    work_logits = logits.float()
+    k_values = torch.arange(
+        1,
+        work_logits.shape[1] + 1,
+        device=work_logits.device,
+        dtype=work_logits.dtype,
+    )
+    policy = torch.softmax(work_logits, dim=-1)
+    return (policy * k_values).sum(dim=-1).sum()
+
+
+def distributed_token_mean(
+    local_value_sum: torch.Tensor,
+    local_token_count: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute an exact global token mean with DDP-correct local gradients.
+
+    The collective operates only on detached sufficient statistics. Each rank
+    then adds a zero-valued local surrogate whose derivative is multiplied by
+    ``world_size``. PyTorch DDP averages parameter gradients across ranks, so
+    the resulting averaged gradient equals that of one global token-weighted
+    mean, even when ranks contain different numbers of tokens.
+    """
+    if local_value_sum.ndim != 0:
+        raise ValueError("local_value_sum must be a scalar tensor")
+    local_token_count = int(local_token_count)
+    if local_token_count < 0:
+        raise ValueError("local_token_count must be non-negative")
+
+    count = local_value_sum.detach().new_tensor(float(local_token_count))
+    reduced = torch.stack((local_value_sum.detach(), count))
+    world_size = 1
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(reduced, op=dist.ReduceOp.SUM)
+        world_size = dist.get_world_size()
+
+    global_sum, global_count = reduced.unbind()
+    if not bool((global_count > 0).item()):
+        return local_value_sum * 0.0, global_count
+
+    local_surrogate = (
+        float(world_size)
+        * (local_value_sum - local_value_sum.detach())
+        / global_count
+    )
+    global_mean = global_sum / global_count + local_surrogate
+    return global_mean, global_count
+
+
+def target_budget_loss(
+    logits: torch.Tensor,
+    *,
+    target_mean_k: float,
+    max_weight: float,
+    step: int,
+    warmup_steps: int,
+    ramp_steps: int,
+) -> dict[str, torch.Tensor]:
+    """Build the normalized global expected-mean-K target loss."""
+    if logits.ndim != 2 or logits.shape[1] < 2:
+        raise ValueError("budget k_logits must have shape (N, K) with K >= 2")
+    k_max = int(logits.shape[1])
+    target_mean_k = float(target_mean_k)
+    if not 1.0 <= target_mean_k <= float(k_max):
+        raise ValueError(
+            f"budget target_mean_k must be in [1, {k_max}], "
+            f"got {target_mean_k}"
+        )
+
+    local_expected_k_sum = expected_k_sum_from_logits(logits)
+    expected_mean_k, global_token_count = distributed_token_mean(
+        local_expected_k_sum,
+        logits.shape[0],
+    )
+    effective_weight = budget_weight_at_step(
+        max_weight,
+        step,
+        warmup_steps,
+        ramp_steps,
+    )
+    weight = expected_mean_k.new_tensor(effective_weight)
+    if not bool((global_token_count > 0).item()):
+        zero = local_expected_k_sum * 0.0
+        return {
+            "expected_mean_k": zero,
+            "global_token_count": global_token_count,
+            "violation": zero,
+            "loss": zero,
+            "weight": weight,
+            "weighted_loss": zero,
+        }
+
+    violation = expected_mean_k - target_mean_k
+    normalized_violation = violation / float(k_max - 1)
+    loss = normalized_violation.square()
+    return {
+        "expected_mean_k": expected_mean_k,
+        "global_token_count": global_token_count,
+        "violation": violation,
+        "loss": loss,
+        "weight": weight,
+        "weighted_loss": weight * loss,
+    }
 
 
 class Loss(nn.Module):
@@ -187,6 +320,7 @@ class Loss(nn.Module):
         all_renders,
         *,
         gaussians=None,
+        routing_budget=None,
         metric_mode="train",
         compute_valid_metrics=True,
         compute_raydrop_metrics=True,
@@ -381,5 +515,27 @@ class Loss(nn.Module):
         losses["wc_raydrop"]      = (self.w_raydrop      * losses["loss_raydrop"]).detach()
         losses["wc_chamfer"]      = (self.w_chamfer      * losses["loss_chamfer"]).detach()
         losses["wc_scale"]        = (self.w_scale        * losses["loss_scale"]).detach()
+
+        # Optional learned-count regularization belongs to the same loss
+        # assembly as the rendering terms. Existing callers omit this argument
+        # and therefore preserve their historical total exactly.
+        if routing_budget is not None:
+            budget_logits = routing_budget.get("logits")
+            if budget_logits is None:
+                raise ValueError("routing_budget requires attached router logits")
+            terms = target_budget_loss(
+                budget_logits,
+                target_mean_k=routing_budget["target_mean_k"],
+                max_weight=routing_budget["weight"],
+                step=routing_budget["step"],
+                warmup_steps=routing_budget["warmup_steps"],
+                ramp_steps=routing_budget["ramp_steps"],
+            )
+            losses["loss_budget"] = terms["loss"]
+            losses["wc_budget"] = terms["weighted_loss"].detach()
+            losses["budget_expected_mean_k"] = terms["expected_mean_k"].detach()
+            losses["budget_violation"] = terms["violation"].detach()
+            losses["budget_effective_weight"] = terms["weight"].detach()
+            losses["total"] = losses["total"] + terms["weighted_loss"]
 
         return losses
