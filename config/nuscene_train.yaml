@@ -1,7 +1,7 @@
-device: [0,1,2,3]
+device: [4, 5]
 
 project_name: 2dgs-utonia
-exp_name:  ${p2g.anchor_mode}-${p2g.grid_query.count_mode}-3slots_loss_w
+exp_name:  naive_adaptive_K #${p2g.anchor_mode}-bs-${train.batch_size}-exp1
 mode: train
 
 
@@ -75,7 +75,7 @@ p2g:
   freeze_utonia: true
   utonia_ckpt: null   # optional abs path override; null -> checkpoints/utonia/utonia.pth (config dump: config/utonia_pretrained.yaml)
   utonia_feature_stage: 3  # encoder stage index: 3 -> 0.4m/432D, 4 -> 0.8m/576D (default/final)
-  anchor_mode: spherical   # "spherical" | "grid"
+  anchor_mode: grid   # "spherical" | "grid"
   squery:                       # spherical mode only: raw-point occupied cell = anchor
                                 # (temporal fusion은 grid_query 블록으로 양 모드 공유;
                                 # 이 head의 K/V는 own-frame token으로 한정)
@@ -100,15 +100,30 @@ p2g:
   grid_query:                   # 공유 temporal fusion(bg_radius_m/bg_max_kv_per_frame/
                                 # num_heads/bg_layers/fg_layers는 양 모드 사용) +
                                 # grid mode 전용 K routing/head 설정
-    count_mode: learned_gumbel  # legacy | learned_gumbel; 이전 config에서 생략 시 legacy
+    count_mode: learned_gumbel  # legacy | learned_gumbel
     K_max: 3                    # legacy only: occupied 0.4m cell당 최대 Gaussian 수
     points_per_gaussian: 4      # legacy exp=null only: K_i=ceil(raw_count/this), capped by K_max
-    exp: null                   # legacy only: null=raw-count range quantile;
+    exp: 1                      # legacy only: null=raw-count range quantile;
                                 # 1=one raw-point medoid; 2=two token-coordinate seeds
     learned_count:              # learned_gumbel only; legacy K_max/points_per_gaussian/exp와 독립
-      K_max: 4                  # logits=[K1,K2,K3,K4], K별 독립 joint head
+      K_max: 4                  # logits=[K1,K2,K3,K4], token별 selected-only K head
       tau: 1.0                  # train: hard Gumbel-ST temperature; eval: deterministic argmax
       seed_mode: range_quantile # K별 range-quantile candidate bank (A안)
+      # K-head 입력 gradient만 1/sqrt(K)로 줄이고 router에는 적용하지 않음.
+      # learned_count 내부 옵션이므로 count_mode=legacy 전환 시 과거 output 방식 유지.
+      grad_balance_scope: token
+      budget:
+        enable: true
+        # DDP 전체 token의 noise-free policy E[K] 평균을 이 값에 맞춤.
+        target_mean_k: 2.0
+        weight: 1.0
+        warmup_steps: 500       # 이 optimizer step 전까지 budget gradient=0
+        ramp_steps: 1000        # 이후 weight를 0 -> 1.0으로 선형 증가
+      logging:
+        enable: true
+        interval: 20            # optimizer step 기준 train routing 통계 주기
+        # 각 값은 bin lower bound: [0,10), ... [80,110), [110,inf)
+        range_edges_m: [0, 10, 20, 30, 40, 60, 80, 110]
     bg_radius_m: 0.8
     bg_max_kv_per_frame: 8
     num_heads: 8
