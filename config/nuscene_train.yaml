@@ -1,4 +1,4 @@
-device: [4, 5]
+device: [5, 6]
 
 project_name: 2dgs-utonia
 exp_name:  naive_adaptive_K #${p2g.anchor_mode}-bs-${train.batch_size}-exp1
@@ -97,6 +97,9 @@ p2g:
     rope_scale_fg: adaptive   # adaptive | fixed
     attn_chunk: 8192
     n_layers: 2                # bg·fg 공유 cross-attn depth (query refinement 라운드 수)
+    cross_attn_backend: flash_varlen # real-batch: 118.5 -> 24.6 ms fwd+bwd
+    self_attn_layers: 1         # cross refinement 뒤 anchor별 query set block
+    self_attn_backend: flash_varlen  # real-batch: 21.8 -> 13.8 ms fwd+bwd
   grid_query:                   # 공유 temporal fusion(bg_radius_m/bg_max_kv_per_frame/
                                 # num_heads/bg_layers/fg_layers는 양 모드 사용) +
                                 # grid mode 전용 K routing/head 설정

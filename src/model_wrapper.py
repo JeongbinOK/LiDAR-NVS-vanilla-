@@ -26,10 +26,8 @@ WANDB_COMMON_LOSS_KEYS = {
     "loss_chamfer",
     "loss_scale",
     "loss_budget",
-    "wc_budget",
     "budget_expected_mean_k",
     "budget_violation",
-    "budget_effective_weight",
     "render_points_mean",
     "intensity_psnr_valid",
     "intensity_ssim_valid",
@@ -44,11 +42,16 @@ WANDB_COMMON_LOSS_KEYS = {
 
 GLOBAL_REDUCED_LOSS_KEYS = {
     "loss_budget",
-    "wc_budget",
     "budget_expected_mean_k",
     "budget_violation",
-    "budget_effective_weight",
 }
+
+ADAPTIVE_BUDGET_LOG_KEYS = {
+    "loss_budget",
+    "budget_expected_mean_k",
+    "budget_violation",
+}
+
 
 class ModelWrapper(LightningModule):
     def __init__(
@@ -297,10 +300,11 @@ class ModelWrapper(LightningModule):
                 continue
             if not torch.is_tensor(value):
                 continue
+            epoch_only = key in ADAPTIVE_BUDGET_LOG_KEYS
             self.log(
                 f"{prefix}/{key}",
                 value,
-                on_step=True,
+                on_step=not epoch_only,
                 on_epoch=True,
                 prog_bar=(key == "total" or key.startswith("loss_")),
                 # Budget terms already contain an autograd-safe global token
@@ -333,7 +337,7 @@ class ModelWrapper(LightningModule):
         }
 
     def _log_routing_stats(self, routing: dict | None, *, prefix: str) -> None:
-        """Log detached learned-count diagnostics without touching render/loss."""
+        """Accumulate detached learned-count diagnostics for epoch-only logs."""
         if not self._routing_logging_enable or routing is None:
             return
         if prefix == "train":
@@ -353,44 +357,26 @@ class ModelWrapper(LightningModule):
         if not bool((token_count > 0).item()):
             return
 
-        on_step = prefix == "train"
         base_batch_size = max(1, int(token_count.item()))
 
         def log_value(name, value, *, batch_size=base_batch_size):
             self.log(
                 f"{prefix}/routing/{name}",
                 value,
-                on_step=on_step,
+                on_step=False,
                 on_epoch=True,
                 sync_dist=False,  # statistics were explicitly summed above.
                 batch_size=max(1, int(batch_size)),
             )
 
-        log_value("tokens", token_count)
         log_value("gaussians", statistics["sampled_k_sum"])
         log_value(
             "sampled/mean_k",
             statistics["sampled_k_sum"] / token_count,
         )
         log_value(
-            "policy/expected_mean_k",
-            statistics["expected_k_sum"] / token_count,
-        )
-        log_value(
             "argmax/mean_k",
             statistics["argmax_k_sum"] / token_count,
-        )
-        log_value(
-            "policy/normalized_entropy",
-            statistics["entropy_sum"] / token_count,
-        )
-        log_value(
-            "policy/mean_top1_prob",
-            statistics["top1_prob_sum"] / token_count,
-        )
-        log_value(
-            "policy/mean_logit_margin",
-            statistics["logit_margin_sum"] / token_count,
         )
 
         k_max = int(statistics["selected_counts"].numel())
@@ -404,11 +390,6 @@ class ModelWrapper(LightningModule):
                 f"argmax/frac_k{k}",
                 statistics["argmax_counts"][index] / token_count,
             )
-            log_value(
-                f"policy/prob_k{k}",
-                statistics["policy_prob_sums"][index] / token_count,
-            )
-
         range_labels = range_bin_labels(self._routing_range_edges)
         for index, label in enumerate(range_labels):
             count = statistics["range_token_counts"][index]
@@ -419,11 +400,6 @@ class ModelWrapper(LightningModule):
             log_value(
                 f"range/{label}/sampled_mean_k",
                 statistics["range_sampled_k_sums"][index] / count,
-                batch_size=bin_batch_size,
-            )
-            log_value(
-                f"range/{label}/expected_mean_k",
-                statistics["range_expected_k_sums"][index] / count,
                 batch_size=bin_batch_size,
             )
             log_value(
@@ -444,11 +420,6 @@ class ModelWrapper(LightningModule):
                 batch_size=group_batch_size,
             )
             log_value(
-                f"{group_name}/expected_mean_k",
-                statistics["group_expected_k_sums"][group_index] / count,
-                batch_size=group_batch_size,
-            )
-            log_value(
                 f"{group_name}/argmax_mean_k",
                 statistics["group_argmax_k_sums"][group_index] / count,
                 batch_size=group_batch_size,
@@ -465,13 +436,6 @@ class ModelWrapper(LightningModule):
                 log_value(
                     f"{group_name}/argmax_frac_k{k}",
                     statistics["group_argmax_counts"][
-                        group_index, index
-                    ] / count,
-                    batch_size=group_batch_size,
-                )
-                log_value(
-                    f"{group_name}/policy_prob_k{k}",
-                    statistics["group_policy_prob_sums"][
                         group_index, index
                     ] / count,
                     batch_size=group_batch_size,

@@ -62,7 +62,15 @@ class _UnitMapper:
         return input_coord.new_zeros(3)
 
 
-def _aggregate_seed_cell(points, points_per_gaussian, k_max=3, voxel_coord=None, exp=None):
+def _aggregate_seed_cell(
+    points,
+    points_per_gaussian,
+    k_max=3,
+    voxel_coord=None,
+    exp=None,
+    count_mode="legacy",
+    seed_mode=None,
+):
     intensity = torch.arange(1, points.shape[0] + 1, dtype=points.dtype)
     grid_coord = torch.tensor([[0, 0, 0]])
     voxel_feature = torch.tensor([[3.0, 4.0]])
@@ -71,6 +79,7 @@ def _aggregate_seed_cell(points, points_per_gaussian, k_max=3, voxel_coord=None,
     return aggregate_points_to_cells_with_seeds(
         points, intensity, grid_coord, voxel_feature, voxel_coord,
         torch.zeros(3), _UnitMapper(), points_per_gaussian, k_max, exp=exp,
+        count_mode=count_mode, seed_mode=seed_mode,
     )
 
 
@@ -86,6 +95,18 @@ def _builder_cfg(anchor_mode, **grid_overrides):
         intensity_encoder=SimpleNamespace(type="mlp"),
         int_proj=SimpleNamespace(in_dim=5, out_dim=4),
         r_far=80.0,
+    )
+
+
+def _learned_cfg(k_max=4, tau=1.0, **overrides):
+    return _cfg(
+        count_mode="learned_gumbel",
+        learned_count=SimpleNamespace(
+            K_max=k_max,
+            tau=tau,
+            seed_mode="range_quantile",
+        ),
+        **overrides,
     )
 
 
@@ -247,9 +268,58 @@ def test_exp2_uses_two_identical_token_coordinate_seeds_with_two_slots():
     torch.testing.assert_close(seed_data.seed_sensor[0, 2], torch.zeros(3))
 
 
+def test_learned_count_builds_k1_to_k4_range_quantile_seed_bank():
+    points = torch.tensor([
+        [0.05, 0.1, 0.1], [0.15, 0.1, 0.1],
+        [0.25, 0.1, 0.1], [0.35, 0.1, 0.1],
+        [0.45, 0.1, 0.1], [0.55, 0.1, 0.1],
+        [0.65, 0.1, 0.1], [0.75, 0.1, 0.1],
+    ])
+    seed_data = _aggregate_seed_cell(
+        points,
+        points_per_gaussian=None,
+        k_max=4,
+        count_mode="learned_gumbel",
+        seed_mode="range_quantile",
+    )[-1]
+
+    assert seed_data.anchor_k is None
+    assert seed_data.seed_sensor.shape == (1, 4, 4, 3)
+    # N=8: K1->[4], K2->[2,6], K3->[1,4,6], K4->[1,3,5,7].
+    expected_rows = ([4], [2, 6], [1, 4, 6], [1, 3, 5, 7])
+    for candidate_index, rows in enumerate(expected_rows):
+        k = candidate_index + 1
+        torch.testing.assert_close(
+            seed_data.seed_sensor[0, candidate_index, :k],
+            points[torch.tensor(rows)],
+        )
+        torch.testing.assert_close(
+            seed_data.delta_sensor[0, candidate_index, :k],
+            points[torch.tensor(rows)] - torch.tensor([0.5, 0.5, 0.5]),
+        )
+        torch.testing.assert_close(
+            seed_data.seed_sensor[0, candidate_index, k:],
+            torch.zeros(4 - k, 3),
+        )
+
+
 def test_grid_builder_exp_switches_only_grid_seed_construction():
     grid_builder = OccupiedGridTokenBuilder(_builder_cfg("grid", exp=2))
-    assert grid_builder.grid_seed_config == (4, 3, 2)
+    assert grid_builder.grid_seed_config == ("legacy", 4, 3, 2, None)
+    learned_builder = OccupiedGridTokenBuilder(_builder_cfg(
+        "grid",
+        count_mode="learned_gumbel",
+        # These invalid legacy values prove this branch does not read them.
+        K_max=-1,
+        points_per_gaussian=-1,
+        exp=99,
+        learned_count=SimpleNamespace(
+            K_max=4, tau=1.0, seed_mode="range_quantile",
+        ),
+    ))
+    assert learned_builder.grid_seed_config == (
+        "learned_gumbel", None, 4, None, "range_quantile",
+    )
     spherical_builder = OccupiedGridTokenBuilder(_builder_cfg("spherical", exp=2))
     assert spherical_builder.grid_seed_config is None
 
@@ -356,6 +426,110 @@ def test_k_heads_derive_the_production_parameter_width_from_gs_params():
     assert [module.out_features for module in head.k_heads] == [42, 84, 126]
 
 
+def test_learned_count_adds_k4_head_and_post_fusion_mlp_only_in_new_mode():
+    legacy = GridSlotHead(_cfg(), _gs_params(), dim=8)
+    learned = GridSlotHead(_learned_cfg(), _gs_params(), dim=8)
+
+    assert not hasattr(legacy, "count_predictor")
+    assert len(legacy.k_heads) == 3
+    assert learned.count_predictor[-1].out_features == 4
+    assert [module.out_features for module in learned.k_heads] == [6, 12, 18, 24]
+    assert learned.trunk[0].in_features == 8 + 4 * 3
+
+
+def test_learned_count_eval_argmax_routes_exactly_to_k2_joint_head():
+    head = GridSlotHead(_learned_cfg(), _gs_params(), dim=8)
+    head.eval()
+    with torch.no_grad():
+        head.count_predictor[-1].weight.zero_()
+        head.count_predictor[-1].bias.copy_(
+            torch.tensor([-3.0, 5.0, -2.0, -1.0])
+        )
+        for k, k_head in enumerate(head.k_heads, start=1):
+            k_head.weight.zero_()
+            bias = torch.arange(k, dtype=torch.float32).add_(10 * k)
+            k_head.bias.copy_(
+                bias[:, None].expand(k, head.param_dim).reshape(-1)
+            )
+
+    raw_params, packing = head(
+        torch.randn(2, 8),
+        None,
+        torch.zeros(2, 4, 4, 3),
+        torch.tensor([2]),
+    )
+
+    assert packing["anchor_k"].tolist() == [2, 2]
+    assert packing["gaussian_offset"].tolist() == [4]
+    torch.testing.assert_close(
+        packing["k_selection"],
+        torch.tensor([[0.0, 1.0, 0.0, 0.0]]).expand(2, -1),
+    )
+    expected = torch.tensor([20.0, 21.0, 20.0, 21.0])
+    torch.testing.assert_close(
+        raw_params, expected[:, None].expand(-1, head.param_dim)
+    )
+
+
+def test_learned_count_selected_opacity_gate_trains_router_and_only_k3_head():
+    class FixedK3Head(GridSlotHead):
+        def _gumbel_selection(self, logits):
+            soft = torch.softmax(logits / self.gumbel_tau, dim=-1)
+            hard = torch.zeros_like(soft)
+            hard[:, 2] = 1.0
+            return hard - soft.detach() + soft
+
+    torch.manual_seed(17)
+    head = FixedK3Head(_learned_cfg(tau=0.7), _gs_params(), dim=8)
+    feature = torch.randn(1, 8, requires_grad=True)
+    raw_params, packing = head(
+        feature,
+        None,
+        torch.randn(1, 4, 4, 3),
+        torch.tensor([1]),
+    )
+
+    assert packing["anchor_k"].tolist() == [3]
+    assert torch.all((packing["k_selection"] == 0) | (packing["k_selection"] == 1))
+    assert torch.allclose(
+        packing["k_selection"].sum(dim=-1),
+        torch.ones(1),
+    )
+    torch.testing.assert_close(
+        packing["packed_selected_gate"],
+        torch.ones(3),
+    )
+
+    packing["k_logits"].retain_grad()
+    opacity = raw_params[:, head.opacity_start:head.opacity_end]
+    torch.sigmoid(opacity).sum().backward()
+
+    predictor_grad = head.count_predictor[-1].weight.grad
+    assert predictor_grad is not None and predictor_grad.abs().sum() > 0
+    assert packing["k_logits"].grad is not None
+    assert torch.all(packing["k_logits"].grad.abs() > 0)
+    assert feature.grad is not None and feature.grad.abs().sum() > 0
+    assert head.k_heads[0].weight.grad is None
+    assert head.k_heads[1].weight.grad is None
+    assert head.k_heads[2].weight.grad is not None
+    assert head.k_heads[2].weight.grad.abs().sum() > 0
+    assert head.k_heads[3].weight.grad is None
+
+
+def test_learned_count_handles_empty_frames():
+    head = GridSlotHead(_learned_cfg(), _gs_params(), dim=8)
+    raw_params, packing = head(
+        torch.zeros(0, 8),
+        None,
+        torch.zeros(0, 4, 4, 3),
+        torch.tensor([0, 0]),
+    )
+
+    assert raw_params.shape == (0, head.param_dim)
+    assert packing["k_selection"].shape == (0, 4)
+    assert packing["gaussian_offset"].tolist() == [0, 0]
+
+
 def test_k_specific_heads_route_mixed_anchors_to_slot_flat_order():
     head = GridSlotHead(_cfg(), _gs_params(), dim=8)
     for k, k_head in enumerate(head.k_heads, start=1):
@@ -413,6 +587,132 @@ def test_gradient_balance_is_forward_identity_on_every_final_output():
     for value in tensors.values():
         expected = weight[:, None].expand_as(value)
         torch.testing.assert_close(value.grad, expected)
+
+
+def test_missing_grad_balance_scope_preserves_historical_output_balancing():
+    head = GridSlotHead(_cfg(), _gs_params(), dim=8)
+    assert head.grad_balance_scope == "output"
+    torch.testing.assert_close(
+        head.gradient_weight(torch.tensor([1, 2, 4]), torch.float32),
+        torch.tensor([1.0, 2.0**-0.5, 0.5]),
+    )
+
+
+def test_token_grad_balance_scales_only_shared_token_path():
+    torch.manual_seed(29)
+    unbalanced = GridSlotHead(
+        _cfg(K_max=4, grad_balance="none", grad_balance_scope="token"),
+        _gs_params(),
+        dim=8,
+    )
+    balanced = GridSlotHead(
+        _cfg(K_max=4, grad_balance="sqrt_k", grad_balance_scope="token"),
+        _gs_params(),
+        dim=8,
+    )
+    balanced.load_state_dict(unbalanced.state_dict())
+
+    base_feature = torch.randn(2, 8)
+    feature_unbalanced = base_feature.clone().requires_grad_()
+    feature_balanced = base_feature.clone().requires_grad_()
+    delta = torch.randn(2, 4, 3)
+    anchor_k = torch.tensor([4, 4])
+    raw_unbalanced, _ = unbalanced(
+        feature_unbalanced, anchor_k, delta, torch.tensor([2])
+    )
+    raw_balanced, packing = balanced(
+        feature_balanced, anchor_k, delta, torch.tensor([2])
+    )
+
+    # The balancing operator is a backward-only identity.
+    torch.testing.assert_close(raw_balanced, raw_unbalanced, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(
+        balanced.gradient_weight(packing["slot_k"], raw_balanced.dtype),
+        torch.ones(8),
+    )
+
+    raw_unbalanced.square().sum().backward()
+    raw_balanced.square().sum().backward()
+
+    # K-head parameters see the same training signal. Only the gradient
+    # returning through the shared trunk/token feature is scaled by 1/sqrt(4).
+    torch.testing.assert_close(
+        balanced.k_heads[3].weight.grad,
+        unbalanced.k_heads[3].weight.grad,
+    )
+    torch.testing.assert_close(
+        balanced.k_heads[3].bias.grad,
+        unbalanced.k_heads[3].bias.grad,
+    )
+    torch.testing.assert_close(
+        balanced.trunk[0].weight.grad,
+        0.5 * unbalanced.trunk[0].weight.grad,
+    )
+    torch.testing.assert_close(
+        balanced.trunk[0].bias.grad,
+        0.5 * unbalanced.trunk[0].bias.grad,
+    )
+    torch.testing.assert_close(
+        feature_balanced.grad,
+        0.5 * feature_unbalanced.grad,
+    )
+
+
+def test_token_grad_balance_does_not_scale_learned_router_gradient():
+    class FixedK4Head(GridSlotHead):
+        def _gumbel_selection(self, logits):
+            soft = torch.softmax(logits / self.gumbel_tau, dim=-1)
+            hard = torch.zeros_like(soft)
+            hard[:, 3] = 1.0
+            return hard - soft.detach() + soft
+
+    torch.manual_seed(31)
+    unbalanced = FixedK4Head(
+        _learned_cfg(
+            grad_balance="none",
+            grad_balance_scope="token",
+        ),
+        _gs_params(),
+        dim=8,
+    )
+    balanced = FixedK4Head(
+        _learned_cfg(
+            grad_balance="sqrt_k",
+            grad_balance_scope="token",
+        ),
+        _gs_params(),
+        dim=8,
+    )
+    balanced.load_state_dict(unbalanced.state_dict())
+
+    base_feature = torch.randn(2, 8)
+    delta = torch.randn(2, 4, 4, 3)
+    outputs = []
+    packings = []
+    for head in (unbalanced, balanced):
+        feature = base_feature.clone().requires_grad_()
+        raw_params, packing = head(
+            feature, None, delta, torch.tensor([2])
+        )
+        packing["k_logits"].retain_grad()
+        opacity = raw_params[:, head.opacity_start:head.opacity_end]
+        torch.sigmoid(opacity).sum().backward()
+        outputs.append(raw_params.detach())
+        packings.append(packing)
+
+    torch.testing.assert_close(outputs[1], outputs[0], rtol=0.0, atol=0.0)
+    torch.testing.assert_close(
+        packings[1]["k_logits"].grad,
+        packings[0]["k_logits"].grad,
+    )
+    torch.testing.assert_close(
+        balanced.count_predictor[-1].weight.grad,
+        unbalanced.count_predictor[-1].weight.grad,
+    )
+    torch.testing.assert_close(
+        balanced.count_predictor[-1].bias.grad,
+        unbalanced.count_predictor[-1].bias.grad,
+    )
 
 
 def test_spatial_hash_uses_exact_radius_and_per_source_frame_cap():

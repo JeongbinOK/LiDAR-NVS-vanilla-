@@ -53,7 +53,10 @@ import torch
 import torch.nn as nn
 
 from ..utils import boxes as box_utils
-from ..utils.attention import AnchorQueryCrossAttention
+from ..utils.attention import (
+    AnchorQueryCrossAttention,
+    AnchorQuerySelfAttention,
+)
 from .spherical_bins import (
     SphericalBins,
     build_cells,
@@ -222,6 +225,22 @@ class SphericalQueryHead(nn.Module):
             # Direct calls default to BG scale. Normal spherical forward passes
             # override it per anchor below without splitting learned weights.
             rope_position_scale=self.bg_rope_position_scale,
+            varlen_backend=str(
+                getattr(squery_cfg, "cross_attn_backend", "fp32_bucket")
+            ),
+        )
+        self.query_self_attn = AnchorQuerySelfAttention(
+            self.dim,
+            num_heads=8,
+            n_layers=int(
+                getattr(squery_cfg, "self_attn_layers", 1) or 1
+            ),
+            mlp_ratio=int(getattr(squery_cfg, "ffn_ratio", 4) or 4),
+            rope_base=_SPHERICAL_ROPE_BASE,
+            rope_position_scale=self.bg_rope_position_scale,
+            varlen_backend=str(
+                getattr(squery_cfg, "self_attn_backend", "fp32_bucket")
+            ),
         )
 
     # ------------------------------------------------------------------ stages
@@ -692,6 +711,18 @@ class SphericalQueryHead(nn.Module):
             queries, kv_feat, kv_pos, pair_anchor, A, seed_out,
             position_scale=anchor_rope_scale,
             query_anchor_ids=query_anchor,
+        )
+        # Cross-attention refines each evidence query from token memory. This
+        # separate set block then exposes every refined query to the sibling
+        # queries of the same (frame, spherical cell, bg/instance label) anchor.
+        # It uses an ordinary residual block; no gate or LayerScale suppresses
+        # the newly introduced query-query path.
+        out_feat = self.query_self_attn(
+            out_feat,
+            seed_out,
+            query_anchor,
+            A,
+            position_scale=anchor_rope_scale,
         )
 
         # ---- Stage E4: queries are already flat, frame/anchor/token-major ----

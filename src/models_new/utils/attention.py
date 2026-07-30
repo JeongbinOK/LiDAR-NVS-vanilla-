@@ -1,6 +1,11 @@
 import torch
 import torch.nn as nn
 
+try:
+    import flash_attn
+except ImportError:
+    flash_attn = None
+
 
 class Rotary3D(nn.Module):
     """Utonia-compatible 3D RoPE with an explicit metric position scale.
@@ -109,24 +114,21 @@ class AnchorQueryCrossAttention(nn.Module):
     The raw-seeded spherical head takes its Gaussian centres from observed
     points, so the historical probability outputs (the attention-weighted K/V
     position ``p_init`` and its per-layer head-averaged weights) are gone and
-    only the attended features are returned. The kernel stays a manual
-    batched einsum on purpose: the anchor groups are tiny (K <= ~6 queries,
-    L <= ~64 K/V, head_dim 24), where measured fused SDPA backends lose --
-    FlashAttention rejects non-null masks and the memory-efficient kernel is
-    slower than plain batched matmul at these shapes. Scores / softmax run in
-    **fp32** (NaN-collapse history under bf16), then cast back.
+    only the attended features are returned. Flat ragged queries support two
+    execution backends: ``fp32_bucket`` retains the manual fp32 score/softmax
+    reference, while ``flash_varlen`` projects the complete ragged Q/K/V once
+    and uses cumulative sequence lengths without an attention mask.
 
     Relative geometry enters the scores via Utonia-compatible ``Rotary3D``:
     every query is rotated by its own ``query_pos`` and every key by its
     ``kv_pos``, so the logits see ``kv_pos - query_pos``. Positions are not
     concatenated into K/V features.
 
-    varlen packing: ``anchor_ids`` (ascending) gives every K/V pair's anchor; per
-    anchor we derive (start, len) via bincount+cumsum and process anchors in chunks
-    of ``chunk`` (padding each chunk to its own ``L_max`` with a bool mask). Padded
-    slots are masked out of the SDPA softmax; a fully-empty anchor (L_a == 0,
-    rare -- membership guarantees >=1 in the normal flow) keeps its query
-    through the residual path only.
+    Varlen packing: ``anchor_ids`` (ascending) gives every K/V pair's anchor.
+    Flash uses the resulting cumulative lengths directly. The fp32 reference
+    processes anchors in chunks of ``chunk`` and pads each chunk to its own
+    ``L_max`` with a bool mask. A fully-empty anchor (rare -- membership
+    guarantees at least one row normally) keeps its query through the residual.
 
     Cross-attention decoder-layer semantics: the K/V memory (``kv_feat``) is fixed;
     each of ``n_layers`` layers re-projects it and updates the queries via
@@ -134,7 +136,8 @@ class AnchorQueryCrossAttention(nn.Module):
     """
 
     def __init__(self, dim, num_heads=8, n_layers=1, chunk=8192, mlp_ratio=4,
-                 rope_base=10.0, rope_position_scale=0.5):
+                 rope_base=10.0, rope_position_scale=0.5,
+                 varlen_backend="fp32_bucket"):
         super().__init__()
         assert dim % num_heads == 0, "dim must be divisible by num_heads"
         self.dim = dim
@@ -143,6 +146,11 @@ class AnchorQueryCrossAttention(nn.Module):
         self.scale = self.head_dim ** -0.5
         self.n_layers = int(n_layers)
         self.chunk = int(chunk)
+        self.varlen_backend = str(varlen_backend).lower()
+        if self.varlen_backend not in ("fp32_bucket", "flash_varlen", "auto"):
+            raise ValueError(
+                "varlen_backend must be 'fp32_bucket', 'flash_varlen', or 'auto'"
+            )
         self.rope = Rotary3D(
             self.head_dim, base=rope_base, position_scale=rope_position_scale
         )
@@ -403,6 +411,37 @@ class AnchorQueryCrossAttention(nn.Module):
                     f"anchor ({A}), got {tuple(anchor_scale.shape)}"
                 )
 
+        use_flash = (
+            queries.is_cuda
+            and flash_attn is not None
+            and self.varlen_backend in ("flash_varlen", "auto")
+        )
+        if (
+            self.varlen_backend == "flash_varlen"
+            and queries.is_cuda
+            and flash_attn is None
+        ):
+            raise RuntimeError(
+                "flash_varlen was requested but flash_attn is unavailable"
+            )
+        if use_flash:
+            kv_counts = torch.bincount(kv_anchor_ids, minlength=A)
+            # The normal spherical membership route gives every occupied anchor
+            # at least one memory row. Retain the exact residual-only behavior of
+            # the reference path for synthetic/degenerate empty-memory anchors.
+            if not bool((kv_counts == 0).any().item()):
+                return self._forward_variable_flash(
+                    queries,
+                    kv_feat,
+                    kv_pos,
+                    query_anchor_ids,
+                    kv_anchor_ids,
+                    q_counts,
+                    kv_counts,
+                    query_pos,
+                    anchor_scale,
+                )
+
         out_parts = []
         row_parts = []
         # The observed support distribution has a small integer tail (rather
@@ -455,3 +494,269 @@ class AnchorQueryCrossAttention(nn.Module):
         packed_rows = torch.cat(row_parts)
         restore = torch.argsort(packed_rows)
         return torch.cat(out_parts, dim=0)[restore]
+
+    def _forward_variable_flash(
+        self,
+        queries,
+        kv_feat,
+        kv_pos,
+        query_anchor_ids,
+        kv_anchor_ids,
+        q_counts,
+        kv_counts,
+        query_pos,
+        anchor_scale,
+    ):
+        """True varlen CUDA path with one Q/K sequence pair per anchor."""
+        q_scale = (
+            anchor_scale
+            if anchor_scale is None or anchor_scale.ndim == 0
+            else anchor_scale[query_anchor_ids]
+        )
+        k_scale = (
+            anchor_scale
+            if anchor_scale is None or anchor_scale.ndim == 0
+            else anchor_scale[kv_anchor_ids]
+        )
+        q_angles = self.rope.angles(
+            query_pos.to(torch.float32), position_scale=q_scale
+        )
+        k_angles = self.rope.angles(
+            kv_pos.to(torch.float32), position_scale=k_scale
+        )
+        cu_seqlens_q = nn.functional.pad(
+            torch.cumsum(q_counts, dim=0, dtype=torch.int32), (1, 0)
+        )
+        cu_seqlens_k = nn.functional.pad(
+            torch.cumsum(kv_counts, dim=0, dtype=torch.int32), (1, 0)
+        )
+        max_seqlen_q = int(q_counts.max().item())
+        max_seqlen_k = int(kv_counts.max().item())
+
+        H, dh = self.num_heads, self.head_dim
+        q_cur = queries
+        for li in range(self.n_layers):
+            qh = self.q_proj[li](q_cur).reshape(-1, H, dh)
+            kh, vh = self.kv_proj[li](kv_feat).chunk(2, dim=-1)
+            kh = kh.reshape(-1, H, dh)
+            vh = vh.reshape(-1, H, dh)
+            q_rot = self.rope.rotate(
+                qh.float(), q_angles[:, None, :, :]
+            )
+            k_rot = self.rope.rotate(
+                kh.float(), k_angles[:, None, :, :]
+            )
+            attended = flash_attn.flash_attn_varlen_func(
+                q=q_rot.to(torch.bfloat16),
+                k=k_rot.to(torch.bfloat16),
+                v=vh.to(torch.bfloat16),
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                dropout_p=0.0,
+                softmax_scale=self.scale,
+                causal=False,
+            )
+            attended = attended.reshape(-1, self.dim).to(q_cur.dtype)
+            q_cur = self.norm[li](
+                q_cur + self.out_proj[li](attended)
+            )
+            q_cur = self.norm_ffn[li](
+                q_cur + self.ffn[li](q_cur)
+            )
+        return q_cur
+
+
+class AnchorQuerySelfAttention(nn.Module):
+    """Per-anchor ragged query self-attention after cross refinement.
+
+    Every query attends only to the sibling evidence queries carrying the same
+    ``query_anchor_id``. The block uses ordinary pre-norm residuals without a
+    gate or LayerScale. CUDA can use one true varlen FlashAttention launch;
+    the reference path buckets anchors by exact query count and keeps fp32
+    scores/softmax.
+    """
+
+    def __init__(
+        self,
+        dim,
+        num_heads=8,
+        n_layers=1,
+        mlp_ratio=4,
+        rope_base=10.0,
+        rope_position_scale=0.5,
+        varlen_backend="fp32_bucket",
+    ):
+        super().__init__()
+        if dim % num_heads != 0:
+            raise ValueError("dim must be divisible by num_heads")
+        self.dim = int(dim)
+        self.num_heads = int(num_heads)
+        self.head_dim = self.dim // self.num_heads
+        self.scale = self.head_dim ** -0.5
+        self.n_layers = int(n_layers)
+        if self.n_layers < 1:
+            raise ValueError("n_layers must be at least one")
+        self.varlen_backend = str(varlen_backend).lower()
+        if self.varlen_backend not in ("fp32_bucket", "flash_varlen", "auto"):
+            raise ValueError(
+                "varlen_backend must be 'fp32_bucket', 'flash_varlen', or 'auto'"
+            )
+        self.rope = Rotary3D(
+            self.head_dim,
+            base=rope_base,
+            position_scale=rope_position_scale,
+        )
+
+        hidden = int(self.dim * mlp_ratio)
+        self.norm1 = nn.ModuleList([
+            nn.LayerNorm(self.dim) for _ in range(self.n_layers)
+        ])
+        self.qkv = nn.ModuleList([
+            nn.Linear(self.dim, self.dim * 3) for _ in range(self.n_layers)
+        ])
+        self.out_proj = nn.ModuleList([
+            nn.Linear(self.dim, self.dim) for _ in range(self.n_layers)
+        ])
+        self.norm2 = nn.ModuleList([
+            nn.LayerNorm(self.dim) for _ in range(self.n_layers)
+        ])
+        self.ffn = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(self.dim, hidden),
+                nn.SiLU(),
+                nn.Linear(hidden, self.dim),
+            )
+            for _ in range(self.n_layers)
+        ])
+
+    def _fp32_bucket(self, q, k, v, counts):
+        starts = torch.cumsum(counts, dim=0) - counts
+        attended = q.new_zeros(q.shape)
+        for q_len in torch.unique(counts, sorted=True).tolist():
+            q_len = int(q_len)
+            anchors = (counts == q_len).nonzero(as_tuple=True)[0]
+            rows = starts[anchors, None] + torch.arange(
+                q_len, device=q.device
+            ).view(1, -1)
+            q_group = q[rows]
+            k_group = k[rows]
+            v_group = v[rows]
+            scores = torch.einsum(
+                "glhd,gshd->ghls", q_group.float(), k_group.float()
+            ) * self.scale
+            probability = torch.softmax(scores, dim=-1)
+            group_out = torch.einsum(
+                "ghls,gshd->glhd", probability, v_group.float()
+            ).to(q.dtype)
+            attended = attended.index_copy(
+                0,
+                rows.reshape(-1),
+                group_out.reshape(-1, self.num_heads, self.head_dim),
+            )
+        return attended
+
+    def _flash_varlen(self, q, k, v, counts):
+        cu_seqlens = nn.functional.pad(
+            torch.cumsum(counts, dim=0, dtype=torch.int32), (1, 0)
+        )
+        qkv = torch.stack([q, k, v], dim=1).to(torch.bfloat16)
+        return flash_attn.flash_attn_varlen_qkvpacked_func(
+            qkv,
+            cu_seqlens,
+            max_seqlen=int(counts.max().item()),
+            dropout_p=0.0,
+            softmax_scale=self.scale,
+            causal=False,
+        ).to(q.dtype)
+
+    def forward(
+        self,
+        queries,
+        query_pos,
+        query_anchor_ids,
+        num_anchors,
+        position_scale=None,
+    ):
+        A = int(num_anchors)
+        G = int(queries.shape[0])
+        if queries.ndim != 2 or queries.shape[1] != self.dim:
+            raise ValueError(
+                f"queries must have shape (G,{self.dim}), got {tuple(queries.shape)}"
+            )
+        if query_pos.shape != (G, 3):
+            raise ValueError(
+                f"query_pos must have shape ({G},3), got {tuple(query_pos.shape)}"
+            )
+        if query_anchor_ids.shape != (G,):
+            raise ValueError("query_anchor_ids must provide one anchor id per query")
+        if G == 0:
+            return queries
+        if A <= 0:
+            raise ValueError("num_anchors must be positive for non-empty queries")
+        if (
+            (query_anchor_ids < 0).any()
+            or (query_anchor_ids >= A).any()
+            or (query_anchor_ids[1:] < query_anchor_ids[:-1]).any()
+        ):
+            raise ValueError(
+                "query_anchor_ids must be ascending and lie in [0, A)"
+            )
+
+        counts = torch.bincount(query_anchor_ids, minlength=A)
+        if (counts == 0).any():
+            raise ValueError("every occupied anchor must own at least one query")
+        anchor_scale = None
+        if position_scale is not None:
+            anchor_scale = torch.as_tensor(
+                position_scale, device=queries.device, dtype=torch.float32
+            )
+            if anchor_scale.ndim > 1 or (
+                anchor_scale.ndim == 1 and anchor_scale.shape[0] != A
+            ):
+                raise ValueError(
+                    "position_scale must be a scalar or have one value per "
+                    f"anchor ({A}), got {tuple(anchor_scale.shape)}"
+                )
+        row_scale = (
+            anchor_scale
+            if anchor_scale is None or anchor_scale.ndim == 0
+            else anchor_scale[query_anchor_ids]
+        )
+        angles = self.rope.angles(
+            query_pos.to(torch.float32), position_scale=row_scale
+        )
+
+        use_flash = (
+            queries.is_cuda
+            and flash_attn is not None
+            and self.varlen_backend in ("flash_varlen", "auto")
+        )
+        if (
+            self.varlen_backend == "flash_varlen"
+            and queries.is_cuda
+            and flash_attn is None
+        ):
+            raise RuntimeError(
+                "flash_varlen was requested but flash_attn is unavailable"
+            )
+
+        x = queries
+        for li in range(self.n_layers):
+            normalized = self.norm1[li](x)
+            q, k, v = self.qkv[li](normalized).reshape(
+                G, 3, self.num_heads, self.head_dim
+            ).unbind(dim=1)
+            q = self.rope.rotate(q.float(), angles[:, None, :, :])
+            k = self.rope.rotate(k.float(), angles[:, None, :, :])
+            if use_flash:
+                attended = self._flash_varlen(q, k, v, counts)
+            else:
+                attended = self._fp32_bucket(
+                    q, k, v, counts
+                )
+            attended = attended.reshape(G, self.dim).to(x.dtype)
+            x = x + self.out_proj[li](attended)
+            x = x + self.ffn[li](self.norm2[li](x))
+        return x

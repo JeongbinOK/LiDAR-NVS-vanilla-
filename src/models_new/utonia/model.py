@@ -450,8 +450,6 @@ class Block(PointModule):
 
     def forward(self, point: Point):
         shortcut = point.feat
-        for b in point.batch.unique():
-            mask = point.batch == b
         point = self.cpe(point)
         point.feat = shortcut + point.feat
         shortcut = point.feat

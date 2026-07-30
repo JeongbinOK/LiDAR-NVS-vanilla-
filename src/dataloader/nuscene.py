@@ -552,32 +552,13 @@ class NuScenesNVSDataset(Dataset):
         input_ring       = [all_lidar_ring[i] for i in input_indices]
         input_pose       = pose[input_indices]                  # (n_input, 4, 4)
         input_timestamps = timestamps[input_indices]            # (n_input,)
-        input_tokens     = [lidar_tokens[i]   for i in input_indices]
-
         input_frame_counts = torch.tensor([p.shape[0] for p in input_pts_ref])
         ref_to_sensor = torch.linalg.inv(pose)
-        input_ref_to_sensor = ref_to_sensor[input_indices]
 
         # ── gt = input endpoints + selected middle sweeps ───────────────────
         gt_frame_counts = torch.tensor([p.shape[0] for p in all_pts_ref])
 
-        # ── Camera 객체 ──────────────────────────────────────────────────────
-        input_cameras = [
-            Camera.from_nuscenes(
-                nusc=self.nusc,
-                lidar_token=lidar_tok,
-                timestamp_normalized=ts_norm,
-                pts_sensor=pts_sensor,
-                lidar_ring=ring,
-                cfg=self.cfg,
-                uid=uid,
-                ref_to_sensor=ref_pose.numpy(),
-            )
-            for uid, (lidar_tok, pts_sensor, ring, ts_norm, ref_pose) in enumerate(
-                zip(input_tokens, input_pts_sensor, input_ring, input_timestamps.tolist(), input_ref_to_sensor)
-            )
-        ]
-
+        # ── 렌더링 supervision에 사용하는 GT Camera 객체 ───────────────────
         gt_cameras = [
             Camera.from_nuscenes(
                 nusc=self.nusc,
@@ -606,7 +587,6 @@ class NuScenesNVSDataset(Dataset):
             'point_iid':              torch.cat(input_iid, dim=0),
             'pose':                   input_pose,                          # (n_input, 4, 4)
             'timestamps':             input_timestamps,                    # (n_input,)
-            'cameras':                input_cameras,
             'input_indices':          torch.tensor(input_indices),         # selected GT 안에서 input 위치
             'input_window_indices':   torch.tensor(input_window_indices),  # 11-frame window 안에서 input 위치
             },
@@ -654,7 +634,6 @@ def multiframe_collate_fn(batch):
     all_input_bbox_iids  = []
     all_input_pose       = []
     all_input_timestamps = []
-    all_input_cameras    = []
     all_input_indices    = []
     all_input_window_indices = []
 
@@ -685,7 +664,6 @@ def multiframe_collate_fn(batch):
         all_input_bbox_iids.append(inp["bbox_instance_ids"])
         all_input_pose.append(inp["pose"])
         all_input_timestamps.append(inp["timestamps"])
-        all_input_cameras.append(inp["cameras"])
         all_input_indices.append(inp["input_indices"])
         all_input_window_indices.append(inp["input_window_indices"])
 
@@ -769,7 +747,6 @@ def multiframe_collate_fn(batch):
             "bbox_instance_ids":    all_input_bbox_iids,  # List[List[Tensor(B_f,)]]
             "pose":                all_input_pose,       # List[Tensor(n_input, 4, 4)]
             "timestamps":          all_input_timestamps, # List[Tensor(n_input,)]
-            "cameras":             all_input_cameras,    # List[List[Camera]]
             "input_indices":       all_input_indices,    # List[Tensor]
             "input_window_indices": all_input_window_indices,
             "ptv3_input":          ptv3_input,

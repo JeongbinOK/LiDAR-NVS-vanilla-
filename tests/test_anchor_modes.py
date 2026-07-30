@@ -15,7 +15,10 @@ from src.models_new.module.spherical_query_head import (
     SphericalQueryHead,
     _select_evidence_seeds,
 )
-from src.models_new.utils.attention import AnchorQueryCrossAttention
+from src.models_new.utils.attention import (
+    AnchorQueryCrossAttention,
+    AnchorQuerySelfAttention,
+)
 def test_only_spherical_and_grid_modes_are_supported():
     assert SUPPORTED_ANCHOR_MODES == ("spherical", "grid")
     assert resolve_anchor_mode(SimpleNamespace(anchor_mode="SPHERICAL")) == "spherical"
@@ -50,7 +53,7 @@ def test_spherical_head_adapts_to_common_seed_contract():
             return fused, token_position, None, None, {}
 
     class QueryHead:
-        def __call__(self, feat, *args):
+        def __call__(self, feat, *args, **kwargs):
             seen["head_feature"] = feat
             return feature, position, delta, torch.ones(3), frame_offset, metadata
 
@@ -78,6 +81,8 @@ def test_spherical_head_adapts_to_common_seed_contract():
     assert seeds.delta is delta
     assert seeds.gradient_weight is None
     assert seeds.raw_params is None
+    assert seeds.routing_stats is None
+    assert seeds.routing_budget_logits is None
 
 
 def _spherical_cfg():
@@ -108,6 +113,18 @@ class _CaptureSeedAttention(nn.Module):
         return torch.arange(
             queries.shape[0], device=queries.device, dtype=queries.dtype
         ).unsqueeze(-1).expand_as(queries).clone()
+
+
+class _PassQuerySelfAttention(nn.Module):
+    def forward(
+        self,
+        queries,
+        query_pos,
+        query_anchor_ids,
+        num_anchors,
+        position_scale=None,
+    ):
+        return queries
 
 
 def test_evidence_seed_is_observed_point_nearest_each_anchor_token_mean():
@@ -188,10 +205,46 @@ def test_variable_query_attention_matches_per_anchor_calls_and_backpropagates():
     assert attention.kv_proj[0].weight.grad.abs().sum() > 0
 
 
+def test_query_self_attention_is_anchor_local_and_uses_plain_residual():
+    torch.manual_seed(23)
+    attention = AnchorQuerySelfAttention(
+        48,
+        num_heads=8,
+        n_layers=1,
+        varlen_backend="fp32_bucket",
+    )
+    query_anchor = torch.tensor([0, 0, 1, 1, 1])
+    query_position = torch.randn(5, 3)
+    query = torch.randn(5, 48, requires_grad=True)
+
+    output = attention(query, query_position, query_anchor, 2)
+    changed_query = query.detach().clone()
+    changed_query[0, 0] += 2.0
+    changed_output = attention(
+        changed_query, query_position, query_anchor, 2
+    )
+
+    assert not torch.allclose(output[1], changed_output[1])
+    torch.testing.assert_close(
+        output[query_anchor == 1],
+        changed_output[query_anchor == 1],
+    )
+    assert not any(
+        "gate" in name or "layer_scale" in name
+        for name, _ in attention.named_parameters()
+    )
+
+    output.square().mean().backward()
+    assert query.grad is not None and query.grad.abs().sum() > 0
+    assert attention.qkv[0].weight.grad is not None
+    assert attention.qkv[0].weight.grad.abs().sum() > 0
+
+
 def test_spherical_head_packs_raw_centres_and_passes_seed_positions_to_rope():
     head = SphericalQueryHead(_spherical_cfg(), dim=48, r_far=80.0)
     capture = _CaptureSeedAttention()
     head.attn = capture
+    head.query_self_attn = _PassQuerySelfAttention()
     token_position = torch.tensor([
         [10.0, 0.0, 0.0], [20.0, 0.0, 0.0], [40.0, 0.0, 0.0],
     ])
@@ -254,6 +307,8 @@ def test_spherical_attention_and_d_plus_3_predictor_backward():
     assert head.p0_norm.weight.grad.abs().sum() > 0
     assert head.attn.kv_proj[0].weight.grad is not None
     assert head.attn.kv_proj[0].weight.grad.abs().sum() > 0
+    assert head.query_self_attn.qkv[0].weight.grad is not None
+    assert head.query_self_attn.qkv[0].weight.grad.abs().sum() > 0
     assert predictor.weight.grad[:, -3:].abs().sum() > 0
 
 
@@ -457,6 +512,7 @@ def test_spherical_head_keeps_fp32_positions_under_bf16_features():
     head = SphericalQueryHead(_spherical_cfg(), dim=48, r_far=80.0)
     capture = _CapturePairsAttention()
     head.attn = capture
+    head.query_self_attn = _PassQuerySelfAttention()
     # mixed bg + fg pairs force the fg box-local position buffer to be
     # concatenated with the fp32 ref positions of the bg pairs.
     token_position = torch.tensor([
@@ -622,3 +678,100 @@ def test_grid_head_expands_positions_metadata_and_gradient_weights():
     torch.testing.assert_close(
         seeds.metadata["coord_ref"], seed_ref[anchor_index, slot_index]
     )
+
+
+def test_learned_grid_head_st_selects_matching_k_seed_geometry():
+    token_feature = torch.randn(1, 4)
+    token_position = torch.zeros(1, 3)
+    candidate_seed = torch.zeros(1, 4, 4, 3)
+    for k in range(1, 5):
+        candidate_seed[0, k - 1, :k, 0] = (
+            10 * k + torch.arange(k, dtype=torch.float32)
+        )
+    candidate_seed.requires_grad_()
+    candidate_delta = candidate_seed.clone()
+    candidate_ref = candidate_seed + 100.0
+    selection = torch.tensor(
+        [[0.0, 1.0, 0.0, 0.0]], requires_grad=True
+    )
+    budget_logits = torch.zeros(1, 4, requires_grad=True)
+    anchor_metadata = {
+        "box_assign": torch.tensor([-1]),
+        "instance_id": torch.tensor([-1]),
+        "is_dynamic": torch.tensor([False]),
+        "coord_ref": token_position,
+        "seed_ref": candidate_ref,
+        "bbox_ref_by_frame": [torch.empty(0, 7)],
+    }
+
+    class TemporalAggregator:
+        def __call__(self, *args):
+            return (
+                token_feature,
+                token_position,
+                candidate_seed,
+                candidate_delta,
+                anchor_metadata,
+            )
+
+    class SlotHead:
+        k_max = 4
+
+        def __call__(self, feature, anchor_k, delta, token_offset):
+            assert anchor_k is None
+            assert delta is candidate_delta
+            return torch.zeros(2, 6), {
+                "anchor_index": torch.tensor([0, 0]),
+                "slot_index": torch.tensor([0, 1]),
+                "slot_k": torch.tensor([2, 2]),
+                "anchor_k": torch.tensor([2]),
+                "gaussian_offset": torch.tensor([2]),
+                "k_logits": budget_logits,
+                "k_selection": selection,
+                "selected_only": True,
+            }
+
+        @staticmethod
+        def gradient_weight(slot_k, dtype):
+            return torch.ones_like(slot_k, dtype=dtype)
+
+    seeds = build_grid_gaussian_seeds(
+        TemporalAggregator(),
+        SlotHead(),
+        token_feature,
+        token_position,
+        None,
+        candidate_seed,
+        candidate_delta,
+        torch.tensor([1]),
+        torch.tensor([0]),
+        [],
+        [],
+        None,
+        None,
+    )
+
+    torch.testing.assert_close(
+        seeds.position[:, 0], torch.tensor([20.0, 21.0])
+    )
+    torch.testing.assert_close(
+        seeds.metadata["coord_ref"][:, 0], torch.tensor([120.0, 121.0])
+    )
+    assert seeds.routing_stats is not None
+    assert seeds.routing_stats["selected_k"].tolist() == [2]
+    torch.testing.assert_close(
+        seeds.routing_stats["k_logits"], torch.zeros(1, 4)
+    )
+    torch.testing.assert_close(
+        seeds.routing_stats["token_position_sensor"], token_position
+    )
+    assert seeds.routing_stats["is_dynamic"].tolist() == [False]
+    assert all(
+        not value.requires_grad for value in seeds.routing_stats.values()
+    )
+    assert seeds.routing_budget_logits is budget_logits
+    assert seeds.routing_budget_logits.requires_grad
+    (seeds.position.sum() + seeds.metadata["coord_ref"].sum()).backward()
+    assert candidate_seed.grad is not None
+    assert candidate_seed.grad.abs().sum() > 0
+    assert selection.grad is None
