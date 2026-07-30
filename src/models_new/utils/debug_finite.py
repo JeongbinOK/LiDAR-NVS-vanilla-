@@ -21,10 +21,6 @@ def tensor_report(t) -> str:
     return f"absmax={fmax:.4g} nan={n_nan} inf={n_inf} numel={tf.numel()}"
 
 
-def is_finite(t) -> bool:
-    return torch.is_tensor(t) and bool(torch.isfinite(t).all())
-
-
 def first_nonfinite(named):
     """named: iterable of (name, tensor). Returns (name, tensor) of first
     non-finite tensor, else (None, None). Non-tensors are skipped."""
@@ -32,40 +28,6 @@ def first_nonfinite(named):
         if torch.is_tensor(t) and not bool(torch.isfinite(t).all()):
             return name, t
     return None, None
-
-
-def gaussian_health_stats(batch_gaussians):
-    """Health metrics that plain absmax misses:
-      - scaling_logit_med / _max : median & max of |raw scale logit| (exp overflows
-        ~88; median≪max => only outlier gaussians are degenerate, not the whole set).
-      - rot_quat_norm_min : MIN raw-quaternion norm. F.normalize's gradient blows up
-        as ||q||->0 (0/0), NOT when ||q|| is large -> this is the correct rotation
-        risk signal (absmax is the wrong one).
-    """
-    scal_abs = []
-    quat_min_norm = float("inf")
-    for b_gs in batch_gaussians:
-        if not isinstance(b_gs, dict):
-            continue
-        s = b_gs.get("scaling")
-        if torch.is_tensor(s) and s.numel():
-            fin = torch.isfinite(s)
-            if bool(fin.any()):
-                scal_abs.append(s[fin].abs().reshape(-1))
-        q = b_gs.get("rotation")
-        if torch.is_tensor(q) and q.numel():
-            n = q.norm(dim=-1)
-            nf = n[torch.isfinite(n)]
-            if nf.numel():
-                quat_min_norm = min(quat_min_norm, float(nf.min()))
-    out = {}
-    if scal_abs:
-        alls = torch.cat(scal_abs)
-        out["scaling_logit_med"] = float(alls.median())
-        out["scaling_logit_max"] = float(alls.max())
-    if quat_min_norm != float("inf"):
-        out["rot_quat_norm_min"] = quat_min_norm
-    return out
 
 
 def gaussian_param_absmax(batch_gaussians, keys=("scaling", "opacity", "rotation", "position", "shs")):

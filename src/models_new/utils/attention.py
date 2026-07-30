@@ -94,19 +94,6 @@ class Rotary3D(nn.Module):
         )
         return rotated.flatten(-2)
 
-    def forward(self, q, k, q_pos, k_pos=None, position_scale=None):
-        """Rotate q/k at possibly different positions (cross-attention safe)."""
-        if k_pos is None:
-            k_pos = q_pos
-        q_angles = self.angles(q_pos, position_scale=position_scale)
-        k_angles = self.angles(k_pos, position_scale=position_scale)
-        for _ in range(q.ndim - q_pos.ndim):
-            q_angles = q_angles.unsqueeze(-3)
-        for _ in range(k.ndim - k_pos.ndim):
-            k_angles = k_angles.unsqueeze(-3)
-        return self.rotate(q, q_angles), self.rotate(k, k_angles)
-
-
 class AnchorQueryCrossAttention(nn.Module):
     """Varlen cross-attention: the queries of each anchor attend to that
     anchor's variable-length K/V token set.

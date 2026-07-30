@@ -32,24 +32,6 @@ def inverse_sigmoid(x):
     return torch.log(x / (1 - x))
 
 
-def PILtoTorch(pil_image, resolution):
-    resized_image_PIL = pil_image.resize(resolution)
-    resized_image = torch.from_numpy(np.array(resized_image_PIL)) / 255.0
-    if len(resized_image.shape) == 3:
-        return resized_image.permute(2, 0, 1)
-    else:
-        return resized_image.unsqueeze(dim=-1).permute(2, 0, 1)
-
-
-def get_step_lr_func(lr_init, lr_final, start_step):
-    def helper(step):
-        if step < start_step:
-            return lr_init
-        else:
-            return lr_final
-
-    return helper
-
 def strip_lowerdiag(L):
     uncertainty = torch.zeros((L.shape[0], 6), dtype=torch.float, device="cuda")
 

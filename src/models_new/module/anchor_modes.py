@@ -75,7 +75,7 @@ def build_spherical_gaussian_seeds(
     # ref-frame boxes; the spherical head reuses them instead of recomputing
     # the bit-identical apply_pose / transform_boxes_to_ref (its frame loop
     # still runs for the head-specific raw-point labelling).
-    feature, position, delta, _anchor_range, frame_offset, metadata = query_head(
+    feature, position, delta, frame_offset, metadata = query_head(
         fused_feature,
         token_position,
         raw_point_sensor,

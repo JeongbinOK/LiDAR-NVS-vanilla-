@@ -69,7 +69,7 @@ def to_device(obj, device):
 
 
 def load_model(cfg, ckpt_path, device):
-    model = ModelWrapper(cfg, step_tracker=None)
+    model = ModelWrapper(cfg)
     if ckpt_path:
         blob = torch.load(ckpt_path, map_location="cpu")
         state = blob.get("state_dict", blob) if isinstance(blob, dict) else blob
@@ -214,7 +214,7 @@ def main(cfg):
         batch = to_device(batch, device)
         _input, gt = batch["input"], batch["gt"]
 
-        out = model.p2g_model(_input, batch_idx=i, mode="test")
+        out = model.p2g_model(_input)
         out = model.g2g_model(out, _input["timestamps"])
         renders = model.g2p_model(out, gt)
 

@@ -613,16 +613,6 @@ class NuScenesNVSDataset(Dataset):
 
 transform = utonia.transform.default(0.2, apply_z_positive=False, keep_strength=True)
 
-def ptv3_mod(lidar_points, offset):
-    coords = lidar_points[:, :3]
-    coords_np = coords.detach().cpu().numpy().copy()
-    return {
-        "coord": coords_np,
-        "color": np.zeros_like(coords_np),
-        "normal": np.zeros_like(coords_np),
-        "batch": offset.detach().cpu().numpy().copy(),
-    }
-
 def multiframe_collate_fn(batch):
     all_input_pts        = []
     all_input_sensor_pts = []

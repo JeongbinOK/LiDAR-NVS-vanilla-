@@ -192,10 +192,14 @@ class Point2Gaus(nn.Module):
             keys.append("offset")
         return dict(zip(keys, parts))
 
-    def forward(self, _input, batch_idx, mode):
+    def forward(self, _input):
+        """The anchor mode is fixed at construction from ``cfg.anchor_mode``, and
+        train/eval behaviour follows ``nn.Module.training``, so this module needs
+        neither a split name nor a step counter from the caller.
+        """
         lidar_points = _input.get("lidar_points_sensor", _input["lidar_points"])
         offset = _input["offset"]
-        batch_idx = _input["batch_idx"]
+        point_batch_idx = _input["batch_idx"]
         pose = _input["pose"]
         bbox = _input["bbox"]
         bbox_instance_ids = _input.get("bbox_instance_ids")
@@ -225,7 +229,7 @@ class Point2Gaus(nn.Module):
 
         # 프레임별 batch index
         frame_starts    = torch.cat([torch.tensor([0], device=offset.device), offset[:-1]])
-        frame_batch_idx = batch_idx[frame_starts.long()]  # (n_frames,)
+        frame_batch_idx = point_batch_idx[frame_starts.long()]  # (n_frames,)
 
         all_pos         = []
         all_ufeat       = []

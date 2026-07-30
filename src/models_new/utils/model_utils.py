@@ -1,29 +1,7 @@
-from multiprocessing import RLock
-
-import torch
-from jaxtyping import Int64
-from torch import Tensor
-from torch.multiprocessing import Manager
 import lightning.pytorch as pl
 from torch.utils.data import DataLoader
 
 from ...dataloader.nuscene import multiframe_collate_fn
-class StepTracker:
-    lock: RLock
-    step: Int64[Tensor, ""]
-
-    def __init__(self):
-        self.lock = Manager().RLock()
-        self.step = torch.tensor(0, dtype=torch.int64).share_memory_()
-
-    def set_step(self, step: int) -> None:
-        with self.lock:
-            self.step.fill_(step)
-
-    def get_step(self) -> int:
-        with self.lock:
-            return self.step.item()
-    
 
 
 class DataModule(pl.LightningDataModule):

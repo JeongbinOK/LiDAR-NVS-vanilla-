@@ -25,7 +25,7 @@ from lightning.pytorch.plugins.environments import SLURMEnvironment
 from omegaconf import DictConfig, OmegaConf
 from pytorch_lightning.strategies import DDPStrategy
 from src.model_wrapper import ModelWrapper
-from src.models_new.utils.model_utils import StepTracker, DataModule
+from src.models_new.utils.model_utils import DataModule
 from src.dataloader import dataset_dict
 
 import os
@@ -76,7 +76,6 @@ def main(cfg):
         save_on_train_epoch_end=True,  # Ensure it saves at the end of an epoch, not the beginning
     )
 
-    step_tracker = StepTracker()
     trainer = Trainer(
         max_epochs=cfg.train.max_epochs,
         accelerator="gpu",
@@ -99,7 +98,7 @@ def main(cfg):
     #torch.manual_seed(cfg_dict.seed + trainer.global_rank)
 
 
-    model_wrapper = ModelWrapper(cfg,step_tracker)
+    model_wrapper = ModelWrapper(cfg)
     dataset = dataset_dict[cfg.data.dataset_name]
     datamodule = DataModule(dataset, cfg)
 

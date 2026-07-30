@@ -7,7 +7,6 @@ builders. The per-cell intensity statistics are
 from __future__ import annotations
 
 from dataclasses import dataclass
-import math
 
 import torch
 
@@ -70,27 +69,6 @@ def xyz_to_theta_phi_r(xyz):
     phi = torch.atan2(xyz[..., 1], xyz[..., 0])              # [-pi, pi]
     theta = torch.asin((xyz[..., 2] / r).clamp(-1.0, 1.0))   # [-pi/2, pi/2]
     return torch.stack([theta, phi, r], dim=-1)
-
-
-def encode_ray_meta(tpr, r_far):
-    """(...,3)=[theta, phi, r] -> (...,4) encoded ray meta for K/V embeddings.
-
-    Follows the same convention as ``IntensityMLPEncoder``: theta is scaled by
-    pi/2, phi is mapped onto the unit circle
-    (sin, cos) to remove the +-pi azimuth wraparound a bare Linear would see,
-    and r is log1p-compressed/linearized before being normalized by log1p(r_far).
-    r is clamp_min(0.0)'d before log1p.
-
-        [theta/(pi/2), sin(phi), cos(phi), log1p(r)/log1p(r_far)]
-
-    tpr   : (..., 3) [theta, phi, r], own-sensor-origin ray angles/range.
-    r_far : python float/scalar, the normalizing max range (e.g. cfg.r_far).
-    return: (..., 4).
-    """
-    theta, phi, r = tpr.unbind(dim=-1)
-    theta_n = theta / (math.pi / 2.0)
-    log_r_n = torch.log1p(r.clamp_min(0.0)) / math.log1p(float(r_far))
-    return torch.stack([theta_n, torch.sin(phi), torch.cos(phi), log_r_n], dim=-1)
 
 
 class UtoniaGridMapper:
@@ -422,15 +400,6 @@ def _aggregate_points_to_cells(points_xyz, intensity, grid_coord, voxel_feats,
             raise ValueError(f"Unsupported grid seed experiment exp={exp!r}")
         result = result + (seed_data,)
     return result
-
-
-def aggregate_points_to_cells(points_xyz, intensity, grid_coord, voxel_feats,
-                              voxel_coord, metric_origin, mapper):
-    """Aggregate raw points without constructing grid-mode Gaussian seeds."""
-    return _aggregate_points_to_cells(
-        points_xyz, intensity, grid_coord, voxel_feats,
-        voxel_coord, metric_origin, mapper,
-    )
 
 
 def aggregate_points_to_cells_with_membership(

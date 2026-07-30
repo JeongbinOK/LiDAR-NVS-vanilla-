@@ -55,7 +55,7 @@ def test_spherical_head_adapts_to_common_seed_contract():
     class QueryHead:
         def __call__(self, feat, *args, **kwargs):
             seen["head_feature"] = feat
-            return feature, position, delta, torch.ones(3), frame_offset, metadata
+            return feature, position, delta, frame_offset, metadata
 
     seeds = build_spherical_gaussian_seeds(
         TemporalAggregator(),
@@ -256,7 +256,7 @@ def test_spherical_head_packs_raw_centres_and_passes_seed_positions_to_rope():
     ])
     raw_token_index = torch.tensor([0, 1, 1, 2, 2, 2, 2])
 
-    output, centre, delta, _, frame_offset, metadata = head(
+    output, centre, delta, frame_offset, metadata = head(
         torch.randn(3, 48), token_position, raw_points, raw_token_index,
         torch.tensor([3]), torch.tensor([0]), [torch.eye(4).unsqueeze(0)],
         [[torch.empty(0, 7)]], [[torch.empty(0, dtype=torch.long)]],
@@ -292,7 +292,7 @@ def test_spherical_attention_and_d_plus_3_predictor_backward():
         [40.2, 0.0, 0.0], [39.8, 0.0, 0.0],
     ])
     feature = torch.randn(3, 48, requires_grad=True)
-    output, _, delta, _, _, _ = head(
+    output, _, delta, _, _ = head(
         feature, token_position, raw_points,
         torch.tensor([0, 1, 1, 2, 2, 2, 2]),
         torch.tensor([3]), torch.tensor([0]), [torch.eye(4).unsqueeze(0)],
@@ -326,7 +326,7 @@ def test_spherical_foreground_seed_and_delta_use_own_bbox_local_frame():
     ]]
     instance_ids = [[torch.tensor([7]), torch.tensor([7])]]
 
-    _, centre, delta, _, frame_offset, metadata = head(
+    _, centre, delta, frame_offset, metadata = head(
         torch.randn(2, 48), token_position, raw_points, torch.tensor([0, 1]),
         torch.tensor([1, 2]), torch.tensor([0, 0]), [pose], boxes, instance_ids,
     )
@@ -368,7 +368,7 @@ def test_spherical_mixed_cells_split_into_pure_label_group_anchors():
     boxes = [[box.clone(), box.clone()]]
     instance_ids = [[torch.tensor([9]), torch.tensor([9])]]
 
-    _, centre, _, _, frame_offset, metadata = head(
+    _, centre, _, frame_offset, metadata = head(
         torch.randn(4, 48), token_position, raw_points, raw_token_index,
         torch.tensor([2, 4]), torch.tensor([0, 0]), [pose], boxes, instance_ids,
     )
@@ -529,7 +529,7 @@ def test_spherical_head_keeps_fp32_positions_under_bf16_features():
     boxes = [[box.clone(), box.clone()]]
     instance_ids = [[torch.tensor([5]), torch.tensor([5])]]
 
-    _, seed, delta, _, _, _ = head(
+    _, seed, delta, _, _ = head(
         torch.randn(4, 48).bfloat16(), token_position, raw_points,
         raw_token_index, torch.tensor([2, 4]), torch.tensor([0, 0]),
         [pose], boxes, instance_ids,

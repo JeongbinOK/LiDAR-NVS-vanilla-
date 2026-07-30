@@ -58,10 +58,10 @@ Data flow expected by the spherical query head
     # re-binned and matched against the same occupied-cell table
     cell_idx, found = lookup_cells(bins.hash(other_idx3), cell_hash)
 
-``SphericalBins.neighbor_hashes`` (3x3x1, self slot ``SELF_SLOT`` = 4) and
 ``azimuth_neighbor_hashes`` (1x3x1, self slot ``AZIMUTH_SELF_SLOT`` = 1)
-remain available as pure-geometry utilities, but the current head looks at
-the anchor's own cell only.
+remains available as a pure-geometry utility, but the current head looks at
+the anchor's own cell only. ``lookup_cells`` / ``gather_cell_members`` are
+likewise used only by the ``scripts/analyze_spherical_*`` diagnostics.
 """
 from __future__ import annotations
 
@@ -95,10 +95,6 @@ class SphericalBins:
     i_lr]``.
     """
 
-    #: number of cells in the 3x3x1 neighbourhood
-    N_NEIGHBORS: int = 9
-    #: flat slot index of the centre (self) cell in ``neighbor_hashes`` output
-    SELF_SLOT: int = 4
     #: number of cells in the elevation/range-fixed azimuth neighbourhood
     N_AZIMUTH_NEIGHBORS: int = 3
     #: flat slot index of the centre cell in ``azimuth_neighbor_hashes`` output
@@ -133,16 +129,6 @@ class SphericalBins:
         assert self.n_phi >= 3, (
             "n_phi < 3 makes the +-1 phi neighbours alias under wrap; "
             "use a smaller dphi_deg")
-
-        # (9, 3) neighbour offset table, column order [d_theta, d_phi, d_lr].
-        # Built with 'ij' meshgrid + C-order reshape so the flat slot index is
-        #   slot = (d_theta+1)*3 + (d_phi+1)
-        # hence the self cell (0,0,0) lands at slot 4 (== SELF_SLOT).
-        a = torch.tensor([-1, 0, 1], dtype=torch.long)
-        r0 = torch.tensor([0], dtype=torch.long)
-        dt, dp, dl = torch.meshgrid(a, a, r0, indexing="ij")
-        self._offsets_cpu = torch.stack(
-            [dt.reshape(-1), dp.reshape(-1), dl.reshape(-1)], dim=1)  # (9,3) long
 
     # ------------------------------------------------------------------ dims
     @property
@@ -240,52 +226,6 @@ class SphericalBins:
         ], dim=-1)
 
     # ------------------------------------------------------------- neighbours
-    def neighbor_hashes(self, idx3):
-        """``(A,3)`` -> ``(nbr_hash (A,9) long, nbr_valid (A,9) bool)``.
-
-        For each anchor cell, the 3x3x1 = 9 neighbours from every combination
-        of ``{-1, 0, +1}`` offsets on ``(i_theta, i_phi)`` and a fixed
-        ``i_lr`` offset of 0. This looks left/right in azimuth and up/down in
-        elevation, but not the radial bin before/after.
-
-        - ``i_phi`` is **wrapped** ``mod n_phi`` (azimuth is periodic), so phi
-          neighbours are always geometrically valid.
-        - ``i_theta`` is a **clamped** range: an offset that leaves
-          ``[0, n_theta-1]`` yields ``nbr_valid=False`` for that slot (poles
-          have fewer live neighbours). ``i_lr`` is unchanged by this stencil.
-
-        Column (slot) order is fixed: ``slot = (d_theta+1)*3 + (d_phi+1)``, so
-        the **centre / self cell (offset 0,0,0) is slot
-        ``SELF_SLOT`` = 4**. Step 3 uses ``slot == 4`` to recover the
-        centre-cell (P0) token subset.
-
-        Invalid slots get ``nbr_hash = -1`` (a sentinel that never matches a
-        real cell in :func:`lookup_cells`), so a downstream ``found`` result is
-        already ``False`` there; ``nbr_valid`` is returned as well for callers
-        that want the geometric mask explicitly.
-        """
-        idx3 = idx3.to(torch.long)
-        offs = self._offsets_cpu.to(device=idx3.device)          # (9,3)
-
-        i_theta = idx3[:, 0:1]                                    # (A,1)
-        i_phi = idx3[:, 1:2]
-        i_lr = idx3[:, 2:3]
-
-        nt = i_theta + offs[:, 0].view(1, self.N_NEIGHBORS)       # (A,9)
-        nl = i_lr + offs[:, 2].view(1, self.N_NEIGHBORS)
-        nphi = torch.remainder(
-            i_phi + offs[:, 1].view(1, self.N_NEIGHBORS), self.n_phi)
-
-        theta_ok = (nt >= 0) & (nt < self.n_theta)
-        lr_ok = (nl >= 0) & (nl < self.n_lr)
-        nbr_valid = theta_ok & lr_ok                             # (A,9) bool
-
-        nt_c = nt.clamp(0, self.n_theta - 1)
-        nl_c = nl.clamp(0, self.n_lr - 1)
-        h = (nl_c * self.n_theta + nt_c) * self.n_phi + nphi     # (A,9)
-        nbr_hash = torch.where(nbr_valid, h, h.new_full((), -1))
-        return nbr_hash, nbr_valid
-
     def azimuth_neighbor_hashes(self, idx3):
         """``(A,3)`` -> hashes for the 1x3x1 azimuth-only neighbourhood.
 
@@ -348,9 +288,7 @@ def gather_cell_members(anchor_cell_idx, token2cell, num_cells):
     anchor_cell_idx : ``(A, S) long``
         Per-anchor, per-neighbour-slot cell index into the occupied-cell set,
         with ``-1`` for slots that are invalid / not found (as produced by
-        masking :func:`lookup_cells` with ``nbr_valid``). Column order is the
-        :meth:`SphericalBins.neighbor_hashes` slot order (self cell = slot 4
-        for the default 3x3x1 stencil).
+        masking :func:`lookup_cells` with a caller-supplied validity mask).
     token2cell : ``(N,) long``
         Token -> occupied-cell index (from :func:`build_cells`), in ``[0, num_cells)``.
     num_cells : int
@@ -365,12 +303,11 @@ def gather_cell_members(anchor_cell_idx, token2cell, num_cells):
         Token index of each emitted pair (index into the original ``token2cell``
         / token array).
     slot_ids : ``(P,) long``
-        Neighbour-slot (0..S-1) the pair came from.
-        (Recommended extension over the bare ``(anchor_ids, token_ids)`` spec:
-        lets Step 3 select the centre cell via ``slot_ids == SELF_SLOT``.)
+        Neighbour-slot (0..S-1) the pair came from, letting the caller pick out
+        one stencil slot (e.g. its own centre cell).
 
     Ordering contract: pairs are grouped by anchor (ascending), and **within an
-    anchor** by neighbour slot (ascending, i.e. the ``neighbor_hashes`` column
+    anchor** by neighbour slot (ascending, i.e. the caller's stencil column
     order); the token order inside a single cell block is unspecified. Each
     valid (anchor, slot) cell contributes all of that cell's tokens as a
     contiguous block, so ``P = sum of cell sizes over all valid (anchor, slot)``.

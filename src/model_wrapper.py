@@ -4,7 +4,6 @@ import math
 from pathlib import Path
 
 from src.models_new.module import Point2Gaus, GausTemp, GausRender
-#from src.models_new.utils.eval_utils import evaluate_pair_sample, write_ply
 from lightning.pytorch import LightningModule
 from src.models_new.utils.loss import Loss
 from src.models_new.utils.debug_finite import (
@@ -57,7 +56,6 @@ class ModelWrapper(LightningModule):
     def __init__(
         self,
         cfg,
-        step_tracker
     ):
         super().__init__()
         self.cfg = cfg
@@ -65,7 +63,6 @@ class ModelWrapper(LightningModule):
         self.p2g_cfg = cfg.p2g
         self.g2g_cfg = cfg.g2g
         self.g2p_cfg = cfg.g2p
-        self.step_tracker = step_tracker
 
         # Set up the model.
         self.p2g_model = Point2Gaus(self.p2g_cfg)
@@ -172,7 +169,7 @@ class ModelWrapper(LightningModule):
 
     def _shared_step(self, batch, batch_idx, *, prefix: str):
         _input, gt = batch["input"], batch["gt"]
-        p2g_out = self.p2g_model(_input, batch_idx=batch_idx, mode=prefix)
+        p2g_out = self.p2g_model(_input)
         # Keep detached diagnostics outside the renderer/temporal model input.
         routing_stats = p2g_out.pop("routing_stats", None)
         routing_budget_logits = p2g_out.pop("routing_budget_logits", None)
@@ -198,9 +195,6 @@ class ModelWrapper(LightningModule):
 
         if self._dbg_finite and prefix == "train":
             self._debug_forward(out, all_renders, loss_dict, batch_idx)
-
-        if self.step_tracker is not None:
-            self.step_tracker.set_step(self.global_step)
 
         if prefix != "train":
             self._record_eval_summary(loss_dict, batch_idx=batch_idx, prefix=prefix)

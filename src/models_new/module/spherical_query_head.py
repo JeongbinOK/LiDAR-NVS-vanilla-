@@ -377,7 +377,6 @@ class SphericalQueryHead(nn.Module):
         ).to(dtype=raw_sensor.dtype)
         anchor_ref = box_utils.apply_pose(anchor_sensor, pose_f)
         anchor_out = anchor_ref.clone()
-        anchor_r = anchor_sensor.norm(dim=-1)
 
         # frame-local box index of the group instance (fg anchors only). A
         # dynamic raw label is produced by indexing this frame's own iids, so
@@ -405,7 +404,7 @@ class SphericalQueryHead(nn.Module):
         return {
             "pt2anchor": pt2anchor, "pi": pi, "num_anchors": U,
             "label": anchor_label, "box": anchor_box, "is_dyn": is_dyn,
-            "sensor": anchor_sensor, "ref": anchor_ref, "out": anchor_out, "r": anchor_r,
+            "sensor": anchor_sensor, "ref": anchor_ref, "out": anchor_out,
         }
 
     @staticmethod
@@ -450,7 +449,7 @@ class SphericalQueryHead(nn.Module):
         new_offset (n_frames,) global cumsum; frame_batch_idx (n_frames,);
         pose_list[b] (V,4,4) frame->frame0; bbox_list[b][local_f] (B_f,7).
 
-        Returns (out_feat (G,D), seed (G,3), delta_p (G,3), r_anchor (G,),
+        Returns (out_feat (G,D), seed (G,3), delta_p (G,3),
         gauss_offset (n_frames,) long, meta) with a variable G, ordered
         frame-major, anchor-major, source-token-major. seed lives in the output
         coordinate frame (bg: ref frame, fg: box-local); delta_p is the
@@ -510,11 +509,10 @@ class SphericalQueryHead(nn.Module):
             zero_off = torch.zeros(n_frames, dtype=torch.long, device=device)
             return (
                 feat.new_zeros(0, D), tok_pos.new_zeros(0, 3),
-                tok_pos.new_zeros(0, 3), tok_pos.new_zeros(0), zero_off, empty_meta,
+                tok_pos.new_zeros(0, 3), zero_off, empty_meta,
             )
 
         anchor_out = torch.cat([fa["out"] for fa in frame_anchor if fa is not None])
-        anchor_r = torch.cat([fa["r"] for fa in frame_anchor if fa is not None])
         anchor_label = torch.cat([fa["label"] for fa in frame_anchor if fa is not None])
         anchor_box = torch.cat([fa["box"] for fa in frame_anchor if fa is not None])
         anchor_is_dyn = anchor_label >= 0
@@ -729,7 +727,6 @@ class SphericalQueryHead(nn.Module):
         query_rank = _segment_rank(query_anchor, A)
         p_flat = seed_out
         delta_flat = delta_p
-        r_g = anchor_r[query_anchor]
 
         is_dyn_g = anchor_is_dyn[query_anchor]
         label_g = anchor_label[query_anchor]
@@ -756,4 +753,4 @@ class SphericalQueryHead(nn.Module):
             "anchor_raw_count": anchor_raw_count[query_anchor],
             "evidence_raw_count": evidence_raw_count,
         }
-        return out_feat, p_flat, delta_flat, r_g, gauss_offset, meta
+        return out_feat, p_flat, delta_flat, gauss_offset, meta

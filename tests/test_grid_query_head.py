@@ -5,7 +5,7 @@ import unittest
 import torch
 
 from src.models_new.module.builders.common import (
-    aggregate_points_to_cells,
+    _aggregate_points_to_cells,
     aggregate_points_to_cells_with_membership,
     aggregate_points_to_cells_with_seeds,
     counts_to_variable_k,
@@ -142,7 +142,7 @@ def test_builder_raw_count_is_aligned_with_occupied_token_order():
     voxel_coord = torch.tensor([
         [0.5, 0.5, 0.5], [1.5, 0.5, 0.5], [2.5, 0.5, 0.5],
     ])
-    pos, feature, _, occupied, raw_count = aggregate_points_to_cells(
+    pos, feature, _, occupied, raw_count = _aggregate_points_to_cells(
         points, intensity, grid_coord, voxel_feature, voxel_coord,
         torch.zeros(3), Mapper(),
     )

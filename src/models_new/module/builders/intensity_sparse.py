@@ -21,7 +21,7 @@ SubMConv is translation-equivariant, so it captures relative local structure but
 is blind to absolute range/direction from the sensor -- yet intensity depends on
 absolute range (1/r^2) and incidence (ray direction). Those must be fed, not
 derived from the grid. r is log1p-compressed and normalized by log1p(r_far), the
-same convention as ``builders/common.encode_ray_meta``.
+same convention as ``IntensityMLPEncoder._encode``.
 
 Norm: LayerNorm on features (batch-independent -> stable with batch_size 2 and
 frame-varying point counts; consistent with the PTv3 LN style; safer given the
@@ -50,7 +50,8 @@ def ray_input_feat(coord, intensity, coord_scale, log_r_far):
     Shared by the sparse and ptv3 intensity encoders' 5D ray mode: ``coord`` is
     the sensor-frame position scaled by ``coord_scale`` (origin at the sensor), so
     range/direction are recovered by undoing that scale. r is log1p-compressed and
-    normalized by ``log_r_far`` (== log1p(r_far)), matching ``encode_ray_meta``.
+    normalized by ``log_r_far`` (== log1p(r_far)), matching
+    ``IntensityMLPEncoder._encode``.
     """
     metric = coord / coord_scale
     tpr = xyz_to_theta_phi_r(metric)

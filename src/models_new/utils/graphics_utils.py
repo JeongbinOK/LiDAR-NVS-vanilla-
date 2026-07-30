@@ -1,23 +1,7 @@
 import torch
 import math
 import numpy as np
-from typing import NamedTuple
 import torch.nn.functional as F
-
-
-class BasicPointCloud(NamedTuple):
-    points: np.array
-    colors: np.array
-    normals: np.array
-    time: np.array = None
-
-
-def getWorld2View(R, t):
-    Rt = np.zeros((4, 4))
-    Rt[:3, :3] = R.transpose()
-    Rt[:3, 3] = t
-    Rt[3, 3] = 1.0
-    return np.float32(Rt)
 
 
 def getWorld2View2(R, t, translate=np.array([.0, .0, .0]), scale=1.0):
@@ -78,14 +62,6 @@ def getProjectionMatrixCenterShift(znear, zfar, cx, cy, fx, fy, w, h):
     return P
 
 
-def fov2focal(fov, pixels):
-    return pixels / (2 * math.tan(fov / 2))
-
-
-def focal2fov(focal, pixels):
-    return 2 * math.atan(pixels / (2 * focal))
-
-
 def _pano_theta_phi(range_image, vfov, hfov, row_to_theta=None):
     panorama_height, panorama_width = range_image.shape[-2:]
     row, col = torch.meshgrid(
@@ -111,29 +87,6 @@ def _pano_theta_phi(range_image, vfov, hfov, row_to_theta=None):
     horizontal_degree_range = hfov[1] - hfov[0]
     phi = (hfov[0] + col / panorama_width * horizontal_degree_range) * torch.pi / 180
     return theta, phi
-
-
-def depth_to_normal(range_image, vfov, hfov, row_to_theta=None):
-    """
-        view: view camera
-        depth: depthmap
-    """
-    theta, phi = _pano_theta_phi(range_image, vfov, hfov, row_to_theta)
-
-    dx = torch.sin(theta) * torch.sin(phi)
-    dz = torch.sin(theta) * torch.cos(phi)
-    dy = -torch.cos(theta)
-
-    directions = torch.stack([dx, dy, dz], dim=0)
-    directions = F.normalize(directions, dim=0)
-
-    points = directions * range_image
-    output = torch.zeros_like(points)
-    dx = points[:, 2:, 1:-1] - points[:, :-2, 1:-1]
-    dy = points[:, 1:-1, 2:] - points[:, 1:-1, :-2]
-    normal_map = torch.nn.functional.normalize(torch.cross(dx, dy, dim=0), dim=0)
-    output[:, 1:-1, 1:-1] = normal_map
-    return output
 
 
 def pano_to_lidar(range_image, vfov, hfov, row_to_theta=None):
