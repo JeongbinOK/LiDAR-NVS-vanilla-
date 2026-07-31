@@ -147,6 +147,8 @@ class GausRender(nn.Module):
 
         # 텐서로 묶을 데이터용 리스트
         all_depths, all_depths_median, all_intensity_shs, all_raydrops = [], [], [], []
+        # 진단 전용: eval에서만 수집해 학습 메모리/그래프를 그대로 둔다.
+        all_alphas = [] if not self.training else None
         all_gt_depths, all_gt_intensity_shs, all_gt_raydrops = [], [], []
         
         # 포인트 개수가 유동적일 수 있으므로 파이썬 리스트로 유지
@@ -158,6 +160,7 @@ class GausRender(nn.Module):
                 raise ValueError(f"Batch {b}의 Gaussian 데이터가 None입니다.")
 
             b_depths, b_depths_median, b_intensity_shs, b_raydrops = [], [], [], []
+            b_alphas = [] if all_alphas is not None else None
             b_gt_depths, b_gt_intensity_shs, b_gt_raydrops = [], [], []
             b_render_points, b_gt_points = [], []
 
@@ -210,6 +213,8 @@ class GausRender(nn.Module):
                 b_depths_median.append(render_pkg["depth_median"])
                 b_intensity_shs.append(render_pkg["intensity_sh"])
                 b_raydrops.append(render_pkg["raydrop"])
+                if b_alphas is not None:
+                    b_alphas.append(render_pkg["alpha"])
 
                 b_gt_depths.append(gt_depth)
                 b_gt_intensity_shs.append(gt_intensity_sh)
@@ -234,6 +239,8 @@ class GausRender(nn.Module):
             all_depths_median.append(torch.stack(b_depths_median, dim=0))
             all_intensity_shs.append(torch.stack(b_intensity_shs, dim=0))
             all_raydrops.append(torch.stack(b_raydrops, dim=0))
+            if all_alphas is not None:
+                all_alphas.append(torch.stack(b_alphas, dim=0))
             all_gt_depths.append(torch.stack(b_gt_depths, dim=0))
             all_gt_intensity_shs.append(torch.stack(b_gt_intensity_shs, dim=0))
             all_gt_raydrops.append(torch.stack(b_gt_raydrops, dim=0))
@@ -249,6 +256,8 @@ class GausRender(nn.Module):
             "depth_median": torch.stack(all_depths_median, dim=0),
             "intensity_sh": torch.stack(all_intensity_shs, dim=0),
             "raydrop": torch.stack(all_raydrops, dim=0),
+            **({"alpha": torch.stack(all_alphas, dim=0)}
+               if all_alphas is not None else {}),
             "gt_depth": torch.stack(all_gt_depths, dim=0),
             "gt_intensity_sh": torch.stack(all_gt_intensity_shs, dim=0),
             "gt_raydrop": torch.stack(all_gt_raydrops, dim=0),

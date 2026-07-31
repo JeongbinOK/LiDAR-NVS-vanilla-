@@ -147,5 +147,9 @@ def render(viewpoint_camera, pc, cfg, bg_color, input_timestamp, scaling_modifie
         "depth_median": rendered_depth[[1]],   # median: T가 0.5를 넘는 contributor의 depth (chamfer + median loss)
         "normal": rendered_normal,
         "intensity_sh": rendered_intensity_sh,
+        # 누적 alpha. raydrop = alpha*(가우시안 SH 가중평균) + (1-alpha)*bg 이고
+        # bg의 raydrop 채널이 1이므로, 이 값 없이는 "가우시안이 안 덮어서 drop"과
+        # "덮었지만 SH가 drop이라 함"을 구분할 수 없다. 진단 전용 출력.
+        "alpha": rendered_opacity,
         "raydrop": rendered_raydrop.clamp(0, 1)
     }
