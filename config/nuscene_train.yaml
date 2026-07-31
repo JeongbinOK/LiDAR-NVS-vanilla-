@@ -1,7 +1,7 @@
-device: [5, 6]
+device: [0, 1, 2, 3]
 
 project_name: 2dgs-utonia
-exp_name:  naive_adaptive_K #${p2g.anchor_mode}-bs-${train.batch_size}-exp1
+exp_name:  ${p2g.anchor_mode}-bs-${train.batch_size}-selfattn-newloss
 mode: train
 
 
@@ -74,7 +74,7 @@ p2g:
   freeze_utonia: true
   utonia_ckpt: null   # optional abs path override; null -> checkpoints/utonia/utonia.pth (config dump: config/utonia_pretrained.yaml)
   utonia_feature_stage: 3  # encoder stage index: 3 -> 0.4m/432D, 4 -> 0.8m/576D (default/final)
-  anchor_mode: grid   # "spherical" | "grid"
+  anchor_mode: spherical   # "spherical" | "grid"
   squery:                       # spherical mode only: raw-point occupied cell = anchor
                                 # (temporal fusion은 grid_query 블록으로 양 모드 공유;
                                 # 이 head의 K/V는 own-frame token으로 한정)
