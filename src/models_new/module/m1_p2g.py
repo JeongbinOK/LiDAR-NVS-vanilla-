@@ -192,7 +192,7 @@ class Point2Gaus(nn.Module):
             keys.append("offset")
         return dict(zip(keys, parts))
 
-    def forward(self, _input):
+    def forward(self, _input, target_pose=None):
         """The anchor mode is fixed at construction from ``cfg.anchor_mode``, and
         train/eval behaviour follows ``nn.Module.training``, so this module needs
         neither a split name nor a step counter from the caller.
@@ -294,7 +294,7 @@ class Point2Gaus(nn.Module):
             else:
                 if any(item.anchor_k is not None for item in grid_seed_list):
                     raise RuntimeError(
-                        "learned_gumbel seed data must defer anchor_k prediction"
+                        "learned-count seed data must defer anchor_k prediction"
                     )
                 all_anchor_k = None
         else:
@@ -348,6 +348,7 @@ class Point2Gaus(nn.Module):
                 bbox,
                 bbox_instance_ids,
                 _input.get("timestamps"),
+                target_pose=target_pose,
             )
 
         # Spherical retains the shared predictor; grid's K-specific head already

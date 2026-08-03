@@ -214,7 +214,7 @@ def main(cfg):
         batch = to_device(batch, device)
         _input, gt = batch["input"], batch["gt"]
 
-        out = model.p2g_model(_input)
+        out = model.p2g_model(_input, target_pose=gt.get("pose"))
         out = model.g2g_model(out, _input["timestamps"])
         renders = model.g2p_model(out, gt)
 
@@ -274,12 +274,17 @@ def main(cfg):
         gt_pts = gt["lidar_points"][gt_start:gt_off[target_cam], :3].detach().cpu().numpy()
 
         # Gaussian centers + 1σ surfels at this window's target time (per-seq HTML).
+        # Viewpoint mode stores Common once and Additional per target view;
+        # diagnostics must build the same transient union as the renderer.
+        target_gaussians = model.g2p_model.select_target_view(out[b], target_cam)
         static_xyz, dynamic_xyz = gaussians_from_output(
-            model.g2p_model, out[b], float(gt_cam.timestamp))
+            model.g2p_model, target_gaussians, float(gt_cam.timestamp))
         seq_gauss[seq_name].append({
             "label": f"T={target_s}s", "static": static_xyz, "dynamic": dynamic_xyz,
             "input_points": in_pts, "gt_points": gt_pts})
-        surf = surfels_from_output(model.g2p_model, out[b], float(gt_cam.timestamp))
+        surf = surfels_from_output(
+            model.g2p_model, target_gaussians, float(gt_cam.timestamp)
+        )
         seq_surfel[seq_name].append({
             "label": f"T={target_s}s", "static": surf["static"],
             "dynamic": surf["dynamic"], "boxes": surf["boxes"],
@@ -287,7 +292,9 @@ def main(cfg):
             "pred_points": pred_pts})
 
         # per-window Gaussian-size statistics (effective radius vs geometry)
-        st = collect_window_stats(model.g2p_model, out[b], float(gt_cam.timestamp))
+        st = collect_window_stats(
+            model.g2p_model, target_gaussians, float(gt_cam.timestamp)
+        )
         size_records.append(st)
         size_by_split[nuscenes_split].append(st)
 

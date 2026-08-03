@@ -15,6 +15,29 @@ def gradient_scale_identity(x, scale):
     return detached + scale * (x - detached)
 
 
+def opacity_gate_st(raw_opacity, gate):
+    """Apply a hard-ST gate in activated-opacity space.
+
+    The rasterizer applies ``sigmoid`` to raw opacity logits.  A selected hard
+    gate therefore has forward value one, while its soft backward derivative
+    must be applied after that sigmoid.  Keeping this helper shared by the grid
+    head and renderer makes the deferred Common gate exactly match the
+    Additional gate applied during Gaussian prediction.
+    """
+    if raw_opacity.shape[0] == 0:
+        return raw_opacity
+    work_opacity = raw_opacity.float()
+    work_gate = gate.to(device=raw_opacity.device, dtype=torch.float32)
+    while work_gate.ndim < work_opacity.ndim:
+        work_gate = work_gate.unsqueeze(-1)
+    activated = torch.sigmoid(work_opacity)
+    gated_activated = (activated * work_gate).clamp(
+        min=1.0e-6, max=1.0 - 1.0e-6
+    )
+    gated_logit = torch.logit(gated_activated).to(raw_opacity.dtype)
+    return raw_opacity.detach() + gated_logit - gated_logit.detach()
+
+
 def assemble_batch_gaussians(
     gs_raw, out_coord, agg_meta, frame_offset, frame_batch_ids,
     frame_bboxes, frame_bbox_instance_ids, has_bbox_instance_ids, device,
@@ -50,6 +73,19 @@ def assemble_batch_gaussians(
             },
             "frame_bboxes": [],
         })
+        if "view_index" in agg_meta:
+            batch_item["view_index"] = agg_meta["view_index"][batch_indices]
+        if "common_view_gate" in agg_meta:
+            if "anchor_index" not in agg_meta or "view_index" not in agg_meta:
+                raise KeyError(
+                    "common_view_gate requires Gaussian-aligned anchor_index "
+                    "and view_index metadata"
+                )
+            common_mask = agg_meta["view_index"][batch_indices] == -1
+            common_anchor = agg_meta["anchor_index"][batch_indices][common_mask]
+            batch_item["common_view_gate"] = agg_meta[
+                "common_view_gate"
+            ][common_anchor]
 
         for global_frame in frame_indices:
             bbox = frame_bboxes[global_frame]
@@ -114,5 +150,6 @@ def refresh_coord_ref_after_offset(out_coord, agg_meta, frame_offset):
 __all__ = [
     "assemble_batch_gaussians",
     "gradient_scale_identity",
+    "opacity_gate_st",
     "refresh_coord_ref_after_offset",
 ]

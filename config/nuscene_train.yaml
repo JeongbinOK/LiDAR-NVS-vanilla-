@@ -74,7 +74,7 @@ p2g:
   freeze_utonia: true
   utonia_ckpt: null   # optional abs path override; null -> checkpoints/utonia/utonia.pth (config dump: config/utonia_pretrained.yaml)
   utonia_feature_stage: 3  # encoder stage index: 3 -> 0.4m/432D, 4 -> 0.8m/576D (default/final)
-  anchor_mode: spherical   # "spherical" | "grid"
+  anchor_mode: grid        # "spherical" | "grid"
   squery:                       # spherical mode only: raw-point occupied cell = anchor
                                 # (temporal fusion은 grid_query 블록으로 양 모드 공유;
                                 # 이 head의 K/V는 own-frame token으로 한정)
@@ -102,16 +102,21 @@ p2g:
   grid_query:                   # 공유 temporal fusion(bg_radius_m/bg_max_kv_per_frame/
                                 # num_heads/bg_layers/fg_layers는 양 모드 사용) +
                                 # grid mode 전용 K routing/head 설정
-    count_mode: learned_gumbel  # legacy | learned_gumbel
+    count_mode: learned_gumbel_viewpt  # legacy | learned_gumbel | learned_gumbel_viewpt
     K_max: 3                    # legacy only: occupied 0.4m cell당 최대 Gaussian 수
     points_per_gaussian: 4      # legacy exp=null only: K_i=ceil(raw_count/this), capped by K_max
     exp: 1                      # legacy only: null=raw-count range quantile;
                                 # 1=one raw-point medoid; 2=two token-coordinate seeds
-    learned_count:              # learned_gumbel only; legacy K_max/points_per_gaussian/exp와 독립
-      K_max: 4                  # logits=[K1,K2,K3,K4], token별 selected-only K head
+    learned_count:              # learned modes only; legacy K_max/points_per_gaussian/exp와 독립
+      K_max: 4                  # total K=[1..4]; viewpt는 Common 1 + Additional (K-1)
       tau: 1.0                  # train: hard Gumbel-ST temperature; eval: deterministic argmax
-      seed_mode: range_quantile # K별 range-quantile candidate bank (A안)
-      # K-head 입력 gradient만 1/sqrt(K)로 줄이고 router에는 적용하지 않음.
+      seed_mode: range_quantile # learned: all quantile; viewpt: medoid Common + quantile Additional
+      viewpoint:                # learned_gumbel_viewpt only: gt.pose = T_(0<-t)
+        translation_frequencies: 4  # 3 * 4 * sin/cos = 24D
+        rotation_frequencies: 2     # direct R_(0<-t) 6D * 2 * sin/cos = 24D
+        translation_scale_m: 10.0
+        rotation_scale: 2.0         # R 원소를 [-.5,.5]로 정규화; identity-6D subtraction 없음
+      # selected K/Additional head 입력 gradient만 1/sqrt(K); router에는 적용하지 않음.
       # learned_count 내부 옵션이므로 count_mode=legacy 전환 시 과거 output 방식 유지.
       grad_balance_scope: token
       budget:

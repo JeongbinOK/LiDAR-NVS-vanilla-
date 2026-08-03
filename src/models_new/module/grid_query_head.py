@@ -16,7 +16,7 @@ import torch.nn.functional as F
 
 from ..utils import boxes as box_utils
 from ..utils.attention import Rotary3D
-from .gaussian_assembly import gradient_scale_identity
+from .gaussian_assembly import gradient_scale_identity, opacity_gate_st
 
 
 # Fixed query-head geometry constants.  They are intentionally kept out of the
@@ -557,6 +557,86 @@ class GridTemporalAggregator(nn.Module):
         )
 
 
+class ViewpointFourierEncoder(nn.Module):
+    """Encode frame-0-relative sensor pose as 24D translation + 24D rotation.
+
+    ``pose`` is ``T_{0<-t}``, so its rotation block is already the true relative
+    rotation from target sensor axes into frame 0. We use the first two columns
+    of that matrix directly as the continuous 6D representation. Subtracting an
+    identity 6D vector would only be Euclidean centering, not a valid SO(3)
+    relative-rotation operation, and is intentionally not done here.
+    """
+
+    def __init__(self, cfg):
+        super().__init__()
+        self.translation_frequencies = int(
+            getattr(cfg, "translation_frequencies", 4)
+        )
+        self.rotation_frequencies = int(
+            getattr(cfg, "rotation_frequencies", 2)
+        )
+        if self.translation_frequencies <= 0 or self.rotation_frequencies <= 0:
+            raise ValueError("viewpoint Fourier frequency counts must be positive")
+        translation_scale = float(getattr(cfg, "translation_scale_m", 10.0))
+        # Matrix entries lie in [-1, 1]. Scaling them to [-0.5, 0.5] prevents
+        # the first integer-pi Fourier band from aliasing +1 and -1.
+        rotation_scale = float(getattr(cfg, "rotation_scale", 2.0))
+        if translation_scale <= 0.0 or rotation_scale <= 0.0:
+            raise ValueError("viewpoint Fourier normalization scales must be positive")
+        self.register_buffer(
+            "translation_scale",
+            torch.tensor(translation_scale, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "rotation_scale",
+            torch.tensor(rotation_scale, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "translation_bands",
+            2.0 ** torch.arange(self.translation_frequencies, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "rotation_bands",
+            2.0 ** torch.arange(self.rotation_frequencies, dtype=torch.float32),
+            persistent=False,
+        )
+        self.out_dim = (
+            3 * 2 * self.translation_frequencies
+            + 6 * 2 * self.rotation_frequencies
+        )
+
+    @staticmethod
+    def pose_descriptor(pose):
+        if pose.ndim < 2 or tuple(pose.shape[-2:]) != (4, 4):
+            raise ValueError(
+                f"viewpoint pose must end in (4, 4), got {tuple(pose.shape)}"
+            )
+        translation = pose[..., :3, 3]
+        rotation = pose[..., :3, :3]
+        # Column concatenation matches the continuous-6D rotation definition.
+        rotation_6d = torch.cat(
+            [rotation[..., :, 0], rotation[..., :, 1]], dim=-1
+        )
+        return torch.cat([translation, rotation_6d], dim=-1)
+
+    @staticmethod
+    def _encode(values, bands):
+        angles = torch.pi * values.unsqueeze(-1) * bands
+        return torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1).flatten(-2)
+
+    def forward(self, pose):
+        descriptor = self.pose_descriptor(pose).float()
+        translation = descriptor[..., :3] / self.translation_scale
+        rotation_6d = descriptor[..., 3:] / self.rotation_scale
+        return torch.cat([
+            self._encode(translation, self.translation_bands),
+            self._encode(rotation_6d, self.rotation_bands),
+        ], dim=-1)
+
+
 class GridSlotHead(nn.Module):
     """Predict variable-count Gaussian parameters for config-selected routing.
 
@@ -568,6 +648,13 @@ class GridSlotHead(nn.Module):
     token. The selected hard-ST scalar gates the activated opacity of that
     expert's K outputs: forward rendering is unchanged, while backward connects
     the rendering loss to all count logits through the softmax Jacobian.
+
+    ``count_mode="learned_gumbel_viewpt"`` predicts one view-independent Common
+    Gaussian from each fused token, then predicts total K separately for every
+    target ``gt["pose"]``. Only K-1 Additional outputs use the 192D
+    view-dependent feature. The Common output is stored once with ``view_index
+    = -1``; its per-view router gate is deferred until the renderer constructs
+    ``Common union Additional_view``.
     """
 
     def __init__(self, cfg, gs_params, dim):
@@ -580,12 +667,12 @@ class GridSlotHead(nn.Module):
             if k_max is None:
                 raise ValueError("p2g.grid_query.K_max is required")
             self.gumbel_tau = None
-        elif self.count_mode == "learned_gumbel":
+        elif self.count_mode in ("learned_gumbel", "learned_gumbel_viewpt"):
             learned_count = getattr(cfg, "learned_count", None)
             if learned_count is None:
                 raise ValueError(
                     "p2g.grid_query.learned_count is required for "
-                    "count_mode='learned_gumbel'"
+                    f"count_mode={self.count_mode!r}"
                 )
             k_max = getattr(learned_count, "K_max", None)
             if k_max is None:
@@ -599,8 +686,8 @@ class GridSlotHead(nn.Module):
                 )
         else:
             raise ValueError(
-                "p2g.grid_query.count_mode must be 'legacy' or "
-                "'learned_gumbel'"
+                "p2g.grid_query.count_mode must be 'legacy', "
+                "'learned_gumbel', or 'learned_gumbel_viewpt'"
             )
         self.k_max = int(k_max)
         self.grad_balance = str(getattr(cfg, "grad_balance", "sqrt_k"))
@@ -640,14 +727,16 @@ class GridSlotHead(nn.Module):
         self.opacity_start = param_sizes[0]
         self.opacity_end = self.opacity_start + param_sizes[1]
 
-        self.trunk = nn.Sequential(
-            nn.Linear(self.dim + 3 * self.k_max, self.dim),
-            nn.SiLU(),
-        )
-        self.k_heads = nn.ModuleList([
-            nn.Linear(self.dim, k * self.param_dim)
-            for k in range(1, self.k_max + 1)
-        ])
+        if self.count_mode != "learned_gumbel_viewpt":
+            # Preserve the exact legacy/learned_gumbel module names and shapes.
+            self.trunk = nn.Sequential(
+                nn.Linear(self.dim + 3 * self.k_max, self.dim),
+                nn.SiLU(),
+            )
+            self.k_heads = nn.ModuleList([
+                nn.Linear(self.dim, k * self.param_dim)
+                for k in range(1, self.k_max + 1)
+            ])
 
         if self.count_mode == "learned_gumbel":
             self.count_predictor = nn.Sequential(
@@ -657,6 +746,44 @@ class GridSlotHead(nn.Module):
             )
             # Uniform initial categorical probabilities avoid imposing an
             # arbitrary K preference before the rendering losses provide signal.
+            nn.init.zeros_(self.count_predictor[-1].weight)
+            nn.init.zeros_(self.count_predictor[-1].bias)
+        elif self.count_mode == "learned_gumbel_viewpt":
+            viewpoint_cfg = getattr(learned_count, "viewpoint", learned_count)
+            self.viewpoint_encoder = ViewpointFourierEncoder(viewpoint_cfg)
+            if self.viewpoint_encoder.out_dim != 48:
+                raise ValueError(
+                    "learned_gumbel_viewpt requires a 48D viewpoint embedding; "
+                    f"configured frequencies produce {self.viewpoint_encoder.out_dim}D"
+                )
+            self.view_mlp = nn.Sequential(
+                nn.LayerNorm(self.dim + 48),
+                nn.Linear(self.dim + 48, 384),
+                nn.SiLU(),
+                nn.Linear(384, 384),
+                nn.SiLU(),
+                nn.Linear(384, 192),
+            )
+            self.common_predictor = nn.Sequential(
+                nn.Linear(self.dim + 3, self.dim),
+                nn.SiLU(),
+                nn.Linear(self.dim, self.param_dim),
+            )
+            self.count_predictor = nn.Sequential(
+                nn.Linear(192, 192),
+                nn.SiLU(),
+                nn.Linear(192, self.k_max),
+            )
+            additional_width = 3 * max(self.k_max - 1, 0)
+            self.additional_trunk = nn.Sequential(
+                nn.Linear(192 + additional_width, 192),
+                nn.SiLU(),
+            )
+            self.additional_heads = nn.ModuleList([
+                nn.Linear(192, additional_k * self.param_dim)
+                for additional_k in range(1, self.k_max)
+            ])
+            # Start with a uniform total-K policy.
             nn.init.zeros_(self.count_predictor[-1].weight)
             nn.init.zeros_(self.count_predictor[-1].bias)
 
@@ -693,19 +820,8 @@ class GridSlotHead(nn.Module):
         """
         if raw_params.shape[0] == 0:
             return raw_params
-        raw_opacity = raw_params[
-            :, self.opacity_start:self.opacity_end
-        ]
-        work_opacity = raw_opacity.float()
-        work_gate = gate.to(dtype=torch.float32).unsqueeze(-1)
-        activated = torch.sigmoid(work_opacity)
-        gated_activated = (activated * work_gate).clamp(
-            min=1.0e-6, max=1.0 - 1.0e-6
-        )
-        gated_logit = torch.logit(gated_activated).to(raw_opacity.dtype)
-        opacity_st = (
-            raw_opacity.detach() + gated_logit - gated_logit.detach()
-        )
+        raw_opacity = raw_params[:, self.opacity_start:self.opacity_end]
+        opacity_st = opacity_gate_st(raw_opacity, gate)
         return torch.cat([
             raw_params[:, :self.opacity_start],
             opacity_st,
@@ -896,7 +1012,285 @@ class GridSlotHead(nn.Module):
             "selected_only": True,
         }
 
-    def forward(self, anchor_feature, anchor_k, delta_p, anchor_offset):
+    def _target_view_decisions(self, anchor_batch, target_pose, *, device, dtype):
+        """Expand each source token into the target views of its batch item."""
+        if not isinstance(target_pose, (list, tuple)):
+            raise ValueError(
+                "learned_gumbel_viewpt requires gt['pose'] as a list of "
+                "(V, 4, 4) tensors"
+            )
+        if anchor_batch.ndim != 1:
+            raise ValueError("anchor_batch must be one-dimensional")
+        view_counts = []
+        pose_parts = []
+        for batch_id, pose_b in enumerate(target_pose):
+            if not torch.is_tensor(pose_b) or pose_b.ndim != 3 or \
+                    tuple(pose_b.shape[-2:]) != (4, 4):
+                raise ValueError(
+                    f"target_pose[{batch_id}] must have shape (V, 4, 4)"
+                )
+            view_counts.append(int(pose_b.shape[0]))
+            pose_parts.append(pose_b.to(device=device, dtype=dtype))
+        view_counts = torch.tensor(view_counts, device=device, dtype=torch.long)
+
+        if anchor_batch.numel() > 0:
+            if view_counts.numel() == 0:
+                raise ValueError("target_pose cannot be empty when anchors exist")
+            invalid = (anchor_batch < 0) | (anchor_batch >= view_counts.numel())
+            if invalid.any():
+                raise ValueError("anchor_batch contains an invalid batch index")
+            if (view_counts[anchor_batch] <= 0).any():
+                raise ValueError("every batch item containing anchors needs a target view")
+
+        per_anchor = (
+            view_counts[anchor_batch]
+            if anchor_batch.numel() > 0
+            else anchor_batch.new_zeros((0,))
+        )
+        decision_anchor = torch.repeat_interleave(
+            torch.arange(anchor_batch.numel(), device=device), per_anchor
+        )
+        if decision_anchor.numel() == 0:
+            empty = torch.zeros(0, dtype=torch.long, device=device)
+            empty_pose = torch.zeros((0, 4, 4), device=device, dtype=dtype)
+            return decision_anchor, empty, empty_pose
+
+        decision_start = torch.cumsum(per_anchor, dim=0) - per_anchor
+        decision_view = (
+            torch.arange(decision_anchor.numel(), device=device)
+            - torch.repeat_interleave(decision_start, per_anchor)
+        )
+        pose_start = torch.cumsum(view_counts, dim=0) - view_counts
+        flat_pose = torch.cat(pose_parts, dim=0)
+        pose_index = (
+            pose_start[anchor_batch[decision_anchor]] + decision_view
+        )
+        return decision_anchor, decision_view, flat_pose[pose_index]
+
+    def _forward_viewpoint(
+        self, anchor_feature, anchor_k, delta_p, anchor_offset,
+        target_pose, anchor_batch,
+    ):
+        if anchor_k is not None:
+            raise ValueError(
+                "learned_gumbel_viewpt predicts total K after temporal fusion; "
+                "external anchor_k must be None"
+            )
+        expected_delta_shape = (
+            anchor_feature.shape[0], self.k_max, self.k_max, 3,
+        )
+        if tuple(delta_p.shape) != expected_delta_shape:
+            raise ValueError(
+                "learned_gumbel_viewpt delta_p must have shape "
+                f"{expected_delta_shape}, got {tuple(delta_p.shape)}"
+            )
+        if anchor_batch is None:
+            raise ValueError("learned_gumbel_viewpt requires anchor_batch")
+        anchor_batch = anchor_batch.to(
+            device=anchor_feature.device, dtype=torch.long
+        )
+        if anchor_batch.shape != (anchor_feature.shape[0],):
+            raise ValueError("anchor_batch must align one-to-one with anchor_feature")
+
+        decision_anchor, decision_view, decision_pose = self._target_view_decisions(
+            anchor_batch,
+            target_pose,
+            device=anchor_feature.device,
+            dtype=torch.float32,
+        )
+        decision_feature = anchor_feature[decision_anchor]
+        pose_embedding = self.viewpoint_encoder(decision_pose).to(
+            dtype=anchor_feature.dtype
+        )
+        view_feature = self.view_mlp(torch.cat([
+            decision_feature, pose_embedding,
+        ], dim=-1))
+
+        logits = self.count_predictor(view_feature)
+        selection = self._gumbel_selection(logits)
+        selected_index = selection.argmax(dim=-1).to(torch.long)
+        selected_k = selected_index + 1
+
+        # Common is predicted once per source token without any viewpoint input.
+        # Its base position delta is included exactly like the Additional branch.
+        common_delta = delta_p[:, 0, 0].to(dtype=anchor_feature.dtype)
+        common_params = self.common_predictor(torch.cat([
+            anchor_feature, common_delta,
+        ], dim=-1))
+
+        # Store Common physically once per source token. The remaining rows are
+        # the selected K-1 Additional Gaussians from every target-view decision.
+        # Rows remain anchor-major, hence frame offsets keep their historical
+        # contiguous-frame contract.
+        additional_count = selected_k - 1
+        per_anchor_additional = torch.zeros(
+            anchor_feature.shape[0], dtype=torch.long,
+            device=anchor_feature.device,
+        )
+        if additional_count.numel() > 0:
+            per_anchor_additional.index_add_(
+                0, decision_anchor, additional_count
+            )
+        per_anchor_gaussians = per_anchor_additional + 1
+        gaussian_anchor = torch.repeat_interleave(
+            torch.arange(anchor_feature.shape[0], device=anchor_feature.device),
+            per_anchor_gaussians,
+        )
+        anchor_start = torch.cumsum(
+            per_anchor_gaussians, dim=0
+        ) - per_anchor_gaussians
+        local_row = (
+            torch.arange(gaussian_anchor.numel(), device=anchor_feature.device)
+            - torch.repeat_interleave(anchor_start, per_anchor_gaussians)
+        )
+        is_common = local_row == 0
+        common_rows = is_common.nonzero(as_tuple=True)[0]
+        additional_rows = (~is_common).nonzero(as_tuple=True)[0]
+
+        decision_rows = torch.arange(
+            selected_k.numel(), device=anchor_feature.device
+        )
+        additional_decision = torch.repeat_interleave(
+            decision_rows, additional_count
+        )
+        if additional_rows.numel() != additional_decision.numel():
+            raise RuntimeError("Additional Gaussian packing lost decision alignment")
+
+        decision_index = torch.full(
+            (gaussian_anchor.numel(),), -1, dtype=torch.long,
+            device=anchor_feature.device,
+        )
+        gaussian_view = torch.full_like(decision_index, -1)
+        slot_index = torch.zeros_like(decision_index)
+        slot_k = torch.ones_like(decision_index)
+        additional_start = torch.cumsum(
+            additional_count, dim=0
+        ) - additional_count
+        additional_slot = (
+            torch.arange(additional_decision.numel(), device=anchor_feature.device)
+            - torch.repeat_interleave(additional_start, additional_count)
+            + 1
+        )
+        if additional_rows.numel() > 0:
+            decision_index = decision_index.index_copy(
+                0, additional_rows, additional_decision
+            )
+            gaussian_view = gaussian_view.index_copy(
+                0, additional_rows, decision_view[additional_decision]
+            )
+            slot_index = slot_index.index_copy(
+                0, additional_rows, additional_slot
+            )
+            slot_k = slot_k.index_copy(
+                0, additional_rows, selected_k[additional_decision]
+            )
+
+        raw_params = anchor_feature.new_zeros(
+            (gaussian_anchor.numel(), self.param_dim)
+        )
+        raw_params = raw_params.index_copy(0, common_rows, common_params)
+
+        # Candidate K already contains [Common, Additional...]. Only the selected
+        # K row enters its predictor, and K=1 executes no Additional head.
+        selected_delta = delta_p[
+            decision_anchor, selected_index
+        ].to(dtype=anchor_feature.dtype)
+        additional_delta = selected_delta[:, 1:].reshape(
+            selected_k.numel(), 3 * max(self.k_max - 1, 0)
+        )
+        for total_k in range(2, self.k_max + 1):
+            selected_rows = decision_rows[selected_k == total_k]
+            if selected_rows.numel() == 0:
+                continue
+            additional_k = total_k - 1
+            # Selected-only execution: K=1 decisions do not enter either the
+            # Additional trunk or an Additional output head.
+            additional_feature = self.additional_trunk(torch.cat([
+                view_feature[selected_rows], additional_delta[selected_rows],
+            ], dim=-1))
+            head_input = self._balance_token_feature(
+                additional_feature, total_k
+            )
+            predicted = self.additional_heads[additional_k - 1](head_input).reshape(
+                -1, additional_k, self.param_dim
+            )
+            flat_additional = (
+                additional_start[selected_rows, None]
+                + torch.arange(
+                    additional_k, device=anchor_feature.device
+                ).view(1, -1)
+            )
+            output_rows = additional_rows[flat_additional]
+            raw_params = raw_params.index_copy(
+                0, output_rows.reshape(-1), predicted.reshape(-1, self.param_dim)
+            )
+
+        # Additional rows can be gated now because each belongs to exactly one
+        # view. Common is shared, so retain one scalar gate per (token, view) and
+        # apply it only when the renderer constructs that view's union. Thus K=1
+        # still trains its router without duplicating Common Gaussian tensors.
+        selected_gate = selection.gather(
+            1, selected_index.unsqueeze(-1)
+        ).squeeze(-1)
+        packed_gate = raw_params.new_ones((raw_params.shape[0],))
+        if additional_rows.numel() > 0:
+            additional_gate = selected_gate[additional_decision]
+            gated_additional = self._opacity_gate_st(
+                raw_params[additional_rows], additional_gate
+            )
+            raw_params = raw_params.index_copy(
+                0, additional_rows, gated_additional
+            )
+            packed_gate = packed_gate.index_copy(
+                0, additional_rows, additional_gate
+            )
+
+        max_views = max(
+            (int(pose_b.shape[0]) for pose_b in target_pose), default=0
+        )
+        common_view_gate = raw_params.new_zeros(
+            (anchor_feature.shape[0] * max_views,)
+        )
+        if selected_gate.numel() > 0:
+            common_gate_index = decision_anchor * max_views + decision_view
+            common_view_gate = common_view_gate.index_copy(
+                0, common_gate_index, selected_gate
+            )
+        common_view_gate = common_view_gate.reshape(
+            anchor_feature.shape[0], max_views
+        )
+
+        gaussian_offset = self._gaussian_offset(
+            per_anchor_gaussians, anchor_offset
+        )
+        return raw_params, {
+            "anchor_index": gaussian_anchor,
+            "decision_index": decision_index,
+            "decision_anchor_index": decision_anchor,
+            "decision_view_index": decision_view,
+            "view_index": gaussian_view,
+            "is_common": is_common,
+            "common_view_gate": common_view_gate,
+            "slot_index": slot_index,
+            "slot_k": slot_k,
+            "anchor_k": selected_k,
+            "gaussian_offset": gaussian_offset,
+            "k_logits": logits,
+            "k_selection": selection,
+            "packed_selected_gate": packed_gate,
+            "selected_only": True,
+            "view_dependent": True,
+        }
+
+    def forward(
+        self, anchor_feature, anchor_k, delta_p, anchor_offset,
+        target_pose=None, anchor_batch=None,
+    ):
+        if self.count_mode == "learned_gumbel_viewpt":
+            return self._forward_viewpoint(
+                anchor_feature, anchor_k, delta_p, anchor_offset,
+                target_pose, anchor_batch,
+            )
         if self.count_mode == "learned_gumbel":
             return self._forward_learned(
                 anchor_feature, anchor_k, delta_p, anchor_offset
@@ -917,4 +1311,5 @@ class GridSlotHead(nn.Module):
 __all__ = [
     "GridTemporalAggregator",
     "GridSlotHead",
+    "ViewpointFourierEncoder",
 ]

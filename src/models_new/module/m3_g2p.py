@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 from ..gaussian_renderer import render
+from .gaussian_assembly import opacity_gate_st
 from ..utils.graphics_utils import lidar4d_range_image_to_points
 
 
@@ -33,6 +34,110 @@ class GausRender(nn.Module):
             raise ValueError(f"Expected scale tensor with 2 or 3 channels, got {scales.shape[-1]}.")
         z_log_scale = torch.zeros(scales.shape[0], 1, device=scales.device, dtype=scales.dtype)
         return torch.cat([scales, z_log_scale], dim=-1)
+
+    @staticmethod
+    def group_target_views(b_gs, num_views):
+        """Build one Common+Additional index vector per view with one sort.
+
+        Common rows use the reserved ``view_index=-1`` and are prepended to
+        every transient render union. Additional rows are sorted once by their
+        non-negative target-view tag, avoiding a full-union boolean scan for
+        every rasterizer call.
+        """
+        gaussian_view = b_gs.get("view_index")
+        if gaussian_view is None:
+            return [None] * int(num_views)
+        num_views = int(num_views)
+        if num_views <= 0:
+            return []
+        if gaussian_view.ndim != 1:
+            raise ValueError("view_index must be one-dimensional")
+
+        common_rows = (gaussian_view == -1).nonzero(as_tuple=True)[0]
+        additional_rows = (gaussian_view >= 0).nonzero(as_tuple=True)[0]
+        additional_view = gaussian_view[additional_rows].long()
+        if additional_view.numel() > 0:
+            order = torch.argsort(additional_view, stable=True)
+            sorted_rows = additional_rows[order]
+            counts = torch.bincount(
+                additional_view, minlength=num_views
+            ).tolist()
+            if len(counts) != num_views:
+                raise ValueError(
+                    "Additional Gaussian view_index falls outside target cameras"
+                )
+        else:
+            sorted_rows = additional_rows
+            counts = [0] * num_views
+
+        grouped = []
+        start = 0
+        for count in counts:
+            end = start + int(count)
+            grouped.append(torch.cat([common_rows, sorted_rows[start:end]]))
+            start = end
+        return grouped
+
+    @staticmethod
+    def select_target_view(b_gs, view_index, gaussian_indices=None):
+        """Construct the transient ``Common union Additional_view`` tensors."""
+        gaussian_view = b_gs.get("view_index")
+        if gaussian_view is None:
+            return b_gs
+        if gaussian_indices is None:
+            common_indices = (gaussian_view == -1).nonzero(as_tuple=True)[0]
+            additional_indices = (
+                gaussian_view == int(view_index)
+            ).nonzero(as_tuple=True)[0]
+            gaussian_indices = torch.cat([
+                common_indices, additional_indices,
+            ])
+        if gaussian_indices.numel() == 0:
+            raise RuntimeError(
+                f"No Gaussians were generated for target view {view_index}"
+            )
+        gaussian_keys = {
+            "position", "coord", "coord_ref", "box_assign", "instance_id",
+            "is_dynamic", "bg_mask", "shs", "opacity", "scaling", "scale",
+            "scales", "rotation", "rotations", "view_index",
+        }
+        selected = {}
+        for key, value in b_gs.items():
+            if key in gaussian_keys and torch.is_tensor(value):
+                selected[key] = value.index_select(0, gaussian_indices)
+            elif key == "common_view_gate":
+                # This compact [num_common, num_views] tensor is consumed below,
+                # not expanded into a Gaussian-aligned render attribute.
+                continue
+            elif key == "fg_masks" and isinstance(value, dict):
+                selected[key] = {
+                    item_id: item_mask.index_select(0, gaussian_indices)
+                    for item_id, item_mask in value.items()
+                }
+            else:
+                selected[key] = value
+
+        common_view_gate = b_gs.get("common_view_gate")
+        if common_view_gate is not None:
+            if common_view_gate.ndim != 2:
+                raise ValueError("common_view_gate must have shape (N_common, V)")
+            common_count = common_view_gate.shape[0]
+            if common_count == 0:
+                return selected
+            if common_count > selected["opacity"].shape[0]:
+                raise ValueError(
+                    "common_view_gate rows must align with stored Common Gaussians"
+                )
+            if int(view_index) >= common_view_gate.shape[1]:
+                raise IndexError("target view exceeds common_view_gate width")
+            common_opacity = opacity_gate_st(
+                selected["opacity"][:common_count],
+                common_view_gate[:, int(view_index)],
+            )
+            selected["opacity"] = torch.cat([
+                common_opacity, selected["opacity"][common_count:],
+            ])
+        return selected
 
 
     def get_means3D(self, b_gs, t):
@@ -163,21 +268,27 @@ class GausRender(nn.Module):
             b_alphas = [] if all_alphas is not None else None
             b_gt_depths, b_gt_intensity_shs, b_gt_raydrops = [], [], []
             b_render_points, b_gt_points = [], []
+            target_view_groups = self.group_target_views(
+                b_gs, len(gt_cameras)
+            )
 
-            for gt_cam in gt_cameras:
+            for view_index, gt_cam in enumerate(gt_cameras):
                 t = gt_cam.timestamp
+                view_gs = self.select_target_view(
+                    b_gs, view_index, target_view_groups[view_index]
+                )
 
                 # gt timestamp 기준 position 계산
-                means3D = self.get_means3D(b_gs, t)
-                rotations = self.get_rotations(b_gs, t)
+                means3D = self.get_means3D(view_gs, t)
+                rotations = self.get_rotations(view_gs, t)
 
                 pc = {
                     "position": means3D,
-                    "opacity":  b_gs["opacity"],
-                    "scales":   self.pack_scales(b_gs.get("scales", b_gs.get("scale", b_gs["scaling"]))),
+                    "opacity":  view_gs["opacity"],
+                    "scales":   self.pack_scales(view_gs.get("scales", view_gs.get("scale", view_gs["scaling"]))),
                     "rotation": rotations,
                     "rotations": rotations,
-                    "shs":      self.pack_lidar_shs(b_gs["shs"]),
+                    "shs":      self.pack_lidar_shs(view_gs["shs"]),
                 }
 
                 # 랜더링

@@ -18,9 +18,11 @@ class GridSeedData:
     Legacy count routing stores one padded seed set with shape
     ``(N, K_max, 3)`` and its deterministic ``anchor_k``. Learned Gumbel
     routing stores every K-specific candidate set with shape
-    ``(N, K_max, K_max, 3)``; candidate row ``k - 1`` contains the first
-    ``k`` valid range-quantile seeds and ``anchor_k`` is ``None`` because K is
-    predicted only after temporal feature fusion.
+    ``(N, K_max, K_max, 3)`` and ``anchor_k`` is ``None`` because K is
+    predicted only after temporal feature fusion. ``learned_gumbel`` fills a
+    candidate row with ``k`` range-quantile seeds. ``learned_gumbel_viewpt``
+    instead reserves slot zero for one observed medoid (the Common Gaussian)
+    and fills slots ``1..k-1`` with range-quantile Additional seeds.
     """
 
     seed_sensor: torch.Tensor
@@ -205,6 +207,76 @@ def _r_quantile_seed_bank(points, cell_idx, counts, grid_coord, occupied,
     return GridSeedData(seeds, delta, None)
 
 
+def _viewpoint_seed_bank(points, cell_idx, counts, grid_coord, occupied,
+                         metric_origin, mapper, k_max):
+    """Build Common-medoid + Additional-range-quantile candidates.
+
+    Candidate row ``K_total - 1`` always starts with the same observed medoid.
+    Its remaining ``K_total - 1`` slots use deterministic range quantiles. If a
+    cell contains fewer raw points than Additional slots, the integer quantile
+    ranks intentionally repeat observed points; independent predictor outputs
+    and learned offsets can subsequently separate the Gaussians.
+    """
+    occupied_index = occupied.nonzero(as_tuple=True)[0]
+    num_cells = occupied_index.numel()
+    seeds = points.new_zeros((num_cells, k_max, k_max, 3))
+    delta = points.new_zeros((num_cells, k_max, k_max, 3))
+    if num_cells == 0:
+        return GridSeedData(seeds, delta, None)
+
+    count_long = counts.long()
+    occupied_count = count_long[occupied_index]
+    starts = torch.cumsum(count_long, dim=0) - count_long
+
+    # Observed centroid-medoid, with the same deterministic xyz tie-break as
+    # ``_medoid_seed_data``.
+    point_sum = points.new_zeros((counts.numel(), 3))
+    point_sum.index_add_(0, cell_idx, points)
+    point_mean = point_sum / count_long.clamp_min(1).to(points.dtype).unsqueeze(-1)
+    distance2 = ((points - point_mean[cell_idx]) ** 2).sum(dim=-1)
+    distance_key = torch.round(distance2 * 1.0e6)
+    medoid_order = torch.arange(points.shape[0], device=points.device)
+    for value in (
+        points[:, 2], points[:, 1], points[:, 0], distance_key, cell_idx,
+    ):
+        medoid_order = medoid_order[
+            torch.argsort(value[medoid_order], stable=True)
+        ]
+    common_seed = points[medoid_order[starts[occupied_index]]]
+    seeds[:, :, 0] = common_seed[:, None, :]
+
+    # Additional slots use own-frame range quantiles. Stable sorting yields the
+    # deterministic key (cell, range, x, y, z).
+    point_range = points.norm(dim=-1)
+    range_order = torch.arange(points.shape[0], device=points.device)
+    for value in (
+        points[:, 2], points[:, 1], points[:, 0], point_range, cell_idx,
+    ):
+        range_order = range_order[
+            torch.argsort(value[range_order], stable=True)
+        ]
+    sorted_points = points[range_order]
+    cell_start = starts[occupied_index].view(-1, 1)
+    for total_k in range(2, k_max + 1):
+        additional_k = total_k - 1
+        slot = torch.arange(additional_k, device=points.device).view(1, -1)
+        rank = torch.div(
+            (2 * slot + 1) * occupied_count.view(-1, 1),
+            2 * additional_k,
+            rounding_mode="floor",
+        )
+        seeds[:, total_k - 1, 1:total_k] = sorted_points[cell_start + rank]
+
+    cell_center = _cell_centers(
+        grid_coord, occupied, metric_origin, mapper, points.dtype
+    )
+    for total_k in range(1, k_max + 1):
+        delta[:, total_k - 1, :total_k] = (
+            seeds[:, total_k - 1, :total_k] - cell_center[:, None, :]
+        )
+    return GridSeedData(seeds, delta, None)
+
+
 def _medoid_seed_data(points, cell_idx, counts, grid_coord, occupied,
                       metric_origin, mapper, k_max):
     """One observed centroid-medoid seed per occupied token.
@@ -299,7 +371,7 @@ def _aggregate_points_to_cells(points_xyz, intensity, grid_coord, voxel_feats,
         if seed_config is not None:
             count_mode, _points_per_gaussian, k_max, _exp, _seed_mode = seed_config
             k_max = int(k_max)
-            if count_mode == "learned_gumbel":
+            if count_mode in ("learned_gumbel", "learned_gumbel_viewpt"):
                 empty_seed = points_xyz.new_zeros((0, k_max, k_max, 3))
                 empty_k = None
             else:
@@ -381,6 +453,15 @@ def _aggregate_points_to_cells(points_xyz, intensity, grid_coord, voxel_feats,
                 pts, cell_idx, counts, grid_coord, occ, metric_origin, mapper,
                 k_max=int(k_max),
             )
+        elif count_mode == "learned_gumbel_viewpt":
+            if seed_mode != "range_quantile":
+                raise ValueError(
+                    f"Unsupported viewpoint grid seed_mode={seed_mode!r}"
+                )
+            seed_data = _viewpoint_seed_bank(
+                pts, cell_idx, counts, grid_coord, occ, metric_origin, mapper,
+                k_max=int(k_max),
+            )
         elif exp is None:
             seed_data = _r_quantile_seed_data(
                 pts, cell_idx, counts, grid_coord, occ, metric_origin, mapper,
@@ -424,16 +505,20 @@ def aggregate_points_to_cells_with_seeds(
     In ``count_mode="legacy"``, ``exp=None`` retains raw-count-driven
     range-quantile slots, ``exp=1`` emits one raw-point medoid per token, and
     ``exp=2`` emits two identical token-coordinate seeds. In
-    ``count_mode="learned_gumbel"``, legacy ``exp`` and
-    ``points_per_gaussian`` are ignored and ``seed_mode="range_quantile"``
-    builds the full K-specific candidate bank.
+    learned count modes, legacy ``exp`` and ``points_per_gaussian`` are ignored.
+    ``learned_gumbel`` builds the full range-quantile candidate bank;
+    ``learned_gumbel_viewpt`` builds Common-medoid plus Additional-range-quantile
+    candidates.
     """
     count_mode = str(count_mode).lower()
-    if count_mode not in ("legacy", "learned_gumbel"):
+    if count_mode not in (
+        "legacy", "learned_gumbel", "learned_gumbel_viewpt",
+    ):
         raise ValueError(
-            "grid count_mode must be 'legacy' or 'learned_gumbel'"
+            "grid count_mode must be 'legacy', 'learned_gumbel', or "
+            "'learned_gumbel_viewpt'"
         )
-    if count_mode == "learned_gumbel":
+    if count_mode in ("learned_gumbel", "learned_gumbel_viewpt"):
         seed_mode = "range_quantile" if seed_mode is None else str(seed_mode).lower()
     return _aggregate_points_to_cells(
         points_xyz, intensity, grid_coord, voxel_feats,

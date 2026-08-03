@@ -98,7 +98,7 @@ class ModelWrapper(LightningModule):
             and str(self._cfg_get("p2g.anchor_mode", "spherical")).lower() == "grid"
             and str(
                 self._cfg_get("p2g.grid_query.count_mode", "legacy")
-            ).lower() == "learned_gumbel"
+            ).lower() in ("learned_gumbel", "learned_gumbel_viewpt")
         )
         self._budget_target_mean_k = float(self._cfg_get(
             "p2g.grid_query.learned_count.budget.target_mean_k", 2.0
@@ -169,7 +169,7 @@ class ModelWrapper(LightningModule):
 
     def _shared_step(self, batch, batch_idx, *, prefix: str):
         _input, gt = batch["input"], batch["gt"]
-        p2g_out = self.p2g_model(_input)
+        p2g_out = self.p2g_model(_input, target_pose=gt.get("pose"))
         # Keep detached diagnostics outside the renderer/temporal model input.
         routing_stats = p2g_out.pop("routing_stats", None)
         routing_budget_logits = p2g_out.pop("routing_budget_logits", None)

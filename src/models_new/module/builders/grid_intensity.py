@@ -21,8 +21,9 @@ Intensity per primitive comes from one of three encoders (config
 
 All modes also return per-frame ``occ_gc`` (occupied token grid coordinates) and
 ``raw_count`` lists. Grid mode additionally returns either the legacy padded
-own-frame seed set or, for learned Gumbel count routing, a K-specific
-range-quantile seed bank. Every delta is measured from the geometric cell center.
+own-frame seed set or a K-specific learned-count seed bank. Viewpoint routing
+uses one medoid Common seed plus range-quantile Additional seeds. Every delta is
+measured from the geometric cell center.
 """
 from __future__ import annotations
 
@@ -103,12 +104,12 @@ class OccupiedGridTokenBuilder(nn.Module):
                 self.grid_seed_config = (
                     "legacy", points_per_gaussian, k_max, exp, None,
                 )
-            elif count_mode == "learned_gumbel":
+            elif count_mode in ("learned_gumbel", "learned_gumbel_viewpt"):
                 learned_count = getattr(grid_query, "learned_count", None)
                 if learned_count is None:
                     raise ValueError(
                         "p2g.grid_query.learned_count is required for "
-                        "count_mode='learned_gumbel'"
+                        f"count_mode={count_mode!r}"
                     )
                 k_max = getattr(learned_count, "K_max", None)
                 if k_max is None or int(k_max) <= 0:
@@ -126,12 +127,12 @@ class OccupiedGridTokenBuilder(nn.Module):
                 # Legacy points_per_gaussian/exp are deliberately not read in
                 # this branch: K is predicted after temporal feature fusion.
                 self.grid_seed_config = (
-                    "learned_gumbel", None, int(k_max), None, seed_mode,
+                    count_mode, None, int(k_max), None, seed_mode,
                 )
             else:
                 raise ValueError(
-                    "p2g.grid_query.count_mode must be 'legacy' or "
-                    "'learned_gumbel'"
+                    "p2g.grid_query.count_mode must be 'legacy', "
+                    "'learned_gumbel', or 'learned_gumbel_viewpt'"
                 )
         (
             self.intensity_mode,

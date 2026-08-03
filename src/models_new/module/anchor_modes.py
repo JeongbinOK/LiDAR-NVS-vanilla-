@@ -111,6 +111,7 @@ def build_grid_gaussian_seeds(
     bbox,
     bbox_instance_ids,
     timestamps,
+    target_pose=None,
 ):
     """Aggregate grid tokens, pack variable slots, and expand token metadata."""
     (
@@ -127,12 +128,30 @@ def build_grid_gaussian_seeds(
         bbox_instance_ids,
         timestamps,
     )
-    raw_params, packing = slot_head(
-        anchor_feature,
-        anchor_k,
-        delta_p,
-        token_offset,
-    )
+    if getattr(slot_head, "count_mode", None) == "learned_gumbel_viewpt":
+        token_counts = torch.diff(
+            token_offset,
+            prepend=token_offset.new_zeros(1),
+        )
+        anchor_batch = torch.repeat_interleave(
+            frame_batch_idx.to(device=anchor_feature.device), token_counts
+        )
+        raw_params, packing = slot_head(
+            anchor_feature,
+            anchor_k,
+            delta_p,
+            token_offset,
+            target_pose=target_pose,
+            anchor_batch=anchor_batch,
+        )
+    else:
+        # Preserve the legacy/mock head call contract exactly.
+        raw_params, packing = slot_head(
+            anchor_feature,
+            anchor_k,
+            delta_p,
+            token_offset,
+        )
     k_selection = packing.get("k_selection")
     routing_stats = None
     routing_budget_logits = None
@@ -155,44 +174,110 @@ def build_grid_gaussian_seeds(
                 f"{expected_shape}, got {tuple(seed_ref.shape)}"
             )
         selected_index = packing["anchor_k"] - 1
-        anchor_rows = torch.arange(
-            anchor_feature.shape[0], device=anchor_feature.device
-        )
-        # Geometry follows the same hard expert route as its K-specific head.
-        # Do not mix unrelated candidate seed positions in the ST backward:
-        # learned-count gradients are carried solely by the selected expert's
-        # activated-opacity gate inside GridSlotHead.
-        seed_position = seed_position[anchor_rows, selected_index]
-        seed_ref = seed_ref[anchor_rows, selected_index]
-        # This side-output is detached and remains token-level. It never enters
-        # Gaussian assembly, temporal rendering, or the training loss graph.
+        if packing.get("view_dependent", False):
+            decision_index = packing["decision_index"]
+            anchor_index = packing["anchor_index"]
+            slot_index = packing["slot_index"]
+            is_common = packing.get("is_common", packing["view_index"] == -1)
+            common_rows = is_common.nonzero(as_tuple=True)[0]
+            additional_rows = (~is_common).nonzero(as_tuple=True)[0]
+            packed_seed_position = seed_position.new_empty(
+                (anchor_index.numel(), 3)
+            )
+            packed_seed_ref = seed_ref.new_empty((anchor_index.numel(), 3))
+
+            # Common geometry is unconditionally taken from the fixed K=1 row.
+            # It cannot silently become view/K-dependent even if another
+            # candidate row's slot zero changes in the seed builder.
+            packed_seed_position = packed_seed_position.index_copy(
+                0,
+                common_rows,
+                seed_position[anchor_index[common_rows], 0, 0],
+            )
+            packed_seed_ref = packed_seed_ref.index_copy(
+                0,
+                common_rows,
+                seed_ref[anchor_index[common_rows], 0, 0],
+            )
+            if additional_rows.numel() > 0:
+                additional_decision = decision_index[additional_rows]
+                packed_seed_position = packed_seed_position.index_copy(
+                    0,
+                    additional_rows,
+                    seed_position[
+                        anchor_index[additional_rows],
+                        selected_index[additional_decision],
+                        slot_index[additional_rows],
+                    ],
+                )
+                packed_seed_ref = packed_seed_ref.index_copy(
+                    0,
+                    additional_rows,
+                    seed_ref[
+                        anchor_index[additional_rows],
+                        selected_index[additional_decision],
+                        slot_index[additional_rows],
+                    ],
+                )
+            routing_anchor = packing["decision_anchor_index"]
+        else:
+            anchor_rows = torch.arange(
+                anchor_feature.shape[0], device=anchor_feature.device
+            )
+            # Geometry follows the same hard expert route as its K-specific head.
+            # Do not mix unrelated candidate seed positions in the ST backward:
+            # learned-count gradients are carried solely by the selected expert's
+            # activated-opacity gate inside GridSlotHead.
+            selected_seed_position = seed_position[anchor_rows, selected_index]
+            selected_seed_ref = seed_ref[anchor_rows, selected_index]
+            anchor_index = packing["anchor_index"]
+            slot_index = packing["slot_index"]
+            packed_seed_position = selected_seed_position[
+                anchor_index, slot_index
+            ]
+            packed_seed_ref = selected_seed_ref[anchor_index, slot_index]
+            routing_anchor = anchor_rows
+        # This detached side-output is one row per routing decision (one per
+        # token in learned_gumbel, one per token/target-view pair in viewpt). It
+        # never enters Gaussian assembly, temporal rendering, or the loss graph.
         routing_stats = {
             "k_logits": packing["k_logits"].detach(),
             "selected_k": packing["anchor_k"].detach(),
-            "token_position_sensor": token_position.detach(),
-            "is_dynamic": anchor_metadata["is_dynamic"].detach(),
+            "token_position_sensor": token_position[routing_anchor].detach(),
+            "is_dynamic": anchor_metadata["is_dynamic"][routing_anchor].detach(),
         }
+        if packing.get("view_dependent", False):
+            routing_stats["view_index"] = packing[
+                "decision_view_index"
+            ].detach()
         # Loss-only side output. Unlike routing_stats, this tensor intentionally
         # retains autograd and is removed before the temporal model/renderer.
         routing_budget_logits = packing["k_logits"]
     else:
         seed_ref = anchor_metadata["seed_ref"]
+        anchor_index = packing["anchor_index"]
+        slot_index = packing["slot_index"]
+        packed_seed_position = seed_position[anchor_index, slot_index]
+        packed_seed_ref = seed_ref[anchor_index, slot_index]
 
-    anchor_index = packing["anchor_index"]
-    slot_index = packing["slot_index"]
     metadata = {
         "box_assign": anchor_metadata["box_assign"][anchor_index],
         "instance_id": anchor_metadata["instance_id"][anchor_index],
         "is_dynamic": anchor_metadata["is_dynamic"][anchor_index],
-        "coord_ref": seed_ref[anchor_index, slot_index],
+        "coord_ref": packed_seed_ref,
         "bbox_ref_by_frame": anchor_metadata["bbox_ref_by_frame"],
     }
+    if "view_index" in packing:
+        metadata["view_index"] = packing["view_index"]
+    if "common_view_gate" in packing:
+        metadata["anchor_index"] = anchor_index
+        metadata["common_view_gate"] = packing["common_view_gate"]
     gradient_weight = slot_head.gradient_weight(
         packing["slot_k"], seed_position.dtype
     )
     return GaussianSeedBatch(
         feature=None,
-        position=seed_position[anchor_index, slot_index],
+        position=packed_seed_position,
         frame_offset=packing["gaussian_offset"],
         metadata=metadata,
         gradient_weight=gradient_weight,
