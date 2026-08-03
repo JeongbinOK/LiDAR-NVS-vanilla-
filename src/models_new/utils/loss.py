@@ -276,10 +276,11 @@ class Loss(nn.Module):
         The squared log-ratio is averaged over violating Gaussians in each
         violating sample, then over only those samples. Non-violating Gaussians
         and samples therefore contribute neither gradients nor reduction
-        denominator. This keeps the per-sample loss independent of the number
-        of valid Gaussians and avoids the extreme gradients of a meter-space
-        squared hinge. ``w_scale=0`` is a true off switch and does not require
-        Gaussian tensors to be passed.
+        denominator. Viewpoint mode stores Common once even though it appears in
+        every render union, so a violating Common row is weighted by its number
+        of valid target views; this is exactly equivalent to the old physical
+        repetition without retaining V copies. ``w_scale=0`` is a true off
+        switch and does not require Gaussian tensors to be passed.
         """
         if self.w_scale == 0.0:
             return reference.new_zeros(())
@@ -307,9 +308,26 @@ class Loss(nn.Module):
                 torch.log(max_scale.clamp_min(1e-6))
                 - max_scale.new_tensor(SCALE_REG_MAX_M).log()
             )
+            multiplicity = torch.ones_like(excess)
+            gaussian_view = batch_item.get("view_index")
+            common_view_gate = batch_item.get("common_view_gate")
+            if gaussian_view is not None and common_view_gate is not None:
+                common_mask = gaussian_view.to(device=excess.device) == -1
+                if common_view_gate.ndim != 2:
+                    raise ValueError(
+                        "common_view_gate must have shape (N_common, V)"
+                    )
+                common_multiplicity = common_view_gate.detach().ne(0).sum(
+                    dim=-1
+                ).clamp_min(1).to(device=excess.device, dtype=excess.dtype)
+                multiplicity[common_mask] = common_multiplicity
             violated = excess > 0
             if violated.any():
-                sample_losses.append(excess[violated].square().mean())
+                violated_weight = multiplicity[violated]
+                sample_losses.append(
+                    (excess[violated].square() * violated_weight).sum()
+                    / violated_weight.sum()
+                )
 
         if not sample_losses:
             return connected_zero
