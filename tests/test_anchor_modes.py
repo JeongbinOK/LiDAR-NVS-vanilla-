@@ -775,3 +775,97 @@ def test_learned_grid_head_st_selects_matching_k_seed_geometry():
     assert candidate_seed.grad is not None
     assert candidate_seed.grad.abs().sum() > 0
     assert selection.grad is None
+
+
+def test_viewpoint_grid_head_stores_common_once_and_additional_per_view():
+    token_feature = torch.randn(1, 4)
+    token_position = torch.zeros(1, 3)
+    candidate_seed = torch.zeros(1, 4, 4, 3)
+    candidate_ref = torch.zeros_like(candidate_seed)
+    for total_k in range(1, 5):
+        values = 10 * total_k + torch.arange(total_k, dtype=torch.float32)
+        candidate_seed[0, total_k - 1, :total_k, 0] = values
+        candidate_ref[0, total_k - 1, :total_k, 0] = values + 100.0
+    candidate_delta = candidate_seed.clone()
+    anchor_metadata = {
+        "box_assign": torch.tensor([-1]),
+        "instance_id": torch.tensor([-1]),
+        "is_dynamic": torch.tensor([False]),
+        "coord_ref": token_position,
+        "seed_ref": candidate_ref,
+        "bbox_ref_by_frame": [torch.empty(0, 7)],
+    }
+
+    class TemporalAggregator:
+        def __call__(self, *args):
+            return (
+                token_feature,
+                token_position,
+                candidate_seed,
+                candidate_delta,
+                anchor_metadata,
+            )
+
+    class SlotHead:
+        count_mode = "learned_gumbel_viewpt"
+        k_max = 4
+
+        def __call__(
+            self, feature, anchor_k, delta, token_offset,
+            target_pose=None, anchor_batch=None,
+        ):
+            assert target_pose is poses
+            assert anchor_batch.tolist() == [0]
+            return torch.zeros(3, 6), {
+                "anchor_index": torch.tensor([0, 0, 0]),
+                "decision_index": torch.tensor([-1, 1, 1]),
+                "decision_anchor_index": torch.tensor([0, 0]),
+                "decision_view_index": torch.tensor([0, 1]),
+                "view_index": torch.tensor([-1, 1, 1]),
+                "is_common": torch.tensor([True, False, False]),
+                "common_view_gate": torch.ones(1, 2),
+                "slot_index": torch.tensor([0, 1, 2]),
+                "slot_k": torch.tensor([1, 3, 3]),
+                "anchor_k": torch.tensor([1, 3]),
+                "gaussian_offset": torch.tensor([3]),
+                "k_logits": torch.zeros(2, 4, requires_grad=True),
+                "k_selection": torch.tensor([
+                    [1.0, 0.0, 0.0, 0.0],
+                    [0.0, 0.0, 1.0, 0.0],
+                ]),
+                "view_dependent": True,
+            }
+
+        @staticmethod
+        def gradient_weight(slot_k, dtype):
+            return torch.ones_like(slot_k, dtype=dtype)
+
+    poses = [torch.eye(4).repeat(2, 1, 1)]
+    seeds = build_grid_gaussian_seeds(
+        TemporalAggregator(),
+        SlotHead(),
+        token_feature,
+        token_position,
+        None,
+        candidate_seed,
+        candidate_delta,
+        torch.tensor([1]),
+        torch.tensor([0]),
+        [],
+        [],
+        None,
+        None,
+        target_pose=poses,
+    )
+
+    torch.testing.assert_close(
+        seeds.position[:, 0], torch.tensor([10.0, 31.0, 32.0])
+    )
+    torch.testing.assert_close(
+        seeds.metadata["coord_ref"][:, 0],
+        torch.tensor([110.0, 131.0, 132.0]),
+    )
+    assert seeds.metadata["view_index"].tolist() == [-1, 1, 1]
+    assert seeds.metadata["common_view_gate"].shape == (1, 2)
+    assert seeds.routing_stats["selected_k"].tolist() == [1, 3]
+    assert seeds.routing_stats["view_index"].tolist() == [0, 1]

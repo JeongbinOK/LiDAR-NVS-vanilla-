@@ -11,12 +11,18 @@ from src.models_new.module.builders.common import (
     counts_to_variable_k,
 )
 from src.models_new.module.builders.grid_intensity import OccupiedGridTokenBuilder
-from src.models_new.module.gaussian_assembly import gradient_scale_identity
+from src.models_new.module.gaussian_assembly import (
+    assemble_batch_gaussians,
+    gradient_scale_identity,
+)
 from src.models_new.module.grid_query_head import (
     GridSlotHead,
     GridTemporalAggregator,
+    ViewpointFourierEncoder,
     _radius_pairs,
 )
+from src.models_new.module.m3_g2p import GausRender
+from src.models_new.utils.loss import Loss
 
 
 ATTN_DIM = 12  # 2 heads -> head_dim 6, matching Utonia 3D RoPE's %6 contract.
@@ -105,6 +111,24 @@ def _learned_cfg(k_max=4, tau=1.0, **overrides):
             K_max=k_max,
             tau=tau,
             seed_mode="range_quantile",
+        ),
+        **overrides,
+    )
+
+
+def _viewpoint_cfg(k_max=4, tau=1.0, **overrides):
+    return _cfg(
+        count_mode="learned_gumbel_viewpt",
+        learned_count=SimpleNamespace(
+            K_max=k_max,
+            tau=tau,
+            seed_mode="range_quantile",
+            viewpoint=SimpleNamespace(
+                translation_frequencies=4,
+                rotation_frequencies=2,
+                translation_scale_m=10.0,
+                rotation_scale=2.0,
+            ),
         ),
         **overrides,
     )
@@ -303,6 +327,46 @@ def test_learned_count_builds_k1_to_k4_range_quantile_seed_bank():
         )
 
 
+def test_viewpoint_seed_bank_uses_common_medoid_and_additional_quantiles():
+    points = torch.tensor([
+        [0.05, 0.1, 0.1], [0.15, 0.1, 0.1], [0.25, 0.1, 0.1],
+        [0.35, 0.1, 0.1], [0.45, 0.1, 0.1],
+    ])
+    seed_data = _aggregate_seed_cell(
+        points,
+        points_per_gaussian=None,
+        k_max=4,
+        count_mode="learned_gumbel_viewpt",
+        seed_mode="range_quantile",
+    )[-1]
+
+    assert seed_data.anchor_k is None
+    assert seed_data.seed_sensor.shape == (1, 4, 4, 3)
+    # The observed point nearest the raw-point mean is Common for every K.
+    torch.testing.assert_close(
+        seed_data.seed_sensor[0, :, 0], points[2].expand(4, -1)
+    )
+    # K_total=4 has three Additional range quantiles at ranks [0, 2, 4].
+    torch.testing.assert_close(
+        seed_data.seed_sensor[0, 3, 1:4], points[[0, 2, 4]]
+    )
+
+
+def test_viewpoint_additional_quantiles_repeat_observed_points_when_sparse():
+    points = torch.tensor([[0.10, 0.1, 0.1], [0.90, 0.1, 0.1]])
+    seed_data = _aggregate_seed_cell(
+        points,
+        points_per_gaussian=None,
+        k_max=4,
+        count_mode="learned_gumbel_viewpt",
+        seed_mode="range_quantile",
+    )[-1]
+    # Three Additional slots from two observations use ranks [0, 1, 1].
+    torch.testing.assert_close(
+        seed_data.seed_sensor[0, 3, 1:4], points[[0, 1, 1]]
+    )
+
+
 def test_grid_builder_exp_switches_only_grid_seed_construction():
     grid_builder = OccupiedGridTokenBuilder(_builder_cfg("grid", exp=2))
     assert grid_builder.grid_seed_config == ("legacy", 4, 3, 2, None)
@@ -435,6 +499,235 @@ def test_learned_count_adds_k4_head_and_post_fusion_mlp_only_in_new_mode():
     assert learned.count_predictor[-1].out_features == 4
     assert [module.out_features for module in learned.k_heads] == [6, 12, 18, 24]
     assert learned.trunk[0].in_features == 8 + 4 * 3
+
+
+def test_viewpoint_pose_descriptor_uses_relative_rotation_6d_without_subtraction():
+    encoder = ViewpointFourierEncoder(SimpleNamespace(
+        translation_frequencies=4,
+        rotation_frequencies=2,
+        translation_scale_m=10.0,
+        rotation_scale=2.0,
+    ))
+    identity = torch.eye(4).unsqueeze(0)
+    descriptor = encoder.pose_descriptor(identity)
+    torch.testing.assert_close(
+        descriptor,
+        torch.tensor([[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]]),
+    )
+    assert encoder(identity).shape == (1, 48)
+
+    rotated = identity.clone()
+    rotated[0, :3, :3] = torch.tensor([
+        [0.0, -1.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0],
+    ])
+    torch.testing.assert_close(
+        encoder.pose_descriptor(rotated)[0, 3:],
+        torch.tensor([0.0, 1.0, 0.0, -1.0, 0.0, 0.0]),
+    )
+    assert not torch.equal(encoder(identity), encoder(rotated))
+
+    rotated_180 = identity.clone()
+    rotated_180[0, :3, :3] = torch.diag(torch.tensor([-1.0, -1.0, 1.0]))
+    assert not torch.allclose(encoder(identity), encoder(rotated_180), atol=1e-6)
+
+
+def test_viewpoint_head_has_agreed_240_to_384_to_384_to_192_mlp():
+    head = GridSlotHead(_viewpoint_cfg(), _gs_params(), dim=192)
+    assert isinstance(head.view_mlp[0], torch.nn.LayerNorm)
+    assert head.view_mlp[0].normalized_shape == (240,)
+    assert (head.view_mlp[1].in_features, head.view_mlp[1].out_features) == (240, 384)
+    assert (head.view_mlp[3].in_features, head.view_mlp[3].out_features) == (384, 384)
+    assert (head.view_mlp[5].in_features, head.view_mlp[5].out_features) == (384, 192)
+
+
+def test_viewpoint_k1_uses_common_only_and_render_loss_trains_router():
+    class FixedK1Head(GridSlotHead):
+        def _gumbel_selection(self, logits):
+            soft = torch.softmax(logits / self.gumbel_tau, dim=-1)
+            hard = torch.zeros_like(soft)
+            hard[:, 0] = 1.0
+            return hard - soft.detach() + soft
+
+    torch.manual_seed(41)
+    head = FixedK1Head(_viewpoint_cfg(tau=0.7), _gs_params(), dim=8)
+    feature = torch.randn(1, 8, requires_grad=True)
+    target_pose = [torch.eye(4).repeat(2, 1, 1)]
+    target_pose[0][1, 0, 3] = 2.0
+    raw_params, packing = head(
+        feature,
+        None,
+        torch.randn(1, 4, 4, 3),
+        torch.tensor([1]),
+        target_pose=target_pose,
+        anchor_batch=torch.tensor([0]),
+    )
+
+    assert packing["anchor_k"].tolist() == [1, 1]
+    assert packing["view_index"].tolist() == [-1]
+    assert raw_params.shape == (1, head.param_dim)
+    assert packing["common_view_gate"].shape == (1, 2)
+    packing["k_logits"].retain_grad()
+    stored_opacity = raw_params[:, head.opacity_start:head.opacity_end]
+    b_gs = {
+        "view_index": packing["view_index"],
+        "opacity": stored_opacity,
+        "common_view_gate": packing["common_view_gate"],
+    }
+    loss = stored_opacity.new_zeros(())
+    for view_index in range(2):
+        selected = GausRender.select_target_view(b_gs, view_index)
+        assert selected["view_index"].tolist() == [-1]
+        torch.testing.assert_close(selected["opacity"], stored_opacity)
+        loss = loss + torch.sigmoid(selected["opacity"]).sum()
+    loss.backward()
+
+    assert head.common_predictor[-1].weight.grad is not None
+    assert head.common_predictor[-1].weight.grad.abs().sum() > 0
+    assert head.count_predictor[-1].weight.grad is not None
+    assert head.count_predictor[-1].weight.grad.abs().sum() > 0
+    assert packing["k_logits"].grad is not None
+    assert packing["k_logits"].grad.abs().sum() > 0
+    assert head.additional_trunk[0].weight.grad is None
+    assert all(module.weight.grad is None for module in head.additional_heads)
+
+
+def test_viewpoint_mixed_k_packs_common_once_and_preserves_per_view_total_k():
+    class FixedMixedKHead(GridSlotHead):
+        def _gumbel_selection(self, logits):
+            selected = torch.tensor([1, 3, 2, 4], device=logits.device) - 1
+            soft = torch.softmax(logits / self.gumbel_tau, dim=-1)
+            hard = torch.zeros_like(soft).scatter_(1, selected[:, None], 1.0)
+            return hard - soft.detach() + soft
+
+    head = FixedMixedKHead(_viewpoint_cfg(), _gs_params(), dim=8)
+    raw_params, packing = head(
+        torch.randn(2, 8),
+        None,
+        torch.randn(2, 4, 4, 3),
+        torch.tensor([2]),
+        target_pose=[torch.eye(4).repeat(2, 1, 1)],
+        anchor_batch=torch.tensor([0, 0]),
+    )
+
+    # Old packing had sum(K)=10 rows. Shared Common uses N+sum(K-1)=8.
+    assert raw_params.shape == (8, head.param_dim)
+    assert packing["anchor_k"].tolist() == [1, 3, 2, 4]
+    assert packing["view_index"].tolist() == [-1, 1, 1, -1, 0, 1, 1, 1]
+    assert packing["slot_index"].tolist() == [0, 1, 2, 0, 1, 1, 2, 3]
+    assert packing["gaussian_offset"].tolist() == [8]
+
+    b_gs = {
+        "view_index": packing["view_index"],
+        "opacity": raw_params[:, head.opacity_start:head.opacity_end],
+        "common_view_gate": packing["common_view_gate"],
+    }
+    grouped = GausRender.group_target_views(b_gs, 2)
+    # View 0 sees K=[1,2], view 1 sees K=[3,4].
+    assert grouped[0].numel() == 3
+    assert grouped[1].numel() == 7
+
+
+def test_renderer_selects_only_the_requested_target_union():
+    b_gs = {
+        "view_index": torch.tensor([-1, 0, 1, 0, 1]),
+        "position": torch.arange(15, dtype=torch.float32).reshape(5, 3),
+        "opacity": torch.arange(5, dtype=torch.float32).unsqueeze(-1),
+        "scaling": torch.ones(5, 2),
+        "rotation": torch.ones(5, 4),
+        "shs": torch.ones(5, 32),
+        "instance_id": torch.full((5,), -1, dtype=torch.long),
+        "is_dynamic": torch.zeros(5, dtype=torch.bool),
+        "common_view_gate": torch.ones(1, 2),
+        "fg_masks": {-1: torch.zeros(5, dtype=torch.bool)},
+        "object_trajectories": {},
+    }
+    grouped = GausRender.group_target_views(b_gs, 2)
+    selected = GausRender.select_target_view(b_gs, 1, grouped[1])
+    assert selected["view_index"].tolist() == [-1, 1, 1]
+    torch.testing.assert_close(selected["position"], b_gs["position"][[0, 2, 4]])
+    torch.testing.assert_close(selected["opacity"], b_gs["opacity"][[0, 2, 4]])
+    assert selected["fg_masks"][-1].shape == (3,)
+
+
+def test_assembly_keeps_one_common_gate_table_per_batch():
+    gs_raw = {
+        "opacity": torch.arange(6, dtype=torch.float32).unsqueeze(-1),
+    }
+    out_coord = torch.arange(18, dtype=torch.float32).reshape(6, 3)
+    agg_meta = {
+        "box_assign": torch.full((6,), -1, dtype=torch.long),
+        "instance_id": torch.full((6,), -1, dtype=torch.long),
+        "is_dynamic": torch.zeros(6, dtype=torch.bool),
+        "coord_ref": out_coord.clone(),
+        "view_index": torch.tensor([-1, 0, 1, -1, 0, 1]),
+        "anchor_index": torch.tensor([0, 0, 0, 1, 1, 1]),
+        "common_view_gate": torch.tensor([[1.0, 0.5], [0.25, 1.0]]),
+        "bbox_ref_by_frame": [torch.empty(0, 7), torch.empty(0, 7)],
+    }
+    batch = assemble_batch_gaussians(
+        gs_raw,
+        out_coord,
+        agg_meta,
+        torch.tensor([3, 6]),
+        [0, 1],
+        [torch.empty(0, 7), torch.empty(0, 7)],
+        [torch.empty(0, dtype=torch.long), torch.empty(0, dtype=torch.long)],
+        True,
+        out_coord.device,
+    )
+
+    assert len(batch) == 2
+    torch.testing.assert_close(
+        batch[0]["common_view_gate"], torch.tensor([[1.0, 0.5]])
+    )
+    torch.testing.assert_close(
+        batch[1]["common_view_gate"], torch.tensor([[0.25, 1.0]])
+    )
+
+
+def test_shared_common_scale_regularization_matches_physical_view_repetition():
+    loss_fn = Loss(SimpleNamespace(
+        w_chamfer=0.0,
+        w_depth=0.0,
+        w_depth_median=0.0,
+        w_intensity=0.0,
+        w_raydrop=0.0,
+        w_scale=1.0,
+        enable_lpips=False,
+    ))
+    reference = torch.zeros(())
+
+    common_expanded = torch.tensor([[3.0, 3.0]], requires_grad=True)
+    additional_expanded = torch.tensor(
+        [[4.0, 4.0], [5.0, 5.0]], requires_grad=True
+    )
+    expanded_scaling = torch.cat([
+        common_expanded,
+        additional_expanded[0:1],
+        common_expanded,
+        additional_expanded[1:2],
+    ])
+    expanded_loss = loss_fn._scale_regularization(
+        [{"scaling": expanded_scaling}], reference
+    )
+    expanded_loss.backward()
+
+    common_shared = torch.tensor([[3.0, 3.0]], requires_grad=True)
+    additional_shared = torch.tensor(
+        [[4.0, 4.0], [5.0, 5.0]], requires_grad=True
+    )
+    shared_loss = loss_fn._scale_regularization([{
+        "scaling": torch.cat([common_shared, additional_shared]),
+        "view_index": torch.tensor([-1, 0, 1]),
+        "common_view_gate": torch.ones(1, 2),
+    }], reference)
+    shared_loss.backward()
+
+    torch.testing.assert_close(shared_loss, expanded_loss)
+    torch.testing.assert_close(common_shared.grad, common_expanded.grad)
+    torch.testing.assert_close(additional_shared.grad, additional_expanded.grad)
 
 
 def test_learned_count_eval_argmax_routes_exactly_to_k2_joint_head():
