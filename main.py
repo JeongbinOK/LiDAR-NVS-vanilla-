@@ -55,12 +55,20 @@ def main(cfg):
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     callbacks = []
     if cfg.logger.enable:
+        import wandb
+
         os.environ["WANDB__SERVICE_WAIT"] = "300"
+        # Keep experiment metrics while suppressing W&B's CPU/GPU/RAM System tab.
+        # This is evaluated by the W&B service when the run is initialized.
+        wandb_settings = wandb.Settings(
+            x_disable_stats=not bool(getattr(cfg.logger, "system_metrics", False)),
+        )
         logger = WandbLogger(
             project=cfg.project_name,
             name=cfg.exp_name,
             save_dir=cfg.logger.dir,
             config=OmegaConf.to_container(cfg),
+            settings=wandb_settings,
         )
 
         # On rank != 0, wandb.run is None.

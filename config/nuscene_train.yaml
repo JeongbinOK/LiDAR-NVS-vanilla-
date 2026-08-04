@@ -1,7 +1,7 @@
-device: [0, 1, 2, 3]
+device: [8, 9]
 
 project_name: 2dgs-utonia
-exp_name:  ${p2g.anchor_mode}-bs-${train.batch_size}-selfattn-newloss
+exp_name:  ${p2g.anchor_mode}-bs-${train.batch_size}-vpt
 mode: train
 
 
@@ -64,6 +64,7 @@ logger:
   enable: true
   name: wandb
   dir: logs/${exp_name}
+  system_metrics: false  # W&B System 탭의 CPU/GPU/RAM 시계열을 기록하지 않음
 
 
 
