@@ -169,7 +169,11 @@ class ModelWrapper(LightningModule):
 
     def _shared_step(self, batch, batch_idx, *, prefix: str):
         _input, gt = batch["input"], batch["gt"]
-        p2g_out = self.p2g_model(_input, target_pose=gt.get("pose"))
+        p2g_out = self.p2g_model(
+            _input,
+            target_pose=gt.get("pose"),
+            target_timestamps=gt.get("timestamps"),
+        )
         # Keep detached diagnostics outside the renderer/temporal model input.
         routing_stats = p2g_out.pop("routing_stats", None)
         routing_budget_logits = p2g_out.pop("routing_budget_logits", None)

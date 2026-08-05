@@ -113,10 +113,12 @@ p2g:
       tau: 1.0                  # train: hard Gumbel-ST temperature; eval: deterministic argmax
       seed_mode: range_quantile # learned: all quantile; viewpt: medoid Common + quantile Additional
       viewpoint:                # learned_gumbel_viewpt only: gt.pose = T_(0<-t)
-        translation_frequencies: 4  # 3 * 4 * sin/cos = 24D
-        rotation_frequencies: 2     # direct R_(0<-t) 6D * 2 * sin/cos = 24D
-        translation_scale_m: 10.0
-        rotation_scale: 2.0         # R 원소를 [-.5,.5]로 정규화; identity-6D subtraction 없음
+        # router 입력 = token 위치를 target sensor frame으로 옮긴 R^T(p_ref - t)의
+        # Fourier 인코딩. token마다 값이 달라 pose 하나를 전 token에 동일 concat하던
+        # 이전 방식과 다르다. Gaussian parameter는 이 feature를 쓰지 않는다.
+        position_frequencies: 8     # 3 * 8 * sin/cos = 48D
+        position_scale_m: 110.0     # 최저 band 주기 220m -> 최대 관측거리 110m에서 wrap 없음
+                                    # (최고 band 주기 = 220/2^7 = 1.72m)
       # selected K/Additional head 입력 gradient만 1/sqrt(K); router에는 적용하지 않음.
       # learned_count 내부 옵션이므로 count_mode=legacy 전환 시 과거 output 방식 유지.
       grad_balance_scope: token

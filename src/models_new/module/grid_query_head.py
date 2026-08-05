@@ -557,84 +557,67 @@ class GridTemporalAggregator(nn.Module):
         )
 
 
-class ViewpointFourierEncoder(nn.Module):
-    """Encode frame-0-relative sensor pose as 24D translation + 24D rotation.
+class ViewTokenPositionEncoder(nn.Module):
+    """Fourier-encode each token's position in the target view's sensor frame.
 
-    ``pose`` is ``T_{0<-t}``, so its rotation block is already the true relative
-    rotation from target sensor axes into frame 0. We use the first two columns
-    of that matrix directly as the continuous 6D representation. Subtracting an
-    identity 6D vector would only be Euclidean centering, not a valid SO(3)
-    relative-rotation operation, and is intentionally not done here.
+    ``pose`` is ``T_{0<-t}``, so a ref-frame token center lands at
+    ``R^T (p_ref - t)`` in that target sensor's axes. Encoding this instead of a
+    token-independent pose descriptor makes the router input differ per (token,
+    view) pair, which is what a per-token count decision actually depends on:
+    the same ego motion changes a 5 m token's viewing geometry far more than a
+    100 m one's.
     """
 
     def __init__(self, cfg):
         super().__init__()
-        self.translation_frequencies = int(
-            getattr(cfg, "translation_frequencies", 4)
+        self.position_frequencies = int(
+            getattr(cfg, "position_frequencies", 8)
         )
-        self.rotation_frequencies = int(
-            getattr(cfg, "rotation_frequencies", 2)
-        )
-        if self.translation_frequencies <= 0 or self.rotation_frequencies <= 0:
-            raise ValueError("viewpoint Fourier frequency counts must be positive")
-        translation_scale = float(getattr(cfg, "translation_scale_m", 10.0))
-        # Matrix entries lie in [-1, 1]. Scaling them to [-0.5, 0.5] prevents
-        # the first integer-pi Fourier band from aliasing +1 and -1.
-        rotation_scale = float(getattr(cfg, "rotation_scale", 2.0))
-        if translation_scale <= 0.0 or rotation_scale <= 0.0:
-            raise ValueError("viewpoint Fourier normalization scales must be positive")
+        if self.position_frequencies <= 0:
+            raise ValueError("viewpoint position frequency count must be positive")
+        # Half-period of the lowest band. It must cover the farthest returns
+        # (110 m here), otherwise band 0 wraps inside the sensing range and two
+        # tokens at very different distances collide in the embedding.
+        position_scale = float(getattr(cfg, "position_scale_m", 110.0))
+        if position_scale <= 0.0:
+            raise ValueError("viewpoint position_scale_m must be positive")
         self.register_buffer(
-            "translation_scale",
-            torch.tensor(translation_scale, dtype=torch.float32),
+            "position_scale",
+            torch.tensor(position_scale, dtype=torch.float32),
             persistent=False,
         )
         self.register_buffer(
-            "rotation_scale",
-            torch.tensor(rotation_scale, dtype=torch.float32),
+            "position_bands",
+            2.0 ** torch.arange(self.position_frequencies, dtype=torch.float32),
             persistent=False,
         )
-        self.register_buffer(
-            "translation_bands",
-            2.0 ** torch.arange(self.translation_frequencies, dtype=torch.float32),
-            persistent=False,
-        )
-        self.register_buffer(
-            "rotation_bands",
-            2.0 ** torch.arange(self.rotation_frequencies, dtype=torch.float32),
-            persistent=False,
-        )
-        self.out_dim = (
-            3 * 2 * self.translation_frequencies
-            + 6 * 2 * self.rotation_frequencies
-        )
+        self.out_dim = 3 * 2 * self.position_frequencies
 
     @staticmethod
-    def pose_descriptor(pose):
+    def to_view_frame(position_ref, pose):
+        """Map ref-frame token centers into their target view's sensor frame."""
         if pose.ndim < 2 or tuple(pose.shape[-2:]) != (4, 4):
             raise ValueError(
                 f"viewpoint pose must end in (4, 4), got {tuple(pose.shape)}"
             )
-        translation = pose[..., :3, 3]
+        if position_ref.shape[-1] != 3:
+            raise ValueError(
+                "viewpoint token positions must end in 3 channels, got "
+                f"{position_ref.shape[-1]}"
+            )
         rotation = pose[..., :3, :3]
-        # Column concatenation matches the continuous-6D rotation definition.
-        rotation_6d = torch.cat(
-            [rotation[..., :, 0], rotation[..., :, 1]], dim=-1
-        )
-        return torch.cat([translation, rotation_6d], dim=-1)
+        translation = pose[..., :3, 3]
+        centered = position_ref - translation
+        # pose maps target sensor -> ref, so the inverse rotation is R^T.
+        return torch.einsum("...ji,...j->...i", rotation, centered)
 
-    @staticmethod
-    def _encode(values, bands):
-        angles = torch.pi * values.unsqueeze(-1) * bands
-        return torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1).flatten(-2)
-
-    def forward(self, pose):
-        descriptor = self.pose_descriptor(pose).float()
-        translation = descriptor[..., :3] / self.translation_scale
-        rotation_6d = descriptor[..., 3:] / self.rotation_scale
-        return torch.cat([
-            self._encode(translation, self.translation_bands),
-            self._encode(rotation_6d, self.rotation_bands),
-        ], dim=-1)
+    def forward(self, position_ref, pose):
+        position_view = self.to_view_frame(position_ref.float(), pose.float())
+        normalized = position_view / self.position_scale
+        angles = torch.pi * normalized.unsqueeze(-1) * self.position_bands
+        return torch.cat(
+            [torch.sin(angles), torch.cos(angles)], dim=-1
+        ).flatten(-2)
 
 
 class GridSlotHead(nn.Module):
@@ -651,10 +634,13 @@ class GridSlotHead(nn.Module):
 
     ``count_mode="learned_gumbel_viewpt"`` predicts one view-independent Common
     Gaussian from each fused token, then predicts total K separately for every
-    target ``gt["pose"]``. Only K-1 Additional outputs use the 192D
-    view-dependent feature. The Common output is stored once with ``view_index
-    = -1``; its per-view router gate is deferred until the renderer constructs
-    ``Common union Additional_view``.
+    target ``gt["pose"]``. The 192D view feature is a *router-only* input: it is
+    built from the fused token plus that token's position in the target sensor
+    frame and feeds nothing but the count logits. Both the Common and the K-1
+    Additional Gaussians are predicted from the fused token itself, so Gaussian
+    parameters stay view-independent and only their count adapts. The Common
+    output is stored once with ``view_index = -1``; its per-view router gate is
+    deferred until the renderer constructs ``Common union Additional_view``.
     """
 
     def __init__(self, cfg, gs_params, dim):
@@ -750,11 +736,12 @@ class GridSlotHead(nn.Module):
             nn.init.zeros_(self.count_predictor[-1].bias)
         elif self.count_mode == "learned_gumbel_viewpt":
             viewpoint_cfg = getattr(learned_count, "viewpoint", learned_count)
-            self.viewpoint_encoder = ViewpointFourierEncoder(viewpoint_cfg)
-            if self.viewpoint_encoder.out_dim != 48:
+            self.view_position_encoder = ViewTokenPositionEncoder(viewpoint_cfg)
+            if self.view_position_encoder.out_dim != 48:
                 raise ValueError(
-                    "learned_gumbel_viewpt requires a 48D viewpoint embedding; "
-                    f"configured frequencies produce {self.viewpoint_encoder.out_dim}D"
+                    "learned_gumbel_viewpt requires a 48D view-token position "
+                    "embedding; configured frequencies produce "
+                    f"{self.view_position_encoder.out_dim}D"
                 )
             self.view_mlp = nn.Sequential(
                 nn.LayerNorm(self.dim + 48),
@@ -775,12 +762,15 @@ class GridSlotHead(nn.Module):
                 nn.Linear(192, self.k_max),
             )
             additional_width = 3 * max(self.k_max - 1, 0)
+            # Additional Gaussians read the same fused token as Common, not the
+            # router feature, so their parameters never depend on the target
+            # view. With dim=192 this keeps the historical 201 -> 192 shapes.
             self.additional_trunk = nn.Sequential(
-                nn.Linear(192 + additional_width, 192),
+                nn.Linear(self.dim + additional_width, self.dim),
                 nn.SiLU(),
             )
             self.additional_heads = nn.ModuleList([
-                nn.Linear(192, additional_k * self.param_dim)
+                nn.Linear(self.dim, additional_k * self.param_dim)
                 for additional_k in range(1, self.k_max)
             ])
             # Start with a uniform total-K policy.
@@ -1069,7 +1059,7 @@ class GridSlotHead(nn.Module):
 
     def _forward_viewpoint(
         self, anchor_feature, anchor_k, delta_p, anchor_offset,
-        target_pose, anchor_batch,
+        target_pose, anchor_batch, anchor_position_ref,
     ):
         if anchor_k is not None:
             raise ValueError(
@@ -1091,6 +1081,26 @@ class GridSlotHead(nn.Module):
         )
         if anchor_batch.shape != (anchor_feature.shape[0],):
             raise ValueError("anchor_batch must align one-to-one with anchor_feature")
+        if anchor_position_ref is None:
+            raise ValueError(
+                "learned_gumbel_viewpt requires anchor_position_ref: the router "
+                "conditions on each token's position in the target sensor frame"
+            )
+        # One row per (token, target view): a dynamic token sits somewhere else
+        # in each view because its box has moved by then.
+        if (
+            anchor_position_ref.ndim != 3
+            or anchor_position_ref.shape[0] != anchor_feature.shape[0]
+            or anchor_position_ref.shape[-1] != 3
+        ):
+            raise ValueError(
+                "anchor_position_ref must have shape "
+                f"({anchor_feature.shape[0]}, V, 3), got "
+                f"{tuple(anchor_position_ref.shape)}"
+            )
+        anchor_position_ref = anchor_position_ref.to(
+            device=anchor_feature.device
+        )
 
         decision_anchor, decision_view, decision_pose = self._target_view_decisions(
             anchor_batch,
@@ -1099,11 +1109,25 @@ class GridSlotHead(nn.Module):
             dtype=torch.float32,
         )
         decision_feature = anchor_feature[decision_anchor]
-        pose_embedding = self.viewpoint_encoder(decision_pose).to(
-            dtype=anchor_feature.dtype
-        )
+        if decision_view.numel() > 0 and (
+            int(decision_view.max()) >= anchor_position_ref.shape[1]
+        ):
+            raise ValueError(
+                "anchor_position_ref is narrower than the target view count"
+            )
+        # Geometry only: token centers and target poses are data, so this branch
+        # adds no gradient path of its own. The router still reaches the fused
+        # token through decision_feature below.
+        position_embedding = self.view_position_encoder(
+            anchor_position_ref[decision_anchor, decision_view].detach(),
+            decision_pose,
+        ).to(dtype=anchor_feature.dtype)
+        # The 192D view feature is consumed by the count router alone. Nothing
+        # downstream of it produces a Gaussian parameter, so the only gradient
+        # reaching view_mlp is the straight-through opacity gate (plus the
+        # routing-budget loss on the same logits).
         view_feature = self.view_mlp(torch.cat([
-            decision_feature, pose_embedding,
+            decision_feature, position_embedding,
         ], dim=-1))
 
         logits = self.count_predictor(view_feature)
@@ -1204,9 +1228,13 @@ class GridSlotHead(nn.Module):
                 continue
             additional_k = total_k - 1
             # Selected-only execution: K=1 decisions do not enter either the
-            # Additional trunk or an Additional output head.
+            # Additional trunk or an Additional output head. The input is the
+            # fused token that also produced Common, so two target views that
+            # route the same token to the same K get identical Additional
+            # parameters; only the count is view-dependent.
             additional_feature = self.additional_trunk(torch.cat([
-                view_feature[selected_rows], additional_delta[selected_rows],
+                anchor_feature[decision_anchor[selected_rows]],
+                additional_delta[selected_rows],
             ], dim=-1))
             head_input = self._balance_token_feature(
                 additional_feature, total_k
@@ -1284,12 +1312,12 @@ class GridSlotHead(nn.Module):
 
     def forward(
         self, anchor_feature, anchor_k, delta_p, anchor_offset,
-        target_pose=None, anchor_batch=None,
+        target_pose=None, anchor_batch=None, anchor_position_ref=None,
     ):
         if self.count_mode == "learned_gumbel_viewpt":
             return self._forward_viewpoint(
                 anchor_feature, anchor_k, delta_p, anchor_offset,
-                target_pose, anchor_batch,
+                target_pose, anchor_batch, anchor_position_ref,
             )
         if self.count_mode == "learned_gumbel":
             return self._forward_learned(
@@ -1311,5 +1339,5 @@ class GridSlotHead(nn.Module):
 __all__ = [
     "GridTemporalAggregator",
     "GridSlotHead",
-    "ViewpointFourierEncoder",
+    "ViewTokenPositionEncoder",
 ]

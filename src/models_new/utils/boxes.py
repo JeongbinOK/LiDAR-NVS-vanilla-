@@ -97,6 +97,52 @@ def box_local_to_ref(points_local: Tensor, box_ref: Tensor) -> Tensor:
     return torch.stack([x, y, z], dim=-1) + box_ref[:3].unsqueeze(0)
 
 
+def box_local_to_ref_multi(points_local: Tensor, boxes_ref: Tensor) -> Tensor:
+    """Replay one set of box-local points through V poses of the same box.
+
+    points_local : (N, 3) in the box's yaw-aligned local frame.
+    boxes_ref    : (V, 7), the same instance's box at V different times.
+    return       : (N, V, 3), row-wise identical to looping ``box_local_to_ref``
+                   once per box.
+    """
+    yaw = boxes_ref[:, 6]
+    cos_y = torch.cos(yaw).unsqueeze(0)
+    sin_y = torch.sin(yaw).unsqueeze(0)
+    local_x = points_local[:, 0].unsqueeze(-1)
+    local_y = points_local[:, 1].unsqueeze(-1)
+    x = cos_y * local_x - sin_y * local_y
+    y = sin_y * local_x + cos_y * local_y
+    z = points_local[:, 2].unsqueeze(-1).expand_as(x)
+    return torch.stack([x, y, z], dim=-1) + boxes_ref[:, :3].unsqueeze(0)
+
+
+def interpolate_boxes_ref(times: Tensor, boxes: Tensor, query: Tensor) -> Tensor:
+    """Sample a ref-frame box trajectory at V query times.
+
+    Elementwise identical to ``GausRender.interpolate_box_ref`` -- clamped at
+    both ends, linear in center/size and shortest-arc in yaw -- but evaluated
+    for every query time at once. Anything that needs to predict where a dynamic
+    Gaussian will be rendered must use the renderer's own interpolation, so this
+    equivalence is asserted in the tests rather than merely intended.
+
+    times : (F,) ascending; boxes : (F, 7); query : (V,)
+    """
+    if times.ndim != 1 or boxes.ndim != 2 or boxes.shape[-1] != 7:
+        raise ValueError("interpolate_boxes_ref expects (F,) times and (F, 7) boxes")
+    if times.shape[0] != boxes.shape[0] or times.shape[0] < 2:
+        raise ValueError("a box trajectory needs at least two aligned samples")
+    hi = torch.searchsorted(times, query).clamp(1, times.shape[0] - 1)
+    lo = hi - 1
+    span = (times[hi] - times[lo]).clamp_min(1e-6)
+    # Clamping alpha reproduces the renderer's two out-of-range early returns.
+    alpha = ((query - times[lo]) / span).clamp(0.0, 1.0).unsqueeze(-1)
+    center_size = boxes[lo, :6] * (1.0 - alpha) + boxes[hi, :6] * alpha
+    yaw0, yaw1 = boxes[lo, 6], boxes[hi, 6]
+    delta = torch.atan2(torch.sin(yaw1 - yaw0), torch.cos(yaw1 - yaw0))
+    yaw = yaw0 + alpha.squeeze(-1) * delta
+    return torch.cat([center_size, yaw.unsqueeze(-1)], dim=-1)
+
+
 def point_in_box(points: Tensor, boxes: Tensor) -> Tensor:
     """Assign each of (N, 3) points to the box it falls inside (or -1).
 

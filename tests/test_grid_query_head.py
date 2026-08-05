@@ -18,7 +18,7 @@ from src.models_new.module.gaussian_assembly import (
 from src.models_new.module.grid_query_head import (
     GridSlotHead,
     GridTemporalAggregator,
-    ViewpointFourierEncoder,
+    ViewTokenPositionEncoder,
     _radius_pairs,
 )
 from src.models_new.module.m3_g2p import GausRender
@@ -124,10 +124,8 @@ def _viewpoint_cfg(k_max=4, tau=1.0, **overrides):
             tau=tau,
             seed_mode="range_quantile",
             viewpoint=SimpleNamespace(
-                translation_frequencies=4,
-                rotation_frequencies=2,
-                translation_scale_m=10.0,
-                rotation_scale=2.0,
+                position_frequencies=8,
+                position_scale_m=110.0,
             ),
         ),
         **overrides,
@@ -501,36 +499,51 @@ def test_learned_count_adds_k4_head_and_post_fusion_mlp_only_in_new_mode():
     assert learned.trunk[0].in_features == 8 + 4 * 3
 
 
-def test_viewpoint_pose_descriptor_uses_relative_rotation_6d_without_subtraction():
-    encoder = ViewpointFourierEncoder(SimpleNamespace(
-        translation_frequencies=4,
-        rotation_frequencies=2,
-        translation_scale_m=10.0,
-        rotation_scale=2.0,
+def test_view_token_position_encoder_inverts_the_target_pose_per_token():
+    encoder = ViewTokenPositionEncoder(SimpleNamespace(
+        position_frequencies=8,
+        position_scale_m=110.0,
     ))
-    identity = torch.eye(4).unsqueeze(0)
-    descriptor = encoder.pose_descriptor(identity)
-    torch.testing.assert_close(
-        descriptor,
-        torch.tensor([[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]]),
-    )
-    assert encoder(identity).shape == (1, 48)
+    assert encoder.out_dim == 48
 
-    rotated = identity.clone()
-    rotated[0, :3, :3] = torch.tensor([
+    # T_(0<-t): the target sensor sits at (2, 0, 0) rotated +90 deg about z.
+    pose = torch.eye(4).unsqueeze(0).repeat(2, 1, 1)
+    pose[1, :3, 3] = torch.tensor([2.0, 0.0, 0.0])
+    pose[1, :3, :3] = torch.tensor([
         [0.0, -1.0, 0.0],
         [1.0, 0.0, 0.0],
         [0.0, 0.0, 1.0],
     ])
+    position_ref = torch.tensor([[5.0, 1.0, 0.5], [5.0, 1.0, 0.5]])
+    view_position = encoder.to_view_frame(position_ref, pose)
+    torch.testing.assert_close(view_position[0], position_ref[0])
+    # R^T (p - t) = R^T (3, 1, 0.5) = (1, -3, 0.5)
     torch.testing.assert_close(
-        encoder.pose_descriptor(rotated)[0, 3:],
-        torch.tensor([0.0, 1.0, 0.0, -1.0, 0.0, 0.0]),
+        view_position[1], torch.tensor([1.0, -3.0, 0.5])
     )
-    assert not torch.equal(encoder(identity), encoder(rotated))
+    assert encoder(position_ref, pose).shape == (2, 48)
+    # The same viewpoint now yields different embeddings for different tokens.
+    assert not torch.equal(
+        encoder(position_ref, pose)[0], encoder(position_ref, pose)[1]
+    )
 
-    rotated_180 = identity.clone()
-    rotated_180[0, :3, :3] = torch.diag(torch.tensor([-1.0, -1.0, 1.0]))
-    assert not torch.allclose(encoder(identity), encoder(rotated_180), atol=1e-6)
+
+def test_view_token_position_bands_do_not_wrap_inside_the_sensing_range():
+    encoder = ViewTokenPositionEncoder(SimpleNamespace(
+        position_frequencies=8,
+        position_scale_m=110.0,
+    ))
+    x = torch.linspace(-109.0, 109.0, 25)
+    positions = torch.stack([x, torch.zeros_like(x), torch.zeros_like(x)], dim=-1)
+    identity = torch.eye(4).unsqueeze(0).repeat(x.numel(), 1, 1)
+    encoded = encoder(positions, identity)
+
+    # Layout is [ch_x sin(band 0..7), ch_x cos(band 0..7), ch_y ...], so band 0
+    # of x is (encoded[:, 0], encoded[:, 8]). Its 220 m period covers the whole
+    # +-110 m sensing range exactly once: atan2 recovers the position without a
+    # wrap, so no two distances collide in the embedding.
+    recovered = torch.atan2(encoded[:, 0], encoded[:, 8]) * 110.0 / torch.pi
+    torch.testing.assert_close(recovered, x, atol=1e-3, rtol=0.0)
 
 
 def test_viewpoint_head_has_agreed_240_to_384_to_384_to_192_mlp():
@@ -562,6 +575,7 @@ def test_viewpoint_k1_uses_common_only_and_render_loss_trains_router():
         torch.tensor([1]),
         target_pose=target_pose,
         anchor_batch=torch.tensor([0]),
+        anchor_position_ref=torch.tensor([[6.0, 1.0, 0.5]]).expand(1, 2, 3),
     )
 
     assert packing["anchor_k"].tolist() == [1, 1]
@@ -609,6 +623,9 @@ def test_viewpoint_mixed_k_packs_common_once_and_preserves_per_view_total_k():
         torch.tensor([2]),
         target_pose=[torch.eye(4).repeat(2, 1, 1)],
         anchor_batch=torch.tensor([0, 0]),
+        anchor_position_ref=torch.tensor(
+            [[6.0, 1.0, 0.5], [9.0, -2.0, 0.0]]
+        ).unsqueeze(1).expand(2, 2, 3),
     )
 
     # Old packing had sum(K)=10 rows. Shared Common uses N+sum(K-1)=8.
@@ -627,6 +644,173 @@ def test_viewpoint_mixed_k_packs_common_once_and_preserves_per_view_total_k():
     # View 0 sees K=[1,2], view 1 sees K=[3,4].
     assert grouped[0].numel() == 3
     assert grouped[1].numel() == 7
+
+
+class _FixedKHead(GridSlotHead):
+    """Route every decision to a scripted K while keeping the soft backward."""
+
+    selected_k = None
+
+    def _gumbel_selection(self, logits):
+        selected = torch.as_tensor(
+            self.selected_k, device=logits.device, dtype=torch.long
+        ) - 1
+        soft = torch.softmax(logits / self.gumbel_tau, dim=-1)
+        hard = torch.zeros_like(soft).scatter_(1, selected[:, None], 1.0)
+        return hard - soft.detach() + soft
+
+
+def _viewpoint_forward(head, feature, position_ref, target_pose, delta_p=None):
+    num_anchors = feature.shape[0]
+    if delta_p is None:
+        torch.manual_seed(7)
+        delta_p = torch.randn(num_anchors, head.k_max, head.k_max, 3)
+    if position_ref.ndim == 2:
+        # Static tokens: one ref center shared by every target view.
+        num_views = max(int(p.shape[0]) for p in target_pose)
+        position_ref = position_ref.unsqueeze(1).expand(-1, num_views, -1)
+    return head(
+        feature,
+        None,
+        delta_p,
+        torch.tensor([num_anchors]),
+        target_pose=target_pose,
+        anchor_batch=torch.zeros(num_anchors, dtype=torch.long),
+        anchor_position_ref=position_ref,
+    )
+
+
+def test_viewpoint_router_sees_each_token_from_the_target_viewpoint():
+    torch.manual_seed(3)
+    head = GridSlotHead(_viewpoint_cfg(), _gs_params(), dim=8)
+    # count_predictor's output layer is zero-initialised for a uniform K prior,
+    # so give it a weight to make the router input observable in the logits.
+    torch.nn.init.normal_(head.count_predictor[-1].weight, std=0.1)
+    # Two tokens sharing one feature so only their positions can differ.
+    feature = torch.randn(1, 8).repeat(2, 1)
+    position_ref = torch.tensor([[4.0, 0.0, 0.0], [60.0, 0.0, 0.0]])
+    moved = torch.eye(4).repeat(2, 1, 1)
+    moved[1, :3, 3] = torch.tensor([12.0, 0.0, 0.0])
+
+    _, packing = _viewpoint_forward(head, feature, position_ref, [moved])
+    logits = packing["k_logits"]
+    # decision rows are (token0, view0), (token0, view1), (token1, view0), ...
+    assert logits.shape == (4, head.k_max)
+    # Same viewpoint, different token position -> different router input.
+    assert not torch.allclose(logits[0], logits[2])
+    # Same token, different viewpoint -> different router input.
+    assert not torch.allclose(logits[0], logits[1])
+    # A token 12 m in front of view 0 is the 4 m token seen from view 1, so the
+    # router input is identical for those two decisions.
+    _, shifted = _viewpoint_forward(
+        head,
+        feature,
+        torch.tensor([[16.0, 0.0, 0.0], [60.0, 0.0, 0.0]]),
+        [moved],
+    )
+    torch.testing.assert_close(shifted["k_logits"][1], logits[0])
+
+
+def test_viewpoint_additional_gaussians_do_not_depend_on_the_target_view():
+    torch.manual_seed(11)
+    head = _FixedKHead(_viewpoint_cfg(), _gs_params(), dim=8)
+    head.selected_k = [3, 3]
+    feature = torch.randn(1, 8)
+    far_apart = torch.eye(4).repeat(2, 1, 1)
+    far_apart[1, :3, 3] = torch.tensor([25.0, -8.0, 0.0])
+
+    raw_params, packing = _viewpoint_forward(
+        head, feature, torch.tensor([[7.0, 2.0, 0.5]]), [far_apart]
+    )
+    # 1 Common + 2 Additional for each of the two views.
+    assert packing["view_index"].tolist() == [-1, 0, 0, 1, 1]
+    # Both views routed to K=3, so their Additional parameters must be equal
+    # even though the two viewpoints are 26 m apart.
+    torch.testing.assert_close(raw_params[1:3], raw_params[3:5])
+
+
+def test_viewpoint_router_feature_reaches_gaussians_only_through_the_gate():
+    torch.manual_seed(19)
+    head = _FixedKHead(_viewpoint_cfg(tau=0.7), _gs_params(), dim=8)
+    head.selected_k = [1, 3]
+    # A zero-initialised router output layer zeroes the chain rule into view_mlp
+    # for exactly one step; measure the trained-state path instead.
+    torch.nn.init.normal_(head.count_predictor[-1].weight, std=0.1)
+    feature = torch.randn(1, 8, requires_grad=True)
+    poses = torch.eye(4).repeat(2, 1, 1)
+    poses[1, :3, 3] = torch.tensor([5.0, 0.0, 0.0])
+
+    raw_params, packing = _viewpoint_forward(
+        head, feature, torch.tensor([[9.0, 1.0, 0.5]]), [poses]
+    )
+    # Everything except opacity bypasses the router gate entirely.
+    non_opacity = torch.cat([
+        raw_params[:, :head.opacity_start], raw_params[:, head.opacity_end:],
+    ], dim=-1)
+    non_opacity.sum().backward(retain_graph=True)
+
+    assert head.common_predictor[-1].weight.grad.abs().sum() > 0
+    assert head.additional_trunk[0].weight.grad.abs().sum() > 0
+    assert head.additional_heads[1].weight.grad.abs().sum() > 0
+    assert feature.grad.abs().sum() > 0
+    # The 192D view feature feeds the count router alone: no Gaussian parameter
+    # other than the gated opacity may pull gradient through it. The gate's cat
+    # keeps the router in the graph, so this must be zero rather than absent.
+    assert head.view_mlp[1].weight.grad.abs().sum() == 0
+    assert head.count_predictor[-1].weight.grad.abs().sum() == 0
+
+    head.zero_grad(set_to_none=True)
+    feature.grad = None
+    packing["k_logits"].retain_grad()
+    b_gs = {
+        "view_index": packing["view_index"],
+        "opacity": raw_params[:, head.opacity_start:head.opacity_end],
+        "common_view_gate": packing["common_view_gate"],
+    }
+    loss = raw_params.new_zeros(())
+    for view_index in range(2):
+        selected = GausRender.select_target_view(b_gs, view_index)
+        loss = loss + torch.sigmoid(selected["opacity"]).sum()
+    loss.backward()
+
+    # K=1 (view 0) trains the router through the deferred Common gate, K=3
+    # (view 1) through its Additional opacities. Both must be live.
+    assert packing["k_logits"].grad[0].abs().sum() > 0
+    assert packing["k_logits"].grad[1].abs().sum() > 0
+    assert head.view_mlp[1].weight.grad.abs().sum() > 0
+    assert head.view_mlp[5].weight.grad.abs().sum() > 0
+    assert head.count_predictor[-1].weight.grad.abs().sum() > 0
+    assert head.common_predictor[-1].weight.grad.abs().sum() > 0
+    assert head.additional_trunk[0].weight.grad.abs().sum() > 0
+    assert head.additional_heads[1].weight.grad.abs().sum() > 0
+    # The fused token feeds Common, Additional and the router, so it collects
+    # gradient from all three paths.
+    assert feature.grad.abs().sum() > 0
+
+
+def test_viewpoint_zero_init_router_output_delays_view_mlp_by_one_step():
+    """Document the only gradient that is not live at initialisation.
+
+    ``count_predictor[-1]`` is zeroed so step 0 starts from a uniform K policy.
+    Because view_mlp now reaches the loss only through those logits, its own
+    gradient is zero until that layer moves off zero -- which its own non-zero
+    gradient guarantees after the first optimizer step.
+    """
+    torch.manual_seed(23)
+    head = _FixedKHead(_viewpoint_cfg(tau=0.7), _gs_params(), dim=8)
+    head.selected_k = [2, 3]
+    feature = torch.randn(1, 8, requires_grad=True)
+    raw_params, packing = _viewpoint_forward(
+        head, feature, torch.tensor([[9.0, 1.0, 0.5]]),
+        [torch.eye(4).repeat(2, 1, 1)],
+    )
+    torch.testing.assert_close(
+        packing["k_logits"], torch.zeros_like(packing["k_logits"])
+    )
+    raw_params[:, head.opacity_start:head.opacity_end].sum().backward()
+
+    assert head.view_mlp[5].weight.grad.abs().sum() == 0
+    assert head.count_predictor[-1].weight.grad.abs().sum() > 0
 
 
 def test_renderer_selects_only_the_requested_target_union():

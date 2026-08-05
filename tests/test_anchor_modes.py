@@ -812,10 +812,18 @@ def test_viewpoint_grid_head_stores_common_once_and_additional_per_view():
 
         def __call__(
             self, feature, anchor_k, delta, token_offset,
-            target_pose=None, anchor_batch=None,
+            target_pose=None, anchor_batch=None, anchor_position_ref=None,
         ):
             assert target_pose is poses
             assert anchor_batch.tolist() == [0]
+            # The router needs one ref-frame token center per target view, not
+            # sensor-frame coordinates. This token is static, so both views
+            # repeat the aggregator's observed center.
+            assert anchor_position_ref.shape == (1, 2, 3)
+            torch.testing.assert_close(
+                anchor_position_ref,
+                anchor_metadata["coord_ref"].unsqueeze(1).expand(1, 2, 3),
+            )
             return torch.zeros(3, 6), {
                 "anchor_index": torch.tensor([0, 0, 0]),
                 "decision_index": torch.tensor([-1, 1, 1]),
@@ -869,3 +877,170 @@ def test_viewpoint_grid_head_stores_common_once_and_additional_per_view():
     assert seeds.metadata["common_view_gate"].shape == (1, 2)
     assert seeds.routing_stats["selected_k"].tolist() == [1, 3]
     assert seeds.routing_stats["view_index"].tolist() == [0, 1]
+
+
+def test_viewpoint_router_receives_each_token_in_the_target_sensor_frame():
+    """End-to-end seam test: real aggregator -> real viewpoint slot head.
+
+    The router input must be the token center expressed in the *target* sensor
+    frame, which composes the source-frame pose with the inverse target pose.
+    Feeding raw sensor coordinates would silently work for frame 0 only.
+    """
+    from src.models_new.module.grid_query_head import GridSlotHead, GridTemporalAggregator
+
+    torch.manual_seed(5)
+    k_max, dim = 4, 48
+    aggregator = GridTemporalAggregator(
+        SimpleNamespace(
+            K_max=3, points_per_gaussian=4, bg_radius_m=0.8,
+            bg_max_kv_per_frame=8, num_heads=2, bg_layers=1, fg_layers=1,
+            grad_balance="sqrt_k",
+        ),
+        dim=dim, r_far=80.0,
+    )
+    head = GridSlotHead(
+        SimpleNamespace(
+            count_mode="learned_gumbel_viewpt",
+            grad_balance="sqrt_k",
+            learned_count=SimpleNamespace(
+                K_max=k_max, tau=1.0, grad_balance_scope="token",
+                viewpoint=SimpleNamespace(
+                    position_frequencies=8, position_scale_m=110.0,
+                ),
+            ),
+        ),
+        SimpleNamespace(shs=2, opacity=1, scaling=1, rotation=1, offset=1),
+        dim=dim,
+    )
+
+    captured = {}
+
+    def capture_router_position(module, args):
+        captured["position"] = args[0]
+
+    head.view_position_encoder.register_forward_pre_hook(capture_router_position)
+
+    # Frame 1's sensor sits 2 m ahead of frame 0, and target view 1 shares that
+    # pose, so the second view must see frame-1 tokens at their sensor coords.
+    shifted = torch.eye(4)
+    shifted[0, 3] = 2.0
+    pose = torch.stack([torch.eye(4), shifted])
+    # Frame 1's sensor coords are chosen so both frames land within the 0.8 m
+    # background radius in the ref frame, exercising the real fusion attention.
+    token_position = torch.tensor([
+        [10.0, 0.0, 0.0], [30.0, 0.0, 0.0],
+        [8.3, 0.0, 0.0], [28.0, 0.0, 0.0],
+    ])
+    seed_sensor = token_position[:, None, None, :].repeat(1, k_max, k_max, 1)
+    feature = torch.randn(4, dim, requires_grad=True)
+
+    seeds = build_grid_gaussian_seeds(
+        aggregator, head, feature, token_position, None,
+        seed_sensor, torch.zeros_like(seed_sensor),
+        torch.tensor([2, 4]), torch.tensor([0, 0]),
+        [pose], [[torch.empty(0, 7), torch.empty(0, 7)]], None,
+        [torch.tensor([0.0, 1.0])],
+        target_pose=[pose],
+    )
+
+    # Rows are (token, view) in anchor-major order for 4 tokens x 2 views.
+    expected = torch.tensor([
+        [10.0, 0.0, 0.0], [8.0, 0.0, 0.0],     # frame 0, ref == sensor
+        [30.0, 0.0, 0.0], [28.0, 0.0, 0.0],
+        [10.3, 0.0, 0.0], [8.3, 0.0, 0.0],     # frame 1, ref == sensor + 2 m
+        [30.0, 0.0, 0.0], [28.0, 0.0, 0.0],
+    ])
+    view_position = head.view_position_encoder.to_view_frame(
+        captured["position"], pose.repeat(4, 1, 1)
+    )
+    torch.testing.assert_close(view_position, expected)
+
+    assert seeds.metadata["common_view_gate"].shape == (4, 2)
+    seeds.raw_params.sum().backward()
+    assert feature.grad is not None and feature.grad.abs().sum() > 0
+    assert aggregator.bg_attention.kv_proj[0].weight.grad.abs().sum() > 0
+
+
+def test_dynamic_router_position_matches_the_renderer_box_trajectory():
+    """A dynamic token must reach the router where the renderer will draw it."""
+    from src.models_new.module.grid_query_head import GridTemporalAggregator
+    from src.models_new.module.m3_g2p import GausRender
+    from src.models_new.module.anchor_modes import target_view_token_positions
+
+    torch.manual_seed(9)
+    aggregator = GridTemporalAggregator(
+        SimpleNamespace(
+            K_max=3, points_per_gaussian=4, bg_radius_m=0.8,
+            bg_max_kv_per_frame=8, num_heads=2, bg_layers=1, fg_layers=1,
+            grad_balance="sqrt_k",
+        ),
+        dim=48, r_far=80.0,
+    )
+
+    # One car driving +x and yawing, observed at t=0.0 and t=1.0. Boxes are
+    # [x, y, z, w, l, h, yaw]; the token sits 0.5 m ahead of the box center.
+    box_t0 = torch.tensor([[20.0, 0.0, 0.0, 2.0, 4.0, 2.0, 0.0]])
+    box_t1 = torch.tensor([[32.0, 3.0, 0.0, 2.0, 4.0, 2.0, 0.6]])
+    token_position = torch.tensor([
+        [20.5, 0.0, 0.0], [5.0, 0.0, 0.0],       # frame 0: on the car, background
+        [32.5, 3.0, 0.0], [5.0, 0.0, 0.0],       # frame 1
+    ])
+    pose = torch.eye(4).repeat(2, 1, 1)
+    source_times = torch.tensor([0.0, 1.0])
+    instance_ids = [[torch.tensor([7]), torch.tensor([7])]]
+
+    _, anchor_position_out, _, _, anchor_metadata = aggregator(
+        torch.randn(4, 48), token_position, None, None,
+        torch.tensor([2, 4]), torch.tensor([0, 0]),
+        [pose], [[box_t0, box_t1]], instance_ids, [source_times],
+    )
+    assert anchor_metadata["is_dynamic"].tolist() == [True, False, True, False]
+
+    target_times = torch.tensor([0.0, 0.25, 1.0])
+    positions = target_view_token_positions(
+        anchor_metadata,
+        anchor_position_out,
+        torch.zeros(4, dtype=torch.long),
+        torch.tensor([0, 0]),
+        instance_ids,
+        [source_times],
+        [target_times],
+        num_views=3,
+    )
+    assert positions.shape == (4, 3, 3)
+
+    # Background rows never move.
+    for row in (1, 3):
+        torch.testing.assert_close(
+            positions[row],
+            anchor_metadata["coord_ref"][row].expand(3, 3),
+        )
+
+    # Dynamic rows must match the renderer's own interpolate + replay, term for
+    # term, so the router and the rasterizer never disagree about where the car
+    # is at a given render time.
+    trajectory = {
+        "timestamps": source_times,
+        "bbox_ref": torch.cat([box_t0, box_t1]),
+    }
+    renderer = GausRender.__new__(GausRender)
+    for view, t in enumerate(target_times.tolist()):
+        box_t = renderer.interpolate_box_ref(
+            trajectory, t, positions.device, positions.dtype
+        )
+        for row in (0, 2):
+            expected = GausRender.box_local_to_ref(
+                anchor_position_out[row].unsqueeze(0), box_t
+            )
+            torch.testing.assert_close(positions[row, view], expected[0])
+
+    # At the observed times the replay reproduces the observed ref center.
+    torch.testing.assert_close(
+        positions[0, 0], anchor_metadata["coord_ref"][0]
+    )
+    torch.testing.assert_close(
+        positions[2, 2], anchor_metadata["coord_ref"][2]
+    )
+    # A mid-window view genuinely moves the car; the old static input would have
+    # handed the router a position several metres off.
+    assert (positions[0, 1] - positions[0, 0]).norm() > 2.0

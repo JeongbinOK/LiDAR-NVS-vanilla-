@@ -214,7 +214,11 @@ def main(cfg):
         batch = to_device(batch, device)
         _input, gt = batch["input"], batch["gt"]
 
-        out = model.p2g_model(_input, target_pose=gt.get("pose"))
+        out = model.p2g_model(
+            _input,
+            target_pose=gt.get("pose"),
+            target_timestamps=gt.get("timestamps"),
+        )
         out = model.g2g_model(out, _input["timestamps"])
         renders = model.g2p_model(out, gt)
 

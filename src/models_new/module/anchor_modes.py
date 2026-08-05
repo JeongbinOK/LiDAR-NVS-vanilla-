@@ -28,6 +28,8 @@ from typing import Optional
 
 import torch
 
+from ..utils import boxes as box_utils
+
 
 @dataclass(frozen=True)
 class GaussianSeedBatch:
@@ -97,6 +99,90 @@ def build_spherical_gaussian_seeds(
     )
 
 
+def target_view_token_positions(
+    anchor_metadata,
+    anchor_position_out,
+    anchor_batch,
+    frame_batch_idx,
+    bbox_instance_ids,
+    timestamps,
+    target_timestamps,
+    num_views,
+):
+    """Ref-frame token centers as they stand at each target view's time.
+
+    A static token never moves, so all its views share the observed ref center.
+    A dynamic token is pinned to its box: the renderer replays its box-local
+    coordinate through the box interpolated to the render time, so the router
+    must ask the same question at the same instant. Using the observed center
+    instead would misplace a moving object by its displacement over the window
+    (up to ~10 m of ego motion plus the object's own travel across 1.0 s).
+
+    Instances the renderer cannot interpolate -- fewer than two observations --
+    fall back to the observed center, matching ``GausRender.get_means3D``.
+    """
+    coord_ref = anchor_metadata["coord_ref"]
+    device, dtype = coord_ref.device, coord_ref.dtype
+    num_views = int(num_views)
+    positions = coord_ref.unsqueeze(1).expand(-1, num_views, -1).contiguous()
+
+    is_dynamic = anchor_metadata["is_dynamic"]
+    if num_views == 0 or not bool(is_dynamic.any()) or bbox_instance_ids is None:
+        return positions
+    if timestamps is None or target_timestamps is None:
+        raise ValueError(
+            "dynamic tokens need both source and target timestamps to place "
+            "their boxes at the render time"
+        )
+
+    bbox_ref_by_frame = anchor_metadata["bbox_ref_by_frame"]
+    instance_id = anchor_metadata["instance_id"]
+    batch_frames = {}
+    for global_frame, batch_id in enumerate(frame_batch_idx.tolist()):
+        batch_frames.setdefault(int(batch_id), []).append(global_frame)
+
+    for batch_id, frame_indices in batch_frames.items():
+        batch_rows = (anchor_batch == batch_id) & is_dynamic
+        if not bool(batch_rows.any()):
+            continue
+        query = target_timestamps[batch_id].to(device=device, dtype=dtype)
+        if query.numel() > num_views:
+            raise ValueError(
+                "target_timestamps has more entries than target views"
+            )
+        source_times = timestamps[batch_id].to(device=device, dtype=dtype)
+        frame_ids = [
+            bbox_instance_ids[batch_id][local].to(device=device)
+            for local in range(len(frame_indices))
+        ]
+
+        batch_instances = instance_id[batch_rows].unique().tolist()
+        for item_id in batch_instances:
+            item_id = int(item_id)
+            times, boxes = [], []
+            for local, global_frame in enumerate(frame_indices):
+                matches = (frame_ids[local] == item_id).nonzero(as_tuple=True)[0]
+                if matches.numel() == 0:
+                    continue
+                times.append(source_times[local])
+                boxes.append(
+                    bbox_ref_by_frame[global_frame][int(matches[0])].to(dtype)
+                )
+            if len(boxes) < 2:
+                continue
+            item_rows = (batch_rows & (instance_id == item_id)).nonzero(
+                as_tuple=True
+            )[0]
+            box_at_view = box_utils.interpolate_boxes_ref(
+                torch.stack(times), torch.stack(boxes), query,
+            )
+            moved = box_utils.box_local_to_ref_multi(
+                anchor_position_out[item_rows], box_at_view,
+            )
+            positions[item_rows, :query.numel()] = moved
+    return positions
+
+
 def build_grid_gaussian_seeds(
     temporal_aggregator,
     slot_head,
@@ -112,10 +198,11 @@ def build_grid_gaussian_seeds(
     bbox_instance_ids,
     timestamps,
     target_pose=None,
+    target_timestamps=None,
 ):
     """Aggregate grid tokens, pack variable slots, and expand token metadata."""
     (
-        anchor_feature, _anchor_position, seed_position, delta_p, anchor_metadata,
+        anchor_feature, anchor_position_out, seed_position, delta_p, anchor_metadata,
     ) = temporal_aggregator(
         fused_feature,
         token_position,
@@ -136,6 +223,28 @@ def build_grid_gaussian_seeds(
         anchor_batch = torch.repeat_interleave(
             frame_batch_idx.to(device=anchor_feature.device), token_counts
         )
+        # The router conditions on where each token sits in the target sensor
+        # frame, so it needs ref-frame token centers evaluated at each target
+        # view's own time -- static ones from the aggregator's ``coord_ref``,
+        # dynamic ones replayed through their interpolated box.
+        if not isinstance(target_pose, (list, tuple)):
+            raise ValueError(
+                "learned_gumbel_viewpt requires gt['pose'] as a list of "
+                "(V, 4, 4) tensors"
+            )
+        num_views = max(
+            (int(pose_b.shape[0]) for pose_b in target_pose), default=0
+        )
+        anchor_position_ref = target_view_token_positions(
+            anchor_metadata,
+            anchor_position_out,
+            anchor_batch,
+            frame_batch_idx,
+            bbox_instance_ids,
+            timestamps,
+            target_timestamps,
+            num_views,
+        )
         raw_params, packing = slot_head(
             anchor_feature,
             anchor_k,
@@ -143,6 +252,7 @@ def build_grid_gaussian_seeds(
             token_offset,
             target_pose=target_pose,
             anchor_batch=anchor_batch,
+            anchor_position_ref=anchor_position_ref,
         )
     else:
         # Preserve the legacy/mock head call contract exactly.

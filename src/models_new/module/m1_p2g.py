@@ -192,10 +192,14 @@ class Point2Gaus(nn.Module):
             keys.append("offset")
         return dict(zip(keys, parts))
 
-    def forward(self, _input, target_pose=None):
+    def forward(self, _input, target_pose=None, target_timestamps=None):
         """The anchor mode is fixed at construction from ``cfg.anchor_mode``, and
         train/eval behaviour follows ``nn.Module.training``, so this module needs
         neither a split name nor a step counter from the caller.
+
+        ``target_pose``/``target_timestamps`` are the render-time ``gt["pose"]``
+        and ``gt["timestamps"]``, which index the same target views. Only the
+        viewpoint-conditioned count router consumes them.
         """
         lidar_points = _input.get("lidar_points_sensor", _input["lidar_points"])
         offset = _input["offset"]
@@ -349,6 +353,7 @@ class Point2Gaus(nn.Module):
                 bbox_instance_ids,
                 _input.get("timestamps"),
                 target_pose=target_pose,
+                target_timestamps=target_timestamps,
             )
 
         # Spherical retains the shared predictor; grid's K-specific head already
