@@ -79,8 +79,11 @@ p2g:
   squery:                       # spherical mode only: raw-point occupied cell = anchor
                                 # (temporal fusion은 grid_query 블록으로 양 모드 공유;
                                 # 이 head의 K/V는 own-frame token으로 한정)
+    count_mode: learned_gumbel  # legacy | learned_gumbel
+                                # legacy: unique(anchor, source-token)당 1 Gaussian
+                                # learned: (frame, cell, fg/bg label) anchor당 K=[1..4]
     token_stride_m: 0.4       # query seed의 source-token 상대위치를 정규화하는 stage-3 물리 stride
-    dtheta_deg: 2.67
+    dtheta_deg: 4.5
     dphi_deg: 3.0
     dlogr: 0.12               # legacy log radial bin; dr_m 설정 시 무시됨
     dr_m: 0.8                 # linear radial bin (m). far 깊이혼합 제거:
@@ -100,6 +103,40 @@ p2g:
     cross_attn_backend: flash_varlen # real-batch: 118.5 -> 24.6 ms fwd+bwd
     self_attn_layers: 1         # cross refinement 뒤 anchor별 query set block
     self_attn_backend: flash_varlen  # real-batch: 21.8 -> 13.8 ms fwd+bwd
+    grad_balance: sqrt_k
+    learned_count:              # learned_gumbel only
+      K_max: 4
+      tau: 1.0
+      # Linear -> anchor-wise max -> LN -> GELU 뒤 같은 frame/label의
+      # 3x3x3 spherical local self-attention. 2층이면 유효 receptive field가
+      # 5x5x5이고, 3층(7x7x7)은 원거리에서 물리 범위가 지나치게 커 기본 2층.
+      local_attn_heads: 8
+      local_attn_layers: 2
+      local_ffn_ratio: 4
+      # statistic = [clip(n_raw/E[N_emitted_rays],0,1), mean raw-point range in
+      #              [2.5,110]m -> [0,1], physical-log-normalized LOO Q50,
+      #              Q90-Q50, Q50-Q10, valid(0/1)]. E[azimuth rays/cell]=1085/120.
+      stat_embedding_dim: 64    # two-layer 6 -> 64 -> 64 MLP
+      stat_min_raw: 6
+      stat_min_valid_loo: 3     # quantiles must have at least three defined members
+      stat_loo_eps: 0.001       # exact LOO Sherman-Morrison denominator gate
+      stat_range_min_m: 2.5
+      stat_range_max_m: 110.0
+      # LOO channel x -> log1p(min(x,cap)/knee) / log1p(cap/knee).
+      # 1cm preserves mm-cm resolution; the 0.8m radial-cell width is the cap.
+      stat_loo_knee_m: 0.01
+      stat_loo_cap_m: 0.8
+      ray_azimuth_count: 1085   # emitted panorama rays/revolution, not returned points
+      grad_balance_scope: token
+      budget:
+        enable: true
+        target_mean_k: 2.0
+        weight: 1.0
+        warmup_steps: 500
+        ramp_steps: 1000
+      logging:
+        enable: true
+        interval: 20
   grid_query:                   # 공유 temporal fusion(bg_radius_m/bg_max_kv_per_frame/
                                 # num_heads/bg_layers/fg_layers는 양 모드 사용) +
                                 # grid mode 전용 K routing/head 설정

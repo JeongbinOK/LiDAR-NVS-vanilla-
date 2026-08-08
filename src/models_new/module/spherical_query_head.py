@@ -10,19 +10,18 @@ of voting, so no gaussian is ever seeded on the other label's points and no
 raw point is dropped. This equals running the same spherical binning on the
 bg-only and per-instance point subsets separately.
 
-Every unique ``(anchor, supporting token)`` pair is one evidence query and one
-nominal gaussian. Its coarse centre is an actually observed raw point: among
-the raw points shared by that anchor and token, choose the point nearest their
-Cartesian mean. This gives surface-supported seeds without FPS. The query
-starts from that token's own fused feature rather than a pooled anchor feature,
-then cross-attends to the anchor's K/V memory with the raw seed as its Q-side
-3D RoPE coordinate. The caller applies a bounded learned offset.
+``squery.count_mode`` selects one of two checkpoint-isolated output paths:
 
-The spherical anchor is therefore a context/routing set, not an output
-compression unit. Query count is ragged and data-defined; there is no fixed
-three-slot query bank. The head's explicit position conditioning is
-``(seed - source_token_position) / token_stride_m``. The geometric spherical
-cell centre remains useful only for shared K/V capping and anchor geometry.
+* ``legacy`` keeps the historical behaviour: every unique
+  ``(anchor, supporting token)`` pair is one evidence query and one Gaussian.
+  Its coarse centre is the observed point nearest that evidence set's Cartesian
+  mean; the source token query cross-attends to own-frame token memory.
+* ``learned_gumbel`` makes the labelled spherical group the output unit. Its
+  connected fused tokens follow Utonia GridPooling (Linear -> max -> LN ->
+  GELU), then same-frame/same-label 3x3x3 local self-attention. A separate
+  float64 raw-geometry statistic encoder is concatenated only for K routing;
+  K-specific observed range-quantile points and the content feature feed the
+  same joint K-head used by grid learned routing.
 
 Cross-frame temporal context is NOT assembled here. The caller first runs the
 shared grid temporal aggregator (background 0.8 m radius cross-frame attention
@@ -44,10 +43,12 @@ ever reached through raw-point membership:
 - BG/FG share learned query/cross-attention weights, but use independent RoPE
   metric scales selected per anchor to respect their different spatial support.
 
-Outputs are packed frame-major and anchor-major and feed the shared
-``gs_predictor`` together with the normalized seed-minus-source-token delta.
+Outputs remain frame-major. Legacy feeds the shared ``gs_predictor``;
+learned routing returns an anchor-level K-specific seed bank for ``GridSlotHead``.
 """
 from __future__ import annotations
+
+import math
 
 import torch
 import torch.nn as nn
@@ -56,6 +57,7 @@ from ..utils import boxes as box_utils
 from ..utils.attention import (
     AnchorQueryCrossAttention,
     AnchorQuerySelfAttention,
+    Rotary3D,
 )
 from .spherical_bins import (
     SphericalBins,
@@ -104,6 +106,158 @@ _SPHERICAL_ROPE_SCALE_MAX = 8.0    # support >= 0.38 m
 # The pair that DEFINES the support would otherwise land exactly on pi, where
 # +pi and -pi are the same phase and fp32 rounding puts it on either side.
 _SPHERICAL_ROPE_PHASE_MARGIN = 0.98
+
+
+class _SphericalLocalSelfAttention(nn.Module):
+    """Sparse 3x3x3 anchor self-attention with metric 3D RoPE.
+
+    ``neighbor_index`` is a padded ``(A, <=27)`` lookup built from spherical
+    cell indices.  Each layer re-projects the *updated* features of those
+    neighbours, so stacking layers genuinely grows the receptive field rather
+    than repeatedly cross-attending to a frozen one-hop memory.
+    """
+
+    def __init__(self, dim, num_heads=8, n_layers=2, mlp_ratio=4):
+        super().__init__()
+        self.dim = int(dim)
+        self.num_heads = int(num_heads)
+        if self.dim % self.num_heads != 0:
+            raise ValueError("local attention dim must be divisible by num_heads")
+        self.head_dim = self.dim // self.num_heads
+        if self.head_dim % 6 != 0:
+            raise ValueError(
+                "local attention head_dim must be divisible by 6 for 3D RoPE"
+            )
+        self.n_layers = int(n_layers)
+        self.scale = self.head_dim ** -0.5
+        self.rope = Rotary3D(
+            self.head_dim, base=_SPHERICAL_ROPE_BASE, position_scale=1.0
+        )
+        self.q_proj = nn.ModuleList([
+            nn.Linear(self.dim, self.dim) for _ in range(self.n_layers)
+        ])
+        self.kv_proj = nn.ModuleList([
+            nn.Linear(self.dim, 2 * self.dim) for _ in range(self.n_layers)
+        ])
+        self.out_proj = nn.ModuleList([
+            nn.Linear(self.dim, self.dim) for _ in range(self.n_layers)
+        ])
+        self.norm = nn.ModuleList([
+            nn.LayerNorm(self.dim) for _ in range(self.n_layers)
+        ])
+        hidden = int(self.dim * mlp_ratio)
+        self.ffn = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(self.dim, hidden),
+                nn.GELU(),
+                nn.Linear(hidden, self.dim),
+            )
+            for _ in range(self.n_layers)
+        ])
+        self.norm_ffn = nn.ModuleList([
+            nn.LayerNorm(self.dim) for _ in range(self.n_layers)
+        ])
+        for ffn in self.ffn:
+            nn.init.zeros_(ffn[-1].weight)
+            nn.init.zeros_(ffn[-1].bias)
+
+    def forward(self, feature, position, neighbor_index, neighbor_valid):
+        A = int(feature.shape[0])
+        if A == 0 or self.n_layers == 0:
+            return feature
+        if neighbor_index.ndim != 2 or neighbor_index.shape[0] != A:
+            raise ValueError("neighbor_index must have shape (A, L)")
+        if neighbor_valid.shape != neighbor_index.shape:
+            raise ValueError("neighbor_valid must align with neighbor_index")
+        if not bool(neighbor_valid.any(dim=1).all()):
+            raise RuntimeError("every occupied anchor must attend to at least itself")
+
+        safe_index = neighbor_index.clamp(0, A - 1)
+        neighbor_position = position[safe_index].float()
+        query_position = position.float()
+        relative = (neighbor_position - query_position[:, None, :]).abs()
+        relative = torch.where(
+            neighbor_valid[..., None], relative, torch.zeros_like(relative)
+        )
+        support = relative.amax(dim=(1, 2))
+        position_scale = (
+            _SPHERICAL_ROPE_PHASE_MARGIN * torch.pi
+            / support.clamp_min(1.0e-3)
+        ).clamp(_SPHERICAL_ROPE_SCALE_MIN, _SPHERICAL_ROPE_SCALE_MAX)
+        q_angle = self.rope.angles(
+            query_position, position_scale=position_scale
+        )
+        k_angle = self.rope.angles(
+            neighbor_position, position_scale=position_scale
+        )
+        negative_mask = ~neighbor_valid[:, None, :]
+
+        x = feature
+        H, dh = self.num_heads, self.head_dim
+        for layer in range(self.n_layers):
+            q = self.q_proj[layer](x).reshape(A, H, dh)
+            key_all, value_all = self.kv_proj[layer](x).chunk(2, dim=-1)
+            key = key_all[safe_index].reshape(A, safe_index.shape[1], H, dh)
+            value = value_all[safe_index].reshape(
+                A, safe_index.shape[1], H, dh
+            )
+            q_rot = self.rope.rotate(q.float(), q_angle[:, None, :, :])
+            key_rot = self.rope.rotate(
+                key.float(), k_angle[:, :, None, :, :]
+            )
+            score = torch.einsum("ahd,alhd->ahl", q_rot, key_rot) * self.scale
+            score = score.masked_fill(negative_mask, float("-inf"))
+            probability = torch.softmax(score, dim=-1)
+            attended = torch.einsum(
+                "ahl,alhd->ahd", probability, value.float()
+            ).reshape(A, self.dim).to(x.dtype)
+            x = self.norm[layer](x + self.out_proj[layer](attended))
+            x = self.norm_ffn[layer](x + self.ffn[layer](x))
+        return x
+
+
+def _range_quantile_seed_rows(points, anchor_index, num_anchors, k_max):
+    """Grid-mode K-specific range-quantile rule, returning raw-point rows.
+
+    For candidate K and slot s, select the observed point at
+
+        floor(((2s + 1) * N_raw) / (2K)).
+
+    after sorting each anchor's points by sensor range (then x/y/z for stable
+    ties). Thus every active seed lies on an actually observed surface. When
+    ``N_raw < K``, repeated raw points are intentional and match Grid mode.
+    """
+    A, K = int(num_anchors), int(k_max)
+    if points.shape[0] == 0 or A == 0:
+        return torch.zeros(
+            (A, K, K), dtype=torch.long, device=points.device
+        )
+    counts = torch.bincount(anchor_index, minlength=A)
+    if bool((counts <= 0).any()):
+        raise RuntimeError("every spherical anchor needs at least one raw point")
+
+    point_range = torch.linalg.vector_norm(points, dim=-1)
+    # Stable least-to-most-significant sorting gives (anchor, r, x, y, z),
+    # exactly as `_r_quantile_seed_bank` in builders/common.py.
+    sorted_rows = torch.arange(points.shape[0], device=points.device)
+    for value in (
+        points[:, 2], points[:, 1], points[:, 0], point_range, anchor_index,
+    ):
+        sorted_rows = sorted_rows[
+            torch.argsort(value[sorted_rows], stable=True)
+        ]
+    starts = torch.cumsum(counts, dim=0) - counts
+
+    seed_rows = torch.zeros((A, K, K), dtype=torch.long, device=points.device)
+    for k in range(1, K + 1):
+        slot = torch.arange(k, device=points.device).view(1, -1)
+        rank = torch.div(
+            (2 * slot + 1) * counts[:, None],
+            2 * k,
+            rounding_mode="floor",
+        )
+        seed_rows[:, k - 1, :k] = sorted_rows[starts[:, None] + rank]
+    return seed_rows
 
 
 def _segment_rank(sorted_ids, num_segments):
@@ -184,10 +338,19 @@ def _select_evidence_seeds(raw_points, raw_anchor, raw_token, num_anchors, num_t
 
 
 class SphericalQueryHead(nn.Module):
-    def __init__(self, squery_cfg, dim, r_far):
+    def __init__(
+        self, squery_cfg, dim, r_far, *, ring_to_elevation_deg=None,
+    ):
         super().__init__()
         self.dim = int(dim)
-        self.max_kv = int(squery_cfg.max_kv)
+        self.count_mode = str(
+            getattr(squery_cfg, "count_mode", "legacy")
+        ).lower()
+        if self.count_mode not in ("legacy", "learned_gumbel"):
+            raise ValueError(
+                "p2g.squery.count_mode must be 'legacy' or 'learned_gumbel'"
+            )
+        self.max_kv = int(getattr(squery_cfg, "max_kv", 64))
         self.token_stride_m = float(getattr(squery_cfg, "token_stride_m", 0.4))
         if self.token_stride_m <= 0.0:
             raise ValueError("p2g.squery.token_stride_m must be positive")
@@ -198,6 +361,114 @@ class SphericalQueryHead(nn.Module):
             float(squery_cfg.r_min), float(squery_cfg.r_max),
             dr_m=float(dr_m) if dr_m is not None else None,
         )
+
+        if self.count_mode == "learned_gumbel":
+            learned = getattr(squery_cfg, "learned_count", None)
+            if learned is None:
+                raise ValueError(
+                    "p2g.squery.learned_count is required for learned_gumbel"
+                )
+            self.k_max = int(getattr(learned, "K_max", 0) or 0)
+            if self.k_max <= 0:
+                raise ValueError("p2g.squery.learned_count.K_max must be positive")
+            self.stat_embedding_dim = int(
+                getattr(learned, "stat_embedding_dim", 64)
+            )
+            if self.stat_embedding_dim <= 0:
+                raise ValueError("stat_embedding_dim must be positive")
+            self.router_dim = self.dim + self.stat_embedding_dim
+            self.stat_min_raw = int(getattr(learned, "stat_min_raw", 6))
+            self.stat_min_valid_loo = int(
+                getattr(learned, "stat_min_valid_loo", 3)
+            )
+            self.stat_loo_eps = float(
+                getattr(learned, "stat_loo_eps", 1.0e-3)
+            )
+            self.stat_range_min_m = float(
+                getattr(learned, "stat_range_min_m", 2.5)
+            )
+            self.stat_range_max_m = float(
+                getattr(learned, "stat_range_max_m", self.bins.r_max)
+            )
+            self.stat_loo_knee_m = float(
+                getattr(learned, "stat_loo_knee_m", 0.01)
+            )
+            self.stat_loo_cap_m = float(
+                getattr(
+                    learned,
+                    "stat_loo_cap_m",
+                    float(dr_m) if dr_m is not None else 0.8,
+                )
+            )
+            if self.stat_min_raw < 1 or self.stat_min_valid_loo < 1:
+                raise ValueError("statistic support thresholds must be positive")
+            if not 0.0 < self.stat_loo_eps < 1.0:
+                raise ValueError("stat_loo_eps must lie in (0, 1)")
+            if not self.stat_range_min_m < self.stat_range_max_m:
+                raise ValueError("statistic range bounds must be ordered")
+            if self.stat_loo_knee_m <= 0.0 or self.stat_loo_cap_m <= 0.0:
+                raise ValueError("LOO statistic knee/cap must be positive")
+            self.stat_loo_log_denominator = math.log1p(
+                self.stat_loo_cap_m / self.stat_loo_knee_m
+            )
+
+            # Utonia GridPooling order: Linear -> segment max -> LN -> GELU.
+            self.anchor_pool_linear = nn.Linear(self.dim, self.dim)
+            self.anchor_pool_norm = nn.LayerNorm(self.dim)
+            self.anchor_pool_act = nn.GELU()
+            local_heads = int(getattr(learned, "local_attn_heads", 8))
+            local_layers = int(getattr(learned, "local_attn_layers", 2))
+            self.local_attention = _SphericalLocalSelfAttention(
+                self.dim,
+                num_heads=local_heads,
+                n_layers=local_layers,
+                mlp_ratio=int(getattr(learned, "local_ffn_ratio", 4)),
+            )
+            # Two Linear layers as requested; LayerNorm keeps the six input
+            # channels from relying on a dataset-wide mean/std calibration.
+            self.stat_encoder = nn.Sequential(
+                nn.Linear(6, self.stat_embedding_dim),
+                nn.LayerNorm(self.stat_embedding_dim),
+                nn.GELU(),
+                nn.Linear(self.stat_embedding_dim, self.stat_embedding_dim),
+                nn.LayerNorm(self.stat_embedding_dim),
+                nn.GELU(),
+            )
+
+            if ring_to_elevation_deg is None:
+                raise ValueError(
+                    "learned spherical routing requires p2g.ring_to_elevation_deg"
+                )
+            elevation = torch.as_tensor(
+                list(ring_to_elevation_deg), dtype=torch.float64
+            )
+            theta_index = torch.floor(
+                (elevation + 90.0) / float(squery_cfg.dtheta_deg)
+            ).to(torch.long).clamp(0, self.bins.n_theta - 1)
+            ring_count = torch.bincount(
+                theta_index, minlength=self.bins.n_theta
+            ).to(torch.float32)
+
+            # Expected emitted-ray capacity, not the integer capacity of one
+            # arbitrarily phase-aligned panorama. Every phi cell receives the
+            # same 1085 / n_phi expectation; theta capacity still follows the
+            # exact number of physical LiDAR rings assigned to that theta bin.
+            ray_azimuth_count = int(
+                getattr(learned, "ray_azimuth_count", 1085)
+            )
+            if ray_azimuth_count <= 0:
+                raise ValueError("ray_azimuth_count must be positive")
+            expected_phi_rays = float(ray_azimuth_count) / self.bins.n_phi
+            ray_capacity = (
+                ring_count[:, None]
+                .expand(-1, self.bins.n_phi)
+                .contiguous()
+                * expected_phi_rays
+            )
+            self.register_buffer(
+                "ray_capacity", ray_capacity, persistent=False
+            )
+            return
 
         # Keep the checkpoint-facing normalization name, but normalize each
         # evidence's own source-token feature rather than an anchor-pooled P0.
@@ -367,14 +638,16 @@ class SphericalQueryHead(nn.Module):
         group_key, pt2anchor = build_cells(cell_of_point * L + lab_idx)
         U = group_key.numel()
         anchor_cell = torch.div(group_key, L, rounding_mode="floor")
-        anchor_label = uniq_lab[group_key - anchor_cell * L]
+        anchor_label_index = group_key - anchor_cell * L
+        anchor_label = uniq_lab[anchor_label_index]
         is_dyn = anchor_label >= 0
 
         # Anchor reference position = geometric spherical-cell centre; delta_p
         # and the max_kv capping distance are measured from it downstream.
-        anchor_sensor = self.bins.cell_center_xyz(
-            self.bins.unhash(anchor_cell)
-        ).to(dtype=raw_sensor.dtype)
+        anchor_idx3 = self.bins.unhash(anchor_cell)
+        anchor_sensor = self.bins.cell_center_xyz(anchor_idx3).to(
+            dtype=raw_sensor.dtype
+        )
         anchor_ref = box_utils.apply_pose(anchor_sensor, pose_f)
         anchor_out = anchor_ref.clone()
 
@@ -405,7 +678,379 @@ class SphericalQueryHead(nn.Module):
             "pt2anchor": pt2anchor, "pi": pi, "num_anchors": U,
             "label": anchor_label, "box": anchor_box, "is_dyn": is_dyn,
             "sensor": anchor_sensor, "ref": anchor_ref, "out": anchor_out,
+            "idx3": anchor_idx3, "group_key": group_key,
+            "label_index": anchor_label_index, "num_labels": int(L),
         }
+
+    def _local_neighbor_table(self, frame_anchor, anchor_base, num_anchors):
+        """Exact same-frame/same-label 3x3x3 spherical neighbourhood."""
+        A = int(num_anchors)
+        device = next(
+            fa["idx3"].device for fa in frame_anchor if fa is not None
+        )
+        offsets = torch.tensor(
+            [[dt, dp, dr] for dt in (-1, 0, 1)
+             for dp in (-1, 0, 1) for dr in (-1, 0, 1)],
+            dtype=torch.long,
+            device=device,
+        )
+        neighbor_index = torch.arange(device=device, end=A)[:, None].expand(
+            A, offsets.shape[0]
+        ).clone()
+        neighbor_valid = torch.zeros_like(neighbor_index, dtype=torch.bool)
+        for global_f, fa in enumerate(frame_anchor):
+            if fa is None:
+                continue
+            U = int(fa["num_anchors"])
+            base = int(anchor_base[global_f])
+            candidate = fa["idx3"][:, None, :] + offsets[None, :, :]
+            in_bounds = (
+                (candidate[..., 0] >= 0)
+                & (candidate[..., 0] < self.bins.n_theta)
+                & (candidate[..., 2] >= 0)
+                & (candidate[..., 2] < self.bins.n_lr)
+            )
+            candidate = candidate.clone()
+            candidate[..., 0] = candidate[..., 0].clamp(
+                0, self.bins.n_theta - 1
+            )
+            candidate[..., 1] = torch.remainder(
+                candidate[..., 1], self.bins.n_phi
+            )
+            candidate[..., 2] = candidate[..., 2].clamp(
+                0, self.bins.n_lr - 1
+            )
+            neighbor_key = (
+                self.bins.hash(candidate) * fa["num_labels"]
+                + fa["label_index"][:, None]
+            )
+            position = torch.searchsorted(fa["group_key"], neighbor_key)
+            safe_position = position.clamp(max=U - 1)
+            found = (
+                in_bounds
+                & (position < U)
+                & (fa["group_key"][safe_position] == neighbor_key)
+            )
+            neighbor_index[base:base + U] = base + safe_position
+            neighbor_valid[base:base + U] = found
+        if not bool(neighbor_valid.any(dim=1).all()):
+            raise RuntimeError("spherical local neighbourhood lost its self cell")
+        return neighbor_index, neighbor_valid
+
+    @staticmethod
+    def _segmented_quantiles(
+        value, anchor_index, counts, quantiles, num_anchors,
+    ):
+        """Linear-interpolated quantiles for a flat ragged value set."""
+        A = int(num_anchors)
+        result = value.new_zeros((A, len(quantiles)))
+        present = counts > 0
+        if value.numel() == 0 or not bool(present.any()):
+            return result
+        order = torch.argsort(value, stable=True)
+        order = order[
+            torch.argsort(anchor_index[order], stable=True)
+        ]
+        sorted_value = value[order]
+        starts = torch.cumsum(counts, dim=0) - counts
+        rows = present.nonzero(as_tuple=True)[0]
+        for column, quantile in enumerate(quantiles):
+            position = (counts.to(value.dtype) - 1.0) * float(quantile)
+            lower = torch.floor(position).to(torch.long).clamp_min(0)
+            upper = torch.ceil(position).to(torch.long).clamp_min(0)
+            lower_value = sorted_value[starts[rows] + lower[rows]]
+            upper_value = sorted_value[starts[rows] + upper[rows]]
+            weight = position[rows] - lower[rows].to(value.dtype)
+            result[rows, column] = torch.lerp(
+                lower_value, upper_value, weight
+            )
+        return result
+
+    @torch.no_grad()
+    def _normalize_loo_statistic(self, value):
+        """Map a non-negative metre residual to [0,1] on a physical log scale."""
+        clipped = value.clamp(0.0, self.stat_loo_cap_m)
+        return torch.log1p(clipped / self.stat_loo_knee_m) / (
+            self.stat_loo_log_denominator
+        )
+
+    @torch.no_grad()
+    def _anchor_statistics(self, raw_points, raw_anchor, anchor_idx3, num_anchors):
+        """Six requested channels, with float64 exact inverse-range LOO."""
+        A = int(num_anchors)
+        point = raw_points.detach().to(dtype=torch.float64)
+        anchor = raw_anchor.to(dtype=torch.long)
+        radius = torch.linalg.vector_norm(point, dim=-1)
+        ray = point / radius[:, None].clamp_min(torch.finfo(torch.float64).tiny)
+        inverse_range = radius.reciprocal()
+        count = torch.bincount(anchor, minlength=A)
+
+        range_sum = radius.new_zeros(A)
+        range_sum.index_add_(0, anchor, radius)
+        mean_range = range_sum / count.clamp_min(1).to(radius.dtype)
+
+        gram = radius.new_zeros((A, 3, 3))
+        cross = radius.new_zeros((A, 3))
+        gram.index_add_(0, anchor, ray[:, :, None] * ray[:, None, :])
+        cross.index_add_(0, anchor, ray * inverse_range[:, None])
+
+        support = count >= self.stat_min_raw
+        support_rows = support.nonzero(as_tuple=True)[0]
+        solve_success = torch.zeros(A, dtype=torch.bool, device=point.device)
+        inverse_gram = torch.zeros_like(gram)
+        beta = radius.new_zeros((A, 3))
+        if support_rows.numel() > 0:
+            identity = torch.eye(
+                3, dtype=torch.float64, device=point.device
+            ).expand(support_rows.numel(), -1, -1)
+            solution, info = torch.linalg.solve_ex(
+                gram[support_rows], identity, check_errors=False
+            )
+            finite = torch.isfinite(solution).all(dim=(1, 2))
+            good_local = (info == 0) & finite
+            good_rows = support_rows[good_local]
+            solve_success[good_rows] = True
+            inverse_gram[good_rows] = solution[good_local]
+            beta[good_rows] = torch.einsum(
+                "nij,nj->ni", solution[good_local], cross[good_rows]
+            )
+
+        solve_point_rows = solve_success[anchor].nonzero(as_tuple=True)[0]
+        valid_residual = radius.new_zeros(0)
+        valid_residual_anchor = anchor.new_zeros(0)
+        if solve_point_rows.numel() > 0:
+            solve_anchor = anchor[solve_point_rows]
+            solve_ray = ray[solve_point_rows]
+            solve_inverse_range = inverse_range[solve_point_rows]
+            inverse_times_ray = torch.einsum(
+                "nij,nj->ni", inverse_gram[solve_anchor], solve_ray
+            )
+            full_prediction = (
+                solve_ray * beta[solve_anchor]
+            ).sum(dim=-1)
+            leverage = (solve_ray * inverse_times_ray).sum(dim=-1)
+            residual = solve_inverse_range - full_prediction
+            denominator = 1.0 - leverage
+            denominator_valid = (
+                torch.isfinite(denominator)
+                & torch.isfinite(residual)
+                & (denominator >= self.stat_loo_eps)
+            )
+            if denominator_valid.any():
+                member_anchor = solve_anchor[denominator_valid]
+                loo_beta = (
+                    beta[member_anchor]
+                    - inverse_times_ray[denominator_valid]
+                    * (
+                        residual[denominator_valid]
+                        / denominator[denominator_valid]
+                    )[:, None]
+                )
+                predicted_inverse_range = (
+                    solve_ray[denominator_valid] * loo_beta
+                ).sum(dim=-1)
+                predicted_range = predicted_inverse_range.reciprocal()
+                loo_residual = torch.abs(
+                    radius[solve_point_rows[denominator_valid]] - predicted_range
+                )
+                member_valid = (
+                    torch.isfinite(loo_beta).all(dim=-1)
+                    & torch.isfinite(predicted_inverse_range)
+                    & (predicted_inverse_range > 0.0)
+                    & torch.isfinite(loo_residual)
+                )
+                valid_residual = loo_residual[member_valid]
+                valid_residual_anchor = member_anchor[member_valid]
+
+        valid_loo_count = torch.bincount(
+            valid_residual_anchor, minlength=A
+        )
+        # n>=6 is the policy criterion. solve success and >=3 usable residuals
+        # are definition/safety guards: without them Q10/Q50/Q90 do not exist.
+        valid = (
+            support
+            & solve_success
+            & (valid_loo_count >= self.stat_min_valid_loo)
+        )
+        quantiles = self._segmented_quantiles(
+            valid_residual,
+            valid_residual_anchor,
+            valid_loo_count,
+            (0.10, 0.50, 0.90),
+            A,
+        )
+        q10, q50, q90 = quantiles.unbind(dim=-1)
+
+        capacity = self.ray_capacity[
+            anchor_idx3[:, 0], anchor_idx3[:, 1]
+        ].to(dtype=torch.float64)
+        capacity_known = capacity > 0
+        count_ratio_unclipped = (
+            count.to(torch.float64) / capacity.clamp_min(1.0)
+        )
+        count_ratio = torch.where(
+            capacity_known, count_ratio_unclipped.clamp(0.0, 1.0),
+            torch.zeros_like(count_ratio_unclipped),
+        )
+        range_normalized = (
+            (mean_range - self.stat_range_min_m)
+            / (self.stat_range_max_m - self.stat_range_min_m)
+        ).clamp(0.0, 1.0)
+        zero = torch.zeros_like(q50)
+        q50_normalized = self._normalize_loo_statistic(q50)
+        upper_spread_normalized = self._normalize_loo_statistic(
+            (q90 - q50).clamp_min(0.0)
+        )
+        lower_spread_normalized = self._normalize_loo_statistic(
+            (q50 - q10).clamp_min(0.0)
+        )
+        statistic = torch.stack([
+            count_ratio,
+            range_normalized,
+            torch.where(valid, q50_normalized, zero),
+            torch.where(valid, upper_spread_normalized, zero),
+            torch.where(valid, lower_spread_normalized, zero),
+            valid.to(torch.float64),
+        ], dim=-1).to(dtype=raw_points.dtype)
+        diagnostics = {
+            "anchor_raw_count": count,
+            "anchor_mean_range": mean_range.to(dtype=raw_points.dtype),
+            "anchor_ray_capacity": capacity.to(dtype=raw_points.dtype),
+            "anchor_ray_capacity_known": capacity_known,
+            "anchor_ray_fill_ratio_unclipped": count_ratio_unclipped.to(
+                dtype=raw_points.dtype
+            ),
+            "stat_valid": valid,
+            "valid_loo_count": valid_loo_count,
+            "solve_success": solve_success,
+            "loo_q10_m": q10.to(dtype=raw_points.dtype),
+            "loo_q50_m": q50.to(dtype=raw_points.dtype),
+            "loo_q90_m": q90.to(dtype=raw_points.dtype),
+            "router_statistics": statistic,
+        }
+        return statistic, diagnostics
+
+    def _forward_learned(
+        self,
+        feat,
+        tok_pos,
+        raw_point_sensor,
+        raw_rows,
+        raw_anchor,
+        raw_token,
+        tm,
+        frame_anchor,
+        anchor_base,
+        anchor_out,
+        anchor_label,
+        anchor_box,
+        anchor_is_dyn,
+        anchor_frame,
+        num_anchors,
+    ):
+        A = int(num_anchors)
+        projected_member = self.anchor_pool_linear(feat[raw_token])
+        pooled = feat.new_full((A, self.dim), float("-inf"))
+        pooled.index_reduce_(
+            0, raw_anchor, projected_member, "amax", include_self=True
+        )
+        if not bool(torch.isfinite(pooled).all()):
+            raise RuntimeError("occupied spherical anchor has no token feature")
+        anchor_feature = self.anchor_pool_act(self.anchor_pool_norm(pooled))
+
+        neighbor_index, neighbor_valid = self._local_neighbor_table(
+            frame_anchor, anchor_base, A
+        )
+        anchor_feature = self.local_attention(
+            anchor_feature, anchor_out, neighbor_index, neighbor_valid
+        )
+
+        anchor_idx3 = torch.cat([
+            fa["idx3"] for fa in frame_anchor if fa is not None
+        ])
+        statistic, statistic_meta = self._anchor_statistics(
+            raw_point_sensor[raw_rows], raw_anchor, anchor_idx3, A
+        )
+        statistic_embedding = self.stat_encoder(
+            statistic.to(dtype=anchor_feature.dtype)
+        )
+        router_feature = torch.cat(
+            [anchor_feature, statistic_embedding], dim=-1
+        )
+
+        local_seed_rows = _range_quantile_seed_rows(
+            raw_point_sensor[raw_rows], raw_anchor, A, self.k_max
+        )
+        k_row = torch.arange(
+            1, self.k_max + 1, device=feat.device
+        ).view(1, self.k_max, 1)
+        slot = torch.arange(
+            self.k_max, device=feat.device
+        ).view(1, 1, self.k_max)
+        seed_valid = (slot < k_row).expand(A, -1, -1)
+        seed_anchor = torch.arange(A, device=feat.device)[:, None, None].expand(
+            A, self.k_max, self.k_max
+        )[seed_valid]
+        seed_raw_row = raw_rows[local_seed_rows[seed_valid]]
+
+        seed_ref = tok_pos.new_zeros((A, self.k_max, self.k_max, 3))
+        seed_out = tok_pos.new_zeros((A, self.k_max, self.k_max, 3))
+        flat_seed_ref = tm["raw_ref"][seed_raw_row]
+        flat_seed_out = flat_seed_ref.clone()
+        for global_f, fa in enumerate(frame_anchor):
+            if fa is None or not bool(fa["is_dyn"].any()):
+                continue
+            rows = (
+                (anchor_frame[seed_anchor] == global_f)
+                & anchor_is_dyn[seed_anchor]
+            ).nonzero(as_tuple=True)[0]
+            if rows.numel() == 0:
+                continue
+            boxes = tm["bbox_ref_by_frame"][global_f][
+                anchor_box[seed_anchor[rows]]
+            ]
+            flat_seed_out[rows] = box_utils.points_to_box_local_batched(
+                flat_seed_ref[rows], boxes
+            )
+        seed_ref[seed_valid] = flat_seed_ref
+        seed_out[seed_valid] = flat_seed_out
+        seed_delta = tok_pos.new_zeros(seed_out.shape)
+        seed_delta[seed_valid] = (
+            flat_seed_out - anchor_out[seed_anchor]
+        ) / self.token_stride_m
+
+        anchor_sensor = torch.cat([
+            fa["sensor"] for fa in frame_anchor if fa is not None
+        ])
+        anchor_ref = torch.cat([
+            fa["ref"] for fa in frame_anchor if fa is not None
+        ])
+        frame_anchor_count = torch.tensor(
+            [0 if fa is None else int(fa["num_anchors"])
+             for fa in frame_anchor],
+            dtype=torch.long,
+            device=feat.device,
+        )
+        anchor_offset = torch.cumsum(frame_anchor_count, dim=0)
+        metadata = {
+            "box_assign": torch.where(
+                anchor_is_dyn, anchor_box, torch.full_like(anchor_box, -1)
+            ),
+            "instance_id": torch.where(
+                anchor_is_dyn, anchor_label, torch.full_like(anchor_label, -1)
+            ),
+            "is_dynamic": anchor_is_dyn,
+            "coord_ref": anchor_ref,
+            "coord_sensor": anchor_sensor,
+            "bbox_ref_by_frame": tm["bbox_ref_by_frame"],
+            "seed_ref": seed_ref,
+            "router_feature": router_feature,
+            "statistic_embedding": statistic_embedding,
+            "anchor_idx3": anchor_idx3,
+            "neighbor_count": neighbor_valid.sum(dim=-1),
+            **statistic_meta,
+        }
+        return anchor_feature, seed_out, seed_delta, anchor_offset, metadata
 
     @staticmethod
     def _adaptive_rope_scale(num_anchors, kv_anchor, kv_pos, query_anchor,
@@ -494,6 +1139,46 @@ class SphericalQueryHead(nn.Module):
 
         if A == 0:
             D = feat.shape[1]
+            if self.count_mode == "learned_gumbel":
+                zero_off = torch.zeros(
+                    n_frames, dtype=torch.long, device=device
+                )
+                empty_long = torch.zeros(0, dtype=torch.long, device=device)
+                empty_bool = torch.zeros(0, dtype=torch.bool, device=device)
+                empty_position = tok_pos.new_zeros(
+                    0, self.k_max, self.k_max, 3
+                )
+                empty_meta = {
+                    "box_assign": empty_long,
+                    "instance_id": empty_long,
+                    "is_dynamic": empty_bool,
+                    "coord_ref": tok_pos.new_zeros(0, 3),
+                    "coord_sensor": tok_pos.new_zeros(0, 3),
+                    "bbox_ref_by_frame": tm["bbox_ref_by_frame"],
+                    "seed_ref": empty_position.clone(),
+                    "router_feature": feat.new_zeros(0, self.router_dim),
+                    "statistic_embedding": feat.new_zeros(
+                        0, self.stat_embedding_dim
+                    ),
+                    "router_statistics": feat.new_zeros(0, 6),
+                    "anchor_raw_count": empty_long,
+                    "anchor_mean_range": tok_pos.new_zeros(0),
+                    "anchor_ray_capacity": tok_pos.new_zeros(0),
+                    "anchor_ray_capacity_known": empty_bool,
+                    "anchor_ray_fill_ratio_unclipped": tok_pos.new_zeros(0),
+                    "stat_valid": empty_bool,
+                    "valid_loo_count": empty_long,
+                    "solve_success": empty_bool,
+                    "loo_q10_m": tok_pos.new_zeros(0),
+                    "loo_q50_m": tok_pos.new_zeros(0),
+                    "loo_q90_m": tok_pos.new_zeros(0),
+                    "anchor_idx3": tok_pos.new_zeros(0, 3).long(),
+                    "neighbor_count": empty_long,
+                }
+                return (
+                    feat.new_zeros(0, D), empty_position,
+                    empty_position.clone(), zero_off, empty_meta,
+                )
             empty_meta = {
                 "box_assign": torch.zeros(0, dtype=torch.long, device=device),
                 "instance_id": torch.zeros(0, dtype=torch.long, device=device),
@@ -532,6 +1217,25 @@ class SphericalQueryHead(nn.Module):
         raw_rows = torch.cat(raw_rows)
         raw_anchor = torch.cat(raw_anchor)
         raw_token = raw_token_index[raw_rows]
+
+        if self.count_mode == "learned_gumbel":
+            return self._forward_learned(
+                feat,
+                tok_pos,
+                raw_point_sensor,
+                raw_rows,
+                raw_anchor,
+                raw_token,
+                tm,
+                frame_anchor,
+                anchor_base,
+                anchor_out,
+                anchor_label,
+                anchor_box,
+                anchor_is_dyn,
+                anchor_frame,
+                A,
+            )
 
         (
             _seed_sensor, query_anchor, query_token, seed_local_row,

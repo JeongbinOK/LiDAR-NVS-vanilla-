@@ -8,10 +8,10 @@ only boundary where the gaussian-generation semantics differ:
 
 * ``spherical`` runs the shared aggregator without grid seeds, then bins each
   frame's bbox-labelled raw points into spherical cells about its sensor
-  origin; every occupied (cell, label) group is a context anchor, while every
-  unique (anchor, supporting token) pair emits one raw-surface-seeded query
-  that attends only to own-frame tokens. Mixed boundary cells split into pure
-  bg/instance anchors.
+  origin. Mixed boundary cells split into pure bg/instance anchors. Its legacy
+  count mode emits one query per unique (anchor, supporting token); learned
+  count mode pools one feature per anchor and routes a hard-ST K-specific
+  observed range-quantile seed/head bank.
 * ``grid`` keeps each occupied Cartesian token as an anchor, runs the shared
   aggregator with its padded seed geometry, and expands each token through
   either the legacy metadata-selected K head or a learned hard
@@ -59,8 +59,9 @@ def build_spherical_gaussian_seeds(
     bbox,
     bbox_instance_ids,
     timestamps,
+    slot_head=None,
 ):
-    """Fuse tokens across frames, then run the own-frame spherical query head."""
+    """Fuse tokens, then run legacy queries or learned anchor-level K routing."""
     fused_feature, _coord_out, _seed_out, _seed_delta, agg_meta = temporal_aggregator(
         fused_feature,
         token_position,
@@ -90,6 +91,72 @@ def build_spherical_gaussian_seeds(
         token_ref=agg_meta.get("coord_ref"),
         bbox_ref_by_frame=agg_meta.get("bbox_ref_by_frame"),
     )
+    if getattr(query_head, "count_mode", "legacy") == "learned_gumbel":
+        if slot_head is None:
+            raise RuntimeError(
+                "learned spherical routing requires a K-specific slot head"
+            )
+        router_feature = metadata.get("router_feature")
+        if router_feature is None:
+            raise RuntimeError("learned spherical head did not return router_feature")
+        raw_params, packing = slot_head(
+            feature,
+            None,
+            delta,
+            frame_offset,
+            router_feature=router_feature,
+        )
+        expected_shape = (
+            feature.shape[0], slot_head.k_max, slot_head.k_max, 3
+        )
+        if tuple(position.shape) != expected_shape:
+            raise ValueError(
+                "learned spherical seed bank must have shape "
+                f"{expected_shape}, got {tuple(position.shape)}"
+            )
+        seed_ref = metadata.get("seed_ref")
+        if seed_ref is None or tuple(seed_ref.shape) != expected_shape:
+            raise ValueError(
+                "learned spherical seed_ref must match the candidate seed bank"
+            )
+        selection = packing.get("k_selection")
+        if selection is None:
+            raise RuntimeError("learned spherical slot head returned no K selection")
+        selected_index = packing["anchor_k"] - 1
+        anchor_rows = torch.arange(
+            feature.shape[0], device=feature.device
+        )
+        selected_position = position[anchor_rows, selected_index]
+        selected_ref = seed_ref[anchor_rows, selected_index]
+        anchor_index = packing["anchor_index"]
+        slot_index = packing["slot_index"]
+        packed_position = selected_position[anchor_index, slot_index]
+        packed_ref = selected_ref[anchor_index, slot_index]
+
+        routing_stats = {
+            "k_logits": packing["k_logits"].detach(),
+            "selected_k": packing["anchor_k"].detach(),
+        }
+        packed_metadata = {
+            "box_assign": metadata["box_assign"][anchor_index],
+            "instance_id": metadata["instance_id"][anchor_index],
+            "is_dynamic": metadata["is_dynamic"][anchor_index],
+            "coord_ref": packed_ref,
+            "bbox_ref_by_frame": metadata["bbox_ref_by_frame"],
+        }
+        gradient_weight = slot_head.gradient_weight(
+            packing["slot_k"], position.dtype
+        )
+        return GaussianSeedBatch(
+            feature=None,
+            position=packed_position,
+            frame_offset=packing["gaussian_offset"],
+            metadata=packed_metadata,
+            gradient_weight=gradient_weight,
+            raw_params=raw_params,
+            routing_stats=routing_stats,
+            routing_budget_logits=packing["k_logits"],
+        )
     return GaussianSeedBatch(
         feature=feature,
         position=position,

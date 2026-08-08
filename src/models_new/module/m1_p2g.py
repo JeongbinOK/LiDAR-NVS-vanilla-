@@ -115,12 +115,29 @@ class Point2Gaus(nn.Module):
             self.squery_head = SphericalQueryHead(
                 squery_cfg, dim=self.agg_mlp.out_dim,
                 r_far=float(getattr(cfg, "r_far", 70.0)),
+                ring_to_elevation_deg=getattr(
+                    cfg, "ring_to_elevation_deg", None
+                ),
             )
-            self.gs_predictor = nn.Sequential(
-                nn.Linear(trunk_dim + 3, trunk_dim),
-                nn.SiLU(),
-                nn.Linear(trunk_dim, gs_out_dim),
-            )
+            if self.squery_head.count_mode == "legacy":
+                self.gs_predictor = nn.Sequential(
+                    nn.Linear(trunk_dim + 3, trunk_dim),
+                    nn.SiLU(),
+                    nn.Linear(trunk_dim, gs_out_dim),
+                )
+            else:
+                from .grid_query_head import GridSlotHead
+
+                # Reuse the grid learned-count implementation exactly for
+                # hard Gumbel-ST routing, K-specific joint heads, opacity-gate
+                # router gradients, and per-K gradient balancing. Only its
+                # router input width differs: [f_anchor, e_statistic].
+                self.squery_slot_head = GridSlotHead(
+                    squery_cfg,
+                    cfg.gs_params,
+                    dim=self.agg_mlp.out_dim,
+                    router_dim=self.squery_head.router_dim,
+                )
         else:  # grid; validated by build_token_builder
             from .grid_query_head import GridSlotHead
 
@@ -336,6 +353,7 @@ class Point2Gaus(nn.Module):
                 bbox,
                 bbox_instance_ids,
                 _input.get("timestamps"),
+                slot_head=getattr(self, "squery_slot_head", None),
             )
         else:
             seeds = build_grid_gaussian_seeds(
@@ -356,8 +374,8 @@ class Point2Gaus(nn.Module):
                 target_timestamps=target_timestamps,
             )
 
-        # Spherical retains the shared predictor; grid's K-specific head already
-        # returns tensors in the exact split_gs_params layout.
+        # Legacy spherical retains the shared predictor. Grid and learned
+        # spherical already return tensors in the exact split_gs_params layout.
         if seeds.raw_params is None:
             if seeds.feature is None:
                 raise RuntimeError("Gaussian seeds provide neither features nor raw parameters")

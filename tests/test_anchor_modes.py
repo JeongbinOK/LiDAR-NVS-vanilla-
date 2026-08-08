@@ -13,6 +13,7 @@ from src.models_new.module.builders import (
 )
 from src.models_new.module.spherical_query_head import (
     SphericalQueryHead,
+    _range_quantile_seed_rows,
     _select_evidence_seeds,
 )
 from src.models_new.utils.attention import (
@@ -98,6 +99,241 @@ def _spherical_cfg():
         attn_chunk=32,
         ffn_ratio=4,
     )
+
+
+def _learned_spherical_cfg():
+    return SimpleNamespace(
+        count_mode="learned_gumbel",
+        max_kv=64,
+        token_stride_m=0.4,
+        dtheta_deg=4.5,
+        dphi_deg=3.0,
+        dlogr=0.18,
+        dr_m=0.8,
+        r_min=2.0,
+        r_max=110.0,
+        grad_balance="sqrt_k",
+        learned_count=SimpleNamespace(
+            K_max=4,
+            tau=1.0,
+            stat_embedding_dim=64,
+            stat_min_raw=6,
+            stat_min_valid_loo=3,
+            stat_loo_eps=1.0e-3,
+            stat_range_min_m=2.5,
+            stat_range_max_m=110.0,
+            stat_loo_knee_m=0.01,
+            stat_loo_cap_m=0.8,
+            ray_azimuth_count=1085,
+            local_attn_heads=8,
+            local_attn_layers=2,
+            local_ffn_ratio=4,
+            grad_balance_scope="token",
+        ),
+    )
+
+
+def _ring_elevations():
+    return [
+        -30.67, -29.33, -28.00, -26.66, -25.33, -24.00, -22.67, -21.33,
+        -20.00, -18.67, -17.33, -16.00, -14.67, -13.33, -12.00, -10.67,
+         -9.33,  -8.00,  -6.66,  -5.33,  -4.00,  -2.67,  -1.33,   0.00,
+          1.33,   2.67,   4.00,   5.33,   6.67,   8.00,   9.33,  10.67,
+    ]
+
+
+def test_learned_spherical_statistics_use_expected_ray_capacity_and_log_loo():
+    torch.manual_seed(21)
+    head = SphericalQueryHead(
+        _learned_spherical_cfg(),
+        dim=48,
+        r_far=110.0,
+        ring_to_elevation_deg=_ring_elevations(),
+    )
+    # Six rays intersect the exact plane x=10 inside one angular/radial cell.
+    raw_points = torch.tensor([
+        [10.0, 0.15, 0.15], [10.0, 0.25, 0.15], [10.0, 0.35, 0.15],
+        [10.0, 0.15, 0.35], [10.0, 0.25, 0.35], [10.0, 0.35, 0.35],
+    ])
+    token_position = torch.tensor([
+        [10.0, 0.2, 0.2], [10.0, 0.3, 0.3],
+    ])
+    feature = torch.randn(2, 48, requires_grad=True)
+    pose = torch.eye(4).unsqueeze(0)
+    empty_box = torch.empty(0, 7)
+    empty_iid = torch.empty(0, dtype=torch.long)
+
+    anchor_feature, seed_bank, delta_bank, anchor_offset, metadata = head(
+        feature,
+        token_position,
+        raw_points,
+        torch.tensor([0, 0, 0, 1, 1, 1]),
+        torch.tensor([2]),
+        torch.tensor([0]),
+        [pose],
+        [[empty_box]],
+        [[empty_iid]],
+    )
+    assert anchor_feature.shape == (1, 48)
+    assert seed_bank.shape == delta_bank.shape == (1, 4, 4, 3)
+    assert anchor_offset.tolist() == [1]
+    assert metadata["router_feature"].shape == (1, 112)
+    assert metadata["neighbor_count"].tolist() == [1]
+    assert metadata["stat_valid"].tolist() == [True]
+    statistic = metadata["router_statistics"][0]
+    capacity = metadata["anchor_ray_capacity"][0]
+    # The occupied theta bin contains four physical rings. Its capacity uses
+    # the phase-independent expectation 4 * 1085/120, not an arbitrary 9/10
+    # integer azimuth-column allocation.
+    torch.testing.assert_close(
+        capacity, torch.tensor(4.0 * 1085.0 / 120.0)
+    )
+    torch.testing.assert_close(statistic[0], 6.0 / capacity)
+    expected_range = (
+        raw_points.norm(dim=-1).mean() - 2.5
+    ) / (110.0 - 2.5)
+    torch.testing.assert_close(statistic[1], expected_range)
+    assert statistic[2:5].abs().max() < 1.0e-8
+    assert statistic[5].item() == 1.0
+
+    # Every active K-row seed is a real observed point; padded slots are zero.
+    for k in range(1, 5):
+        for slot in range(k):
+            assert bool((raw_points == seed_bank[0, k - 1, slot]).all(dim=1).any())
+        torch.testing.assert_close(
+            seed_bank[0, k - 1, k:],
+            torch.zeros_like(seed_bank[0, k - 1, k:]),
+        )
+
+
+def test_learned_spherical_loo_log_normalization_has_physical_knee_and_cap():
+    head = SphericalQueryHead(
+        _learned_spherical_cfg(),
+        dim=48,
+        r_far=110.0,
+        ring_to_elevation_deg=_ring_elevations(),
+    )
+    residual_m = torch.tensor([0.0, 0.01, 0.10, 0.80, 2.00], dtype=torch.float64)
+    normalized = head._normalize_loo_statistic(residual_m)
+    expected = torch.log1p(
+        residual_m.clamp(max=0.8) / 0.01
+    ) / torch.log1p(torch.tensor(0.8 / 0.01, dtype=torch.float64))
+    torch.testing.assert_close(normalized, expected)
+    assert normalized[0].item() == 0.0
+    assert normalized[-1].item() == 1.0
+
+
+def test_learned_spherical_seed_rows_match_grid_range_quantiles():
+    # Input/anchor order is deliberately interleaved and not range-sorted.
+    # Every selected row is observed, and K-specific ranks match Grid mode.
+    points = torch.tensor([
+        [4.0, 0.0, 0.0],
+        [10.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [5.0, 0.0, 0.0],
+        [3.0, 0.0, 0.0],
+        [2.0, 0.0, 0.0],
+    ])
+    rows = _range_quantile_seed_rows(
+        points,
+        torch.tensor([0, 1, 0, 1, 0, 0]),
+        num_anchors=2,
+        k_max=4,
+    )
+    assert rows[0, 0, :1].tolist() == [4]          # r = 3
+    assert rows[0, 1, :2].tolist() == [5, 0]       # r = 2, 4
+    assert rows[0, 2, :3].tolist() == [2, 4, 0]    # r = 1, 3, 4
+    assert rows[0, 3, :4].tolist() == [2, 5, 4, 0]
+    # N_raw=2 < K repeats real points, exactly like Grid mode.
+    assert rows[1, 3, :4].tolist() == [3, 3, 1, 1]
+
+
+def test_learned_spherical_router_uses_statistics_but_k_head_uses_anchor_feature():
+    from src.models_new.module.grid_query_head import GridSlotHead
+
+    cfg = _learned_spherical_cfg()
+    head = SphericalQueryHead(
+        cfg, dim=48, r_far=110.0,
+        ring_to_elevation_deg=_ring_elevations(),
+    )
+    slot_head = GridSlotHead(
+        cfg,
+        SimpleNamespace(shs=2, opacity=1, scaling=3, rotation=4, offset=3),
+        dim=48,
+        router_dim=head.router_dim,
+    ).eval()
+    # Deterministically select K=3 in eval mode.
+    with torch.no_grad():
+        slot_head.count_predictor[-1].bias[2] = 5.0
+
+    class IdentityTemporalAggregator:
+        def __call__(self, feat, position, seed, delta, *args):
+            return feat, position, None, None, {}
+
+    raw_points = torch.tensor([
+        [10.0, 0.15, 0.15], [10.0, 0.25, 0.15], [10.0, 0.35, 0.15],
+        [10.0, 0.15, 0.35], [10.0, 0.25, 0.35], [10.0, 0.35, 0.35],
+    ])
+    token_position = torch.tensor([
+        [10.0, 0.2, 0.2], [10.0, 0.3, 0.3],
+    ])
+    feature = torch.randn(2, 48, requires_grad=True)
+    pose = torch.eye(4).unsqueeze(0)
+    seeds = build_spherical_gaussian_seeds(
+        IdentityTemporalAggregator(),
+        head,
+        feature,
+        token_position,
+        raw_points,
+        torch.tensor([0, 0, 0, 1, 1, 1]),
+        torch.tensor([2]),
+        torch.tensor([0]),
+        [pose],
+        [[torch.empty(0, 7)]],
+        [[torch.empty(0, dtype=torch.long)]],
+        None,
+        slot_head=slot_head,
+    )
+    assert seeds.feature is None and seeds.raw_params.shape == (3, 13)
+    assert seeds.position.shape == (3, 3)
+    assert seeds.frame_offset.tolist() == [3]
+    assert seeds.routing_stats["selected_k"].tolist() == [3]
+    # The Gaussian trunk contract remains D + 3*Kmax, not router_dim + 3*Kmax.
+    assert slot_head.trunk[0].in_features == 48 + 3 * 4
+    assert slot_head.count_predictor[0].in_features == 48 + 64
+
+    # In training, the selected activated-opacity ST gate must connect render
+    # loss back through the statistic MLP and count router.
+    slot_head.train()
+    with torch.no_grad():
+        slot_head.count_predictor[-1].weight.copy_(
+            torch.linspace(
+                -0.02, 0.02,
+                slot_head.count_predictor[-1].weight.numel(),
+            ).reshape_as(slot_head.count_predictor[-1].weight)
+        )
+    torch.manual_seed(22)
+    train_seeds = build_spherical_gaussian_seeds(
+        IdentityTemporalAggregator(),
+        head,
+        feature,
+        token_position,
+        raw_points,
+        torch.tensor([0, 0, 0, 1, 1, 1]),
+        torch.tensor([2]),
+        torch.tensor([0]),
+        [pose],
+        [[torch.empty(0, 7)]],
+        [[torch.empty(0, dtype=torch.long)]],
+        None,
+        slot_head=slot_head,
+    )
+    torch.sigmoid(train_seeds.raw_params[:, 2:3]).sum().backward()
+    assert slot_head.count_predictor[-1].weight.grad is not None
+    assert slot_head.count_predictor[-1].weight.grad.abs().sum() > 0
+    assert head.stat_encoder[0].weight.grad is not None
+    assert head.stat_encoder[0].weight.grad.abs().sum() > 0
+    assert feature.grad is not None and feature.grad.abs().sum() > 0
 
 
 class _CaptureSeedAttention(nn.Module):

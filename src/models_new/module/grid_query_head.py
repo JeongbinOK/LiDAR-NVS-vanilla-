@@ -643,9 +643,16 @@ class GridSlotHead(nn.Module):
     deferred until the renderer constructs ``Common union Additional_view``.
     """
 
-    def __init__(self, cfg, gs_params, dim):
+    def __init__(self, cfg, gs_params, dim, router_dim=None):
         super().__init__()
         self.dim = int(dim)
+        # Grid uses the Gaussian/content feature itself for routing.  Spherical
+        # learned routing supplies ``[anchor_feature, statistic_embedding]``
+        # instead, while deliberately keeping the Gaussian K-head input at
+        # ``anchor_feature``.  The default preserves every existing grid shape.
+        self.router_dim = self.dim if router_dim is None else int(router_dim)
+        if self.router_dim <= 0:
+            raise ValueError("router_dim must be positive")
         self.count_mode = str(getattr(cfg, "count_mode", "legacy")).lower()
         learned_count = None
         if self.count_mode == "legacy":
@@ -726,7 +733,7 @@ class GridSlotHead(nn.Module):
 
         if self.count_mode == "learned_gumbel":
             self.count_predictor = nn.Sequential(
-                nn.Linear(self.dim, self.dim),
+                nn.Linear(self.router_dim, self.dim),
                 nn.SiLU(),
                 nn.Linear(self.dim, self.k_max),
             )
@@ -911,7 +918,10 @@ class GridSlotHead(nn.Module):
         selected = logits.argmax(dim=-1)
         return F.one_hot(selected, num_classes=self.k_max).to(dtype=logits.dtype)
 
-    def _forward_learned(self, anchor_feature, anchor_k, delta_p, anchor_offset):
+    def _forward_learned(
+        self, anchor_feature, anchor_k, delta_p, anchor_offset,
+        router_feature=None,
+    ):
         if anchor_k is not None:
             raise ValueError(
                 "learned_gumbel predicts anchor_k after temporal fusion; "
@@ -926,7 +936,15 @@ class GridSlotHead(nn.Module):
                 f"{expected_delta_shape}, got {tuple(delta_p.shape)}"
             )
 
-        logits = self.count_predictor(anchor_feature)
+        if router_feature is None:
+            router_feature = anchor_feature
+        expected_router_shape = (anchor_feature.shape[0], self.router_dim)
+        if tuple(router_feature.shape) != expected_router_shape:
+            raise ValueError(
+                "router_feature must have shape "
+                f"{expected_router_shape}, got {tuple(router_feature.shape)}"
+            )
+        logits = self.count_predictor(router_feature)
         selection = self._gumbel_selection(logits)
         selected_index = selection.argmax(dim=-1).to(torch.long)
         selected_k = selected_index + 1
@@ -1313,16 +1331,24 @@ class GridSlotHead(nn.Module):
     def forward(
         self, anchor_feature, anchor_k, delta_p, anchor_offset,
         target_pose=None, anchor_batch=None, anchor_position_ref=None,
+        router_feature=None,
     ):
         if self.count_mode == "learned_gumbel_viewpt":
+            if router_feature is not None:
+                raise ValueError(
+                    "learned_gumbel_viewpt builds its own target-view router feature"
+                )
             return self._forward_viewpoint(
                 anchor_feature, anchor_k, delta_p, anchor_offset,
                 target_pose, anchor_batch, anchor_position_ref,
             )
         if self.count_mode == "learned_gumbel":
             return self._forward_learned(
-                anchor_feature, anchor_k, delta_p, anchor_offset
+                anchor_feature, anchor_k, delta_p, anchor_offset,
+                router_feature=router_feature,
             )
+        if router_feature is not None:
+            raise ValueError("router_feature is only valid for learned count routing")
         return self._forward_legacy(
             anchor_feature, anchor_k, delta_p, anchor_offset
         )
