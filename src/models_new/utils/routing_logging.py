@@ -1,4 +1,4 @@
-"""Detached, fixed-size statistics for learned grid-count routing."""
+"""Detached, fixed-size statistics for learned grid/spherical count routing."""
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
@@ -18,20 +18,19 @@ def _validated_range_edges(range_edges_m: Sequence[float]) -> tuple[float, ...]:
 
 def routing_sufficient_statistics(
     routing: Mapping[str, torch.Tensor],
-    range_edges_m: Sequence[float],
+    range_edges_m: Sequence[float] | None = None,
+    *,
+    include_breakdowns: bool = True,
 ) -> dict[str, torch.Tensor]:
-    """Summarize token routing without retaining or changing its autograd graph.
+    """Summarize learned-count routing without retaining its autograd graph.
 
-    ``range_edges_m`` are lower bounds. For example ``[0, 10, 20]`` creates
-    ``[0, 10)``, ``[10, 20)``, and ``[20, inf)`` bins.
+    The global K distribution is always produced. Grid mode can additionally
+    request its historical range and bg/fg breakdowns; spherical mode keeps the
+    W&B surface intentionally small and needs only ``k_logits``/``selected_k``.
     """
-    edges = _validated_range_edges(range_edges_m)
-
     with torch.no_grad():
         logits = routing["k_logits"].detach().float()
         selected_k = routing["selected_k"].detach().long()
-        token_position_sensor = routing["token_position_sensor"].detach().float()
-        is_dynamic = routing["is_dynamic"].detach().bool()
 
         if logits.ndim != 2 or logits.shape[1] < 2:
             raise ValueError("routing k_logits must have shape (N, K) with K >= 2")
@@ -39,14 +38,7 @@ def routing_sufficient_statistics(
         expected_shape = (token_count,)
         if tuple(selected_k.shape) != expected_shape:
             raise ValueError("routing selected_k must align with k_logits")
-        if tuple(token_position_sensor.shape) != (token_count, 3):
-            raise ValueError(
-                "routing token_position_sensor must have shape (N, 3)"
-            )
-        if tuple(is_dynamic.shape) != expected_shape:
-            raise ValueError("routing is_dynamic must align with k_logits")
 
-        device = logits.device
         dtype = logits.dtype
         argmax_k = logits.argmax(dim=-1) + 1
         selected_index = selected_k - 1
@@ -61,6 +53,31 @@ def routing_sufficient_statistics(
         argmax_counts = torch.bincount(
             argmax_k - 1, minlength=k_max
         ).to(dtype)
+        statistics = {
+            # Keep the historical key for compatibility; in spherical mode
+            # the counted units are labelled-cell anchors rather than tokens.
+            "token_count": logits.new_tensor(float(token_count)),
+            "selected_counts": selected_counts,
+            "argmax_counts": argmax_counts,
+            "sampled_k_sum": selected_k.to(dtype).sum(),
+            "argmax_k_sum": argmax_k.to(dtype).sum(),
+        }
+        if not include_breakdowns:
+            return statistics
+
+        if range_edges_m is None:
+            raise ValueError("range_edges_m is required for routing breakdowns")
+        edges = _validated_range_edges(range_edges_m)
+        token_position_sensor = routing["token_position_sensor"].detach().float()
+        is_dynamic = routing["is_dynamic"].detach().bool()
+        if tuple(token_position_sensor.shape) != (token_count, 3):
+            raise ValueError(
+                "routing token_position_sensor must have shape (N, 3)"
+            )
+        if tuple(is_dynamic.shape) != expected_shape:
+            raise ValueError("routing is_dynamic must align with k_logits")
+
+        device = logits.device
         ranges = token_position_sensor.norm(dim=-1)
         boundaries = torch.tensor(
             edges[1:], device=device, dtype=ranges.dtype
@@ -98,12 +115,7 @@ def routing_sufficient_statistics(
         group_argmax_counts = torch.bincount(
             group_argmax_flat, minlength=2 * k_max
         ).to(dtype).reshape(2, k_max)
-        return {
-            "token_count": logits.new_tensor(float(token_count)),
-            "selected_counts": selected_counts,
-            "argmax_counts": argmax_counts,
-            "sampled_k_sum": selected_k.to(dtype).sum(),
-            "argmax_k_sum": argmax_k.to(dtype).sum(),
+        statistics.update({
             "range_token_counts": range_token_counts,
             "range_sampled_k_sums": range_sampled_k_sums,
             "range_argmax_k_sums": range_argmax_k_sums,
@@ -112,7 +124,8 @@ def routing_sufficient_statistics(
             "group_argmax_k_sums": group_argmax_k_sums,
             "group_selected_counts": group_selected_counts,
             "group_argmax_counts": group_argmax_counts,
-        }
+        })
+        return statistics
 
 
 def distributed_sum_statistics(

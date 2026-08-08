@@ -73,48 +73,58 @@ class ModelWrapper(LightningModule):
         self._metric_interval = int(self._cfg_get("metrics.interval", 50))
         if self._metric_interval <= 0:
             raise ValueError("metrics.interval must be positive")
+        anchor_mode = str(
+            self._cfg_get("p2g.anchor_mode", "spherical")
+        ).lower()
+        routing_block = (
+            "p2g.squery" if anchor_mode == "spherical" else "p2g.grid_query"
+        )
+        self._routing_unit_name = (
+            "anchor" if anchor_mode == "spherical" else "token"
+        )
+        learned_count_block = f"{routing_block}.learned_count"
+        routing_count_mode = str(
+            self._cfg_get(f"{routing_block}.count_mode", "legacy")
+        ).lower()
         self._routing_logging_enable = bool(self._cfg_get(
-            "p2g.grid_query.learned_count.logging.enable", False
+            f"{learned_count_block}.logging.enable", False
         ))
         self._routing_logging_interval = int(self._cfg_get(
-            "p2g.grid_query.learned_count.logging.interval", 20
+            f"{learned_count_block}.logging.interval", 20
         ))
         self._routing_range_edges = tuple(float(value) for value in self._cfg_get(
-            "p2g.grid_query.learned_count.logging.range_edges_m",
+            f"{learned_count_block}.logging.range_edges_m",
             (0, 10, 20, 30, 40, 60, 80, 110),
         ))
         if self._routing_logging_interval <= 0:
             raise ValueError(
-                "p2g.grid_query.learned_count.logging.interval must be positive"
+                "learned_count.logging.interval must be positive"
             )
         # Validates lower-bound ordering once, before the first train batch.
         range_bin_labels(self._routing_range_edges)
         self._last_train_routing_step = -1
         budget_requested = bool(self._cfg_get(
-            "p2g.grid_query.learned_count.budget.enable", False
+            f"{learned_count_block}.budget.enable", False
         ))
         self._budget_enable = (
             budget_requested
-            and str(self._cfg_get("p2g.anchor_mode", "spherical")).lower() == "grid"
-            and str(
-                self._cfg_get("p2g.grid_query.count_mode", "legacy")
-            ).lower() in ("learned_gumbel", "learned_gumbel_viewpt")
+            and routing_count_mode in ("learned_gumbel", "learned_gumbel_viewpt")
         )
         self._budget_target_mean_k = float(self._cfg_get(
-            "p2g.grid_query.learned_count.budget.target_mean_k", 2.0
+            f"{learned_count_block}.budget.target_mean_k", 2.0
         ))
         self._budget_weight = float(self._cfg_get(
-            "p2g.grid_query.learned_count.budget.weight", 1.0
+            f"{learned_count_block}.budget.weight", 1.0
         ))
         self._budget_warmup_steps = int(self._cfg_get(
-            "p2g.grid_query.learned_count.budget.warmup_steps", 500
+            f"{learned_count_block}.budget.warmup_steps", 500
         ))
         self._budget_ramp_steps = int(self._cfg_get(
-            "p2g.grid_query.learned_count.budget.ramp_steps", 1000
+            f"{learned_count_block}.budget.ramp_steps", 1000
         ))
         if self._budget_enable:
             budget_k_max = int(self._cfg_get(
-                "p2g.grid_query.learned_count.K_max", 0
+                f"{learned_count_block}.K_max", 0
             ))
             if not 1.0 <= self._budget_target_mean_k <= float(budget_k_max):
                 raise ValueError(
@@ -348,14 +358,16 @@ class ModelWrapper(LightningModule):
             self._last_train_routing_step = step
 
         statistics = routing_sufficient_statistics(
-            routing, self._routing_range_edges
+            routing,
+            self._routing_range_edges,
+            include_breakdowns=self._routing_unit_name == "token",
         )
         statistics = distributed_sum_statistics(statistics)
-        token_count = statistics["token_count"]
-        if not bool((token_count > 0).item()):
+        unit_count = statistics["token_count"]
+        if not bool((unit_count > 0).item()):
             return
 
-        base_batch_size = max(1, int(token_count.item()))
+        base_batch_size = max(1, int(unit_count.item()))
 
         def log_value(name, value, *, batch_size=base_batch_size):
             self.log(
@@ -370,28 +382,37 @@ class ModelWrapper(LightningModule):
         log_value("gaussians", statistics["sampled_k_sum"])
         log_value(
             "sampled/mean_k",
-            statistics["sampled_k_sum"] / token_count,
+            statistics["sampled_k_sum"] / unit_count,
         )
         log_value(
             "argmax/mean_k",
-            statistics["argmax_k_sum"] / token_count,
+            statistics["argmax_k_sum"] / unit_count,
         )
-
         k_max = int(statistics["selected_counts"].numel())
         for index in range(k_max):
             k = index + 1
             log_value(
                 f"sampled/frac_k{k}",
-                statistics["selected_counts"][index] / token_count,
+                statistics["selected_counts"][index] / unit_count,
             )
             log_value(
                 f"argmax/frac_k{k}",
-                statistics["argmax_counts"][index] / token_count,
+                statistics["argmax_counts"][index] / unit_count,
             )
+
+        # Spherical routing only needs a coarse collapse/learning check in W&B:
+        # global mean K and per-K sampled/argmax fractions. Keep the historical
+        # range and bg/fg diagnostics for Grid without computing them for anchors.
+        if self._routing_unit_name == "anchor":
+            return
+
         range_labels = range_bin_labels(self._routing_range_edges)
         for index, label in enumerate(range_labels):
             count = statistics["range_token_counts"][index]
-            log_value(f"range/{label}/token_frac", count / token_count)
+            log_value(
+                f"range/{label}/{self._routing_unit_name}_frac",
+                count / unit_count,
+            )
             if not bool((count > 0).item()):
                 continue
             bin_batch_size = int(count.item())
@@ -408,7 +429,10 @@ class ModelWrapper(LightningModule):
 
         for group_index, group_name in enumerate(("bg", "fg")):
             count = statistics["group_token_counts"][group_index]
-            log_value(f"{group_name}/token_frac", count / token_count)
+            log_value(
+                f"{group_name}/{self._routing_unit_name}_frac",
+                count / unit_count,
+            )
             if not bool((count > 0).item()):
                 continue
             group_batch_size = int(count.item())
