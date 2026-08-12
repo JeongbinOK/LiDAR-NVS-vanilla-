@@ -1,13 +1,13 @@
-device: [8, 9]
+device: [4, 5, 6, 7]
 seed: 42
 
 project_name: 2dgs-utonia
-exp_name:  ${p2g.anchor_mode}-bs-${train.batch_size}-vpt
+exp_name:  ${p2g.anchor_mode}-bs-${train.batch_size}-n-cd
 mode: train
 
 
 loss:
-  w_chamfer: 0.02
+  w_chamfer: 0 #0.02
   w_depth: 0.5          # depth supervision = 0.5 * mean-depth L1
   w_depth_median: 0.5   #                   + 0.5 * median-depth L1
   w_intensity: 0.2
@@ -141,7 +141,7 @@ p2g:
   grid_query:                   # 공유 temporal fusion(bg_radius_m/bg_max_kv_per_frame/
                                 # num_heads/bg_layers/fg_layers는 양 모드 사용) +
                                 # grid mode 전용 K routing/head 설정
-    count_mode: learned_gumbel_viewpt  # legacy | learned_gumbel | learned_gumbel_viewpt
+    count_mode: learned_gumbel  # legacy | learned_gumbel | learned_gumbel_viewpt
     K_max: 3                    # legacy only: occupied 0.4m cell당 최대 Gaussian 수
     points_per_gaussian: 4      # legacy exp=null only: K_i=ceil(raw_count/this), capped by K_max
     exp: 1                      # legacy only: null=raw-count range quantile;
