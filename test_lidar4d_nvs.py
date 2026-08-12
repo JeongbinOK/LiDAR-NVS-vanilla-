@@ -23,6 +23,7 @@ import json
 import os
 import random
 from collections import defaultdict
+from collections.abc import Mapping
 from pathlib import Path
 
 import numpy as np
@@ -45,15 +46,92 @@ from src.eval.gaussian_stats import collect_window_stats, analyze_gaussian_sizes
 from src.models_new.utils.graphics_utils import lidar4d_range_image_to_points
 from src.models_new.utils.render import visualize_depth
 
-CONFIG_PATH = os.environ.get(
-    "UTONIA_CONFIG_PATH",
-    "/data1/jeongbin/utonia/config/nuscene_train.yaml",
-)
+DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent / "config/nuscene_train.yaml"
+# W&B omits empty root mappings. GausTemp has no tunable config, but
+# ModelWrapper still accesses cfg.g2g during construction.
+MODEL_STRUCTURAL_DEFAULTS = {"g2g": {}}
 RAYDROP_THRESHOLD = 0.5
 EVAL_MAX_DEPTH_M = 80.0
 
 
 # ---------------------------------------------------------------------------
+def _is_experiment_config(value) -> bool:
+    """Return whether ``value`` has the minimum model/data config contract."""
+    if OmegaConf.is_config(value):
+        value = OmegaConf.to_container(value, resolve=False)
+    return isinstance(value, Mapping) and "p2g" in value and "data" in value
+
+
+def _as_experiment_config(value):
+    """Normalize common Lightning checkpoint config wrappers to an OmegaConf."""
+    if OmegaConf.is_config(value):
+        value = OmegaConf.to_container(value, resolve=False)
+    if not isinstance(value, Mapping):
+        return None
+
+    # Lightning projects commonly store the full config under one of these
+    # keys. If the object is already the experiment config, use it directly.
+    for key in ("cfg", "config", "hparams"):
+        nested = value.get(key)
+        if _is_experiment_config(nested):
+            value = nested
+            break
+
+    if not _is_experiment_config(value):
+        return None
+    config = dict(value)
+    config.pop("_wandb", None)
+    return OmegaConf.create(config)
+
+
+def _checkpoint_config_from_wandb(checkpoint: Path):
+    """Read the W&B config stored beside this checkpoint's training run."""
+    config_file = checkpoint.parent / "wandb/latest-run/files/config.yaml"
+    if not config_file.is_file():
+        raise FileNotFoundError(
+            "Checkpoint evaluation needs its run-local W&B config, but it was "
+            f"not found: {config_file}"
+        )
+
+    raw = OmegaConf.to_container(OmegaConf.load(config_file), resolve=False)
+    if not isinstance(raw, Mapping):
+        raise RuntimeError(f"Unexpected W&B config format: {config_file}")
+    # W&B serializes each root key as {value: ...}; restore the original
+    # experiment config before constructing ModelWrapper.
+    unwrapped = {
+        key: value["value"]
+        if isinstance(value, Mapping) and "value" in value
+        else value
+        for key, value in raw.items()
+        if key != "_wandb"
+    }
+    config = _as_experiment_config(unwrapped)
+    if config is None:
+        raise RuntimeError(
+            f"W&B config does not contain a valid model/data config: {config_file}"
+        )
+    config = OmegaConf.merge(OmegaConf.create(MODEL_STRUCTURAL_DEFAULTS), config)
+    return config, f"W&B config artifact: {config_file.resolve()}"
+
+
+def resolve_eval_config(cli):
+    """Choose a reproducible base config before merging evaluator CLI overrides.
+
+    A checkpoint always uses the W&B config from the same experiment directory:
+    ``<checkpoint parent>/wandb/latest-run/files/config.yaml``. A missing
+    artifact is an error rather than an unsafe fallback to the checkout's
+    currently edited training YAML.
+    """
+    ckpt_value = OmegaConf.select(cli, "test.ckpt_path", default=None)
+    if ckpt_value:
+        checkpoint = Path(str(ckpt_value)).expanduser().resolve()
+        if not checkpoint.is_file():
+            raise FileNotFoundError(f"Checkpoint does not exist: {checkpoint}")
+        return _checkpoint_config_from_wandb(checkpoint)
+
+    return OmegaConf.load(DEFAULT_CONFIG_PATH), f"default config: {DEFAULT_CONFIG_PATH}"
+
+
 def to_device(obj, device):
     """Move all tensors (leave Camera/other objects untouched -- render moves
     their tensors internally)."""
@@ -68,7 +146,7 @@ def to_device(obj, device):
     return obj
 
 
-def load_model(cfg, ckpt_path, device):
+def load_model(cfg, ckpt_path, device, *, allow_checkpoint_mismatch=False):
     model = ModelWrapper(cfg)
     if ckpt_path:
         blob = torch.load(ckpt_path, map_location="cpu")
@@ -76,6 +154,12 @@ def load_model(cfg, ckpt_path, device):
         missing, unexpected = model.load_state_dict(state, strict=False)
         print(f"[ckpt] {ckpt_path}\n       loaded "
               f"(missing={len(missing)}, unexpected={len(unexpected)})")
+        if (missing or unexpected) and not allow_checkpoint_mismatch:
+            raise RuntimeError(
+                "Checkpoint/config mismatch. Refusing to evaluate partial weights; "
+                "pass allow_checkpoint_mismatch=true only for an intentional "
+                f"ablation. missing={list(missing)}, unexpected={list(unexpected)}"
+            )
     else:
         print("[ckpt] WARNING: no checkpoint -> randomly initialized weights")
     model.eval().to(device)
@@ -157,7 +241,7 @@ def summarize(window_metrics):
 
 # ---------------------------------------------------------------------------
 @torch.no_grad()
-def main(cfg):
+def main(cfg, config_source="unspecified"):
     seed = int(cfg.get("seed", 0))
     random.seed(seed)
     np.random.seed(seed)
@@ -169,11 +253,15 @@ def main(cfg):
     out_dir = Path(str(cfg.get("out_dir", os.path.join(cfg.logger.dir, "lidar4d_eval"))))
     viz_dir = out_dir / "viz"
     viz_dir.mkdir(parents=True, exist_ok=True)
+    effective_config_path = out_dir / "effective_config.yaml"
+    OmegaConf.save(config=cfg, f=str(effective_config_path), resolve=False)
 
     print(
         f"[setup] device={device} seed={seed} "
         f"mode={cfg.data.mode} out_dir={out_dir}"
     )
+    print(f"[config] source={config_source}")
+    print(f"[config] effective={effective_config_path}")
     print("[setup] scale_factor=1.0 (depth already in meters; GS-LiDAR rescale N/A)")
     depth_statistic = str(cfg.get("depth_statistic", "median")).lower()
     depth_key = {"mean": "depth", "median": "depth_median"}.get(depth_statistic)
@@ -187,7 +275,12 @@ def main(cfg):
         f"metric_clamp=[1e-6,{EVAL_MAX_DEPTH_M:g}]m"
     )
 
-    model = load_model(cfg, cfg.test.ckpt_path, device)
+    model = load_model(
+        cfg,
+        cfg.test.ckpt_path,
+        device,
+        allow_checkpoint_mismatch=bool(cfg.get("allow_checkpoint_mismatch", False)),
+    )
     backends = MetricBackends(lpips_net="alex")
 
     dataset = LiDAR4DNuScenesTestDataset(cfg.data, split=cfg.data.test_split)
@@ -347,6 +440,8 @@ def main(cfg):
         "config": {"ckpt": cfg.test.ckpt_path, "mode": cfg.data.mode,
                    "version": cfg.data.version, "scale_factor": 1.0,
                    "seed": seed,
+                   "source": config_source,
+                   "effective_config": str(effective_config_path),
                    "depth_statistic": depth_statistic,
                    "max_depth_m": EVAL_MAX_DEPTH_M,
                    "gt_range_policy": "clamp_positive_returns",
@@ -387,8 +482,8 @@ def main(cfg):
 
 
 if __name__ == "__main__":
-    base = OmegaConf.load(CONFIG_PATH)
     cli = OmegaConf.from_cli()
+    base, config_source = resolve_eval_config(cli)
     cfg = OmegaConf.merge(base, cli)
     cfg.mode = "test"
-    main(cfg)
+    main(cfg, config_source=config_source)
