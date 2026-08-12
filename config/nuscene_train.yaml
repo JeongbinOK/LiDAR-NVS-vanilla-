@@ -1,4 +1,5 @@
 device: [8, 9]
+seed: 42
 
 project_name: 2dgs-utonia
 exp_name:  ${p2g.anchor_mode}-bs-${train.batch_size}-vpt

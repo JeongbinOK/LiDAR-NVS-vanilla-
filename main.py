@@ -18,7 +18,7 @@ import torch.multiprocessing as mp
 # also applies in every DDP subprocess Lightning relaunches.
 mp.set_sharing_strategy("file_system")
 from torch.utils.data import DataLoader
-from lightning.pytorch import Trainer
+from lightning.pytorch import Trainer, seed_everything
 from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers.wandb import WandbLogger
 from lightning.pytorch.plugins.environments import SLURMEnvironment
@@ -42,6 +42,7 @@ def print_run_summary(cfg):
     print(
         "Run: "
         f"mode={cfg.mode}, "
+        f"seed={cfg.seed}, "
         f"devices={list(cfg.device)}, "
         f"train_batch_size={cfg.train.batch_size}, "
         f"val_check_interval={cfg.train.val_check_interval}, "
@@ -51,6 +52,9 @@ def print_run_summary(cfg):
 
 
 def main(cfg):
+    # Seed before logger, model, and DataModule construction so initialization,
+    # Gumbel sampling, data shuffling, and DataLoader workers are reproducible.
+    seed_everything(int(cfg.seed), workers=True)
     os.makedirs(cfg.logger.dir, exist_ok=True)
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     callbacks = []
@@ -103,9 +107,6 @@ def main(cfg):
         max_steps=cfg.train.max_steps,
         precision = "32"
     )
-    #torch.manual_seed(cfg_dict.seed + trainer.global_rank)
-
-
     model_wrapper = ModelWrapper(cfg)
     dataset = dataset_dict[cfg.data.dataset_name]
     datamodule = DataModule(dataset, cfg)
