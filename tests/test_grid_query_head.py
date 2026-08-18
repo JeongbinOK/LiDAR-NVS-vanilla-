@@ -197,6 +197,7 @@ def test_grid_builder_returns_frame_local_seeds_and_spherical_placeholder():
     )
     seed_data = grid_out.grid_seeds
     assert grid_out.raw_memberships is None
+    assert grid_out.router_guides is None
     assert len(seed_data) == 2
     torch.testing.assert_close(seed_data[0].seed_sensor[0, 0], lidar_points[1, :3])
     torch.testing.assert_close(seed_data[1].seed_sensor[0, 0], lidar_points[3, :3])
@@ -207,6 +208,7 @@ def test_grid_builder_returns_frame_local_seeds_and_spherical_placeholder():
         lidar_points, offset, None, features, ptv3_input, _UnitMapper()
     )
     assert spherical_out.grid_seeds is None
+    assert spherical_out.router_guides is None
     assert len(spherical_out.raw_memberships) == 2
     for frame, membership in enumerate(spherical_out.raw_memberships):
         start = 2 * frame
@@ -214,6 +216,64 @@ def test_grid_builder_returns_frame_local_seeds_and_spherical_placeholder():
             membership.points_sensor, lidar_points[start:start + 2, :3]
         )
         assert membership.token_index.tolist() == [0, 0]
+
+
+def test_grid_builder_computes_guide_from_exact_occupied_token_membership():
+    learned_count = SimpleNamespace(
+        K_max=3,
+        tau=1.0,
+        seed_mode="range_quantile",
+        pseudo_gt=SimpleNamespace(
+            enable=True,
+            thresholds_m=[0.001, 0.01],
+            min_raw_points=3,
+            loo_denominator_min=1.0e-3,
+            min_valid_loo_count=3,
+            min_valid_loo_fraction=0.75,
+            residual_quantile=0.75,
+        ),
+    )
+    builder = OccupiedGridTokenBuilder(_builder_cfg(
+        "grid",
+        count_mode="learned_gumbel",
+        learned_count=learned_count,
+    ))
+    xyz = torch.tensor([
+        [0.50, 0.02, 0.02],
+        [0.50, 0.08, 0.03],
+        [0.50, 0.14, 0.05],
+        [0.50, 0.04, 0.12],
+        [0.50, 0.10, 0.16],
+        [0.50, 0.16, 0.19],
+    ])
+    lidar_points = torch.cat([xyz, torch.ones(xyz.shape[0], 1)], dim=-1)
+    features = {
+        "feat": torch.tensor([[1.0, 2.0]]),
+        "grid_coord": torch.tensor([[0, 0, 0]]),
+        "coord": torch.tensor([[0.5, 0.1, 0.1]]),
+        "offset": torch.tensor([1]),
+    }
+    ptv3_input = {
+        "coord": xyz[:1],
+        "grid_coord": torch.tensor([[0, 0, 0]]),
+        "offset": torch.tensor([1]),
+    }
+    output = builder(
+        lidar_points,
+        torch.tensor([xyz.shape[0]]),
+        None,
+        features,
+        ptv3_input,
+        _UnitMapper(),
+        compute_router_guide=True,
+    )
+    assert output.raw_memberships is None
+    assert len(output.grid_seeds) == 1
+    assert len(output.router_guides) == 1
+    guide = output.router_guides[0]
+    assert guide.raw_count.tolist() == [6]
+    assert guide.geometry_valid.tolist() == [True]
+    assert guide.target_k.tolist() == [1]
 
 
 def test_raw_membership_preserves_input_points_and_compact_token_rows():

@@ -5,7 +5,7 @@ from pathlib import Path
 
 from src.models_new.module import Point2Gaus, GausTemp, GausRender
 from lightning.pytorch import LightningModule
-from src.models_new.utils.loss import Loss
+from src.models_new.utils.loss import Loss, router_guide_loss
 from src.models_new.utils.debug_finite import (
     first_nonfinite,
     gaussian_param_absmax,
@@ -27,6 +27,15 @@ WANDB_COMMON_LOSS_KEYS = {
     "loss_budget",
     "budget_expected_mean_k",
     "budget_violation",
+    "loss_router_guide",
+    "router_guide_accuracy",
+    "router_guide_mean_target_k",
+    "router_guide_geometry_valid_fraction",
+    "router_guide_low_support_fraction",
+    "router_guide_frac_k1",
+    "router_guide_frac_k2",
+    "router_guide_frac_k3",
+    "router_guide_frac_k4",
     "render_points_mean",
     "intensity_psnr_valid",
     "intensity_ssim_valid",
@@ -43,12 +52,30 @@ GLOBAL_REDUCED_LOSS_KEYS = {
     "loss_budget",
     "budget_expected_mean_k",
     "budget_violation",
+    "loss_router_guide",
+    "router_guide_accuracy",
+    "router_guide_mean_target_k",
+    "router_guide_geometry_valid_fraction",
+    "router_guide_low_support_fraction",
+    "router_guide_frac_k1",
+    "router_guide_frac_k2",
+    "router_guide_frac_k3",
+    "router_guide_frac_k4",
 }
 
-ADAPTIVE_BUDGET_LOG_KEYS = {
+ROUTING_EPOCH_LOG_KEYS = {
     "loss_budget",
     "budget_expected_mean_k",
     "budget_violation",
+    "loss_router_guide",
+    "router_guide_accuracy",
+    "router_guide_mean_target_k",
+    "router_guide_geometry_valid_fraction",
+    "router_guide_low_support_fraction",
+    "router_guide_frac_k1",
+    "router_guide_frac_k2",
+    "router_guide_frac_k3",
+    "router_guide_frac_k4",
 }
 
 
@@ -122,6 +149,13 @@ class ModelWrapper(LightningModule):
         self._budget_ramp_steps = int(self._cfg_get(
             f"{learned_count_block}.budget.ramp_steps", 1000
         ))
+        # A ceiling rather than an alignment target: rendering decides the
+        # allocation freely below target_mean_k. Applies to the post-guide
+        # budget only -- the guide phase deliberately pins the mean to the
+        # pseudo-GT distribution from both sides.
+        self._budget_one_sided = bool(self._cfg_get(
+            f"{learned_count_block}.budget.one_sided", False
+        ))
         if self._budget_enable:
             budget_k_max = int(self._cfg_get(
                 f"{learned_count_block}.K_max", 0
@@ -139,6 +173,64 @@ class ModelWrapper(LightningModule):
                 raise ValueError(
                     "learned_count.budget warmup_steps/ramp_steps must be "
                     "non-negative"
+                )
+        pseudo_gt_block = "p2g.grid_query.learned_count.pseudo_gt"
+        guide_requested = bool(self._cfg_get(
+            f"{pseudo_gt_block}.enable", False
+        ))
+        if guide_requested and not (
+            anchor_mode == "grid" and routing_count_mode == "learned_gumbel"
+        ):
+            raise ValueError(
+                "router pseudo-GT requires grid count_mode='learned_gumbel'"
+            )
+        self._router_guide_enable = guide_requested
+        self._router_guide_weight = float(self._cfg_get(
+            f"{pseudo_gt_block}.weight", 1.0
+        ))
+        self._router_guide_train_fraction = float(self._cfg_get(
+            f"{pseudo_gt_block}.train_fraction", 0.5
+        ))
+        self._router_guide_min_raw_points = int(self._cfg_get(
+            f"{pseudo_gt_block}.min_raw_points", 3
+        ))
+        self._router_guide_label_smoothing = float(self._cfg_get(
+            f"{pseudo_gt_block}.label_smoothing", 0.1
+        ))
+        max_epochs = int(self._cfg_get("train.max_epochs", 0))
+        self._router_guide_stop_epoch = int(math.ceil(
+            self._router_guide_train_fraction * max_epochs
+        ))
+        if self._router_guide_enable:
+            if self._router_guide_weight < 0.0:
+                raise ValueError("router pseudo-GT weight must be non-negative")
+            if not 0.0 < self._router_guide_train_fraction <= 1.0:
+                raise ValueError(
+                    "router pseudo-GT train_fraction must be in (0, 1]"
+                )
+            if max_epochs <= 0 or self._router_guide_stop_epoch <= 0:
+                raise ValueError(
+                    "router pseudo-GT requires a positive train.max_epochs"
+                )
+            if self._router_guide_min_raw_points < 3:
+                raise ValueError(
+                    "router pseudo-GT min_raw_points must be at least 3"
+                )
+            if not 0.0 <= self._router_guide_label_smoothing < 1.0:
+                raise ValueError(
+                    "router pseudo-GT label_smoothing must be in [0, 1)"
+                )
+            # A two-sided budget is an alignment target, and its target is the
+            # post-guide budget -- far above the mean K the CE guide teaches.
+            # The two would then pull against each other for the whole guide
+            # phase. A one-sided ceiling has exactly zero gradient underneath,
+            # so the guide runs unopposed without needing the ceiling retuned
+            # to whatever mean the current thresholds happen to imply.
+            if self._budget_enable and not self._budget_one_sided:
+                raise ValueError(
+                    "router pseudo-GT requires learned_count.budget.one_sided "
+                    "when learned_count.budget is also enabled: a two-sided "
+                    "budget target fights the guide's cross entropy"
                 )
         # With gradient accumulation, multiple training batches can share one
         # Lightning global_step. Compute sparse metrics only once for that
@@ -179,14 +271,17 @@ class ModelWrapper(LightningModule):
 
     def _shared_step(self, batch, batch_idx, *, prefix: str):
         _input, gt = batch["input"], batch["gt"]
+        router_guide_active = self._router_guide_active(prefix)
         p2g_out = self.p2g_model(
             _input,
             target_pose=gt.get("pose"),
             target_timestamps=gt.get("timestamps"),
+            compute_router_guide=router_guide_active,
         )
         # Keep detached diagnostics outside the renderer/temporal model input.
         routing_stats = p2g_out.pop("routing_stats", None)
         routing_budget_logits = p2g_out.pop("routing_budget_logits", None)
+        routing_guide = p2g_out.pop("routing_guide", None)
         out = self.g2g_model(p2g_out, _input["timestamps"])
         all_renders = self.g2p_model(out, gt)
 
@@ -204,6 +299,11 @@ class ModelWrapper(LightningModule):
             compute_valid_metrics=compute_valid_metrics,
             compute_raydrop_metrics=compute_official_metrics,
         )
+        self._add_router_guide_loss(
+            loss_dict,
+            routing_guide,
+            active=router_guide_active,
+        )
         self._log_losses(loss_dict, prefix=prefix, batch_size=self._batch_size(_input))
         self._log_routing_stats(routing_stats, prefix=prefix)
 
@@ -214,6 +314,54 @@ class ModelWrapper(LightningModule):
             self._record_eval_summary(loss_dict, batch_idx=batch_idx, prefix=prefix)
 
         return loss_dict["total"]
+
+    def _router_guide_active(self, prefix: str) -> bool:
+        """Enable online pseudo-GT only for the configured leading epochs."""
+        return (
+            prefix == "train"
+            and self._router_guide_enable
+            and int(self.current_epoch) < self._router_guide_stop_epoch
+        )
+
+    def _add_router_guide_loss(
+        self,
+        losses: dict,
+        routing_guide: dict | None,
+        *,
+        active: bool,
+    ) -> None:
+        if not active:
+            if routing_guide is not None:
+                raise RuntimeError(
+                    "router pseudo-GT was produced outside its active schedule"
+                )
+            return
+        if routing_guide is None:
+            raise RuntimeError(
+                "router pseudo-GT is active but the model returned no guide fields"
+            )
+        terms = router_guide_loss(
+            routing_guide["logits"],
+            routing_guide["target_k"],
+            geometry_valid=routing_guide["geometry_valid"],
+            raw_count=routing_guide["raw_count"],
+            weight=self._router_guide_weight,
+            min_raw_points=self._router_guide_min_raw_points,
+            label_smoothing=self._router_guide_label_smoothing,
+        )
+        losses["loss_router_guide"] = terms["loss"]
+        losses["wc_router_guide"] = terms["weighted_loss"].detach()
+        losses["router_guide_accuracy"] = terms["accuracy"]
+        losses["router_guide_mean_target_k"] = terms["mean_target_k"]
+        losses["router_guide_geometry_valid_fraction"] = terms[
+            "geometry_valid_fraction"
+        ]
+        losses["router_guide_low_support_fraction"] = terms[
+            "low_support_fraction"
+        ]
+        for index, fraction in enumerate(terms["target_fractions"], start=1):
+            losses[f"router_guide_frac_k{index}"] = fraction
+        losses["total"] = losses["total"] + terms["weighted_loss"]
 
     def _metric_schedule(self, prefix: str, batch_idx: int) -> tuple[bool, bool]:
         """Return ``(valid, official_raydrop)`` metric switches for this batch.
@@ -308,7 +456,7 @@ class ModelWrapper(LightningModule):
                 continue
             if not torch.is_tensor(value):
                 continue
-            epoch_only = key in ADAPTIVE_BUDGET_LOG_KEYS
+            epoch_only = key in ROUTING_EPOCH_LOG_KEYS
             self.log(
                 f"{prefix}/{key}",
                 value,
@@ -328,7 +476,13 @@ class ModelWrapper(LightningModule):
         *,
         prefix: str,
     ) -> dict | None:
-        """Build the optional router input consumed by the shared Loss module."""
+        """Build the optional router input consumed by the shared Loss module.
+
+        With ``budget.one_sided`` the target is a ceiling rather than an
+        alignment point, so one setting covers both phases: during the guide it
+        is inert (the CE drives the mean far below it) and afterwards it is the
+        only thing bounding the router, with rendering free underneath.
+        """
         if prefix != "train" or not self._budget_enable:
             return None
         if routing_budget_logits is None:
@@ -338,6 +492,7 @@ class ModelWrapper(LightningModule):
         return {
             "logits": routing_budget_logits,
             "target_mean_k": self._budget_target_mean_k,
+            "one_sided": self._budget_one_sided,
             "weight": self._budget_weight,
             "step": int(self.global_step),
             "warmup_steps": self._budget_warmup_steps,

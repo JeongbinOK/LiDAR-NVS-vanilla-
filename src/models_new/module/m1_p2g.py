@@ -209,14 +209,23 @@ class Point2Gaus(nn.Module):
             keys.append("offset")
         return dict(zip(keys, parts))
 
-    def forward(self, _input, target_pose=None, target_timestamps=None):
+    def forward(
+        self,
+        _input,
+        target_pose=None,
+        target_timestamps=None,
+        *,
+        compute_router_guide=False,
+    ):
         """The anchor mode is fixed at construction from ``cfg.anchor_mode``, and
         train/eval behaviour follows ``nn.Module.training``, so this module needs
         neither a split name nor a step counter from the caller.
 
         ``target_pose``/``target_timestamps`` are the render-time ``gt["pose"]``
         and ``gt["timestamps"]``, which index the same target views. Only the
-        viewpoint-conditioned count router consumes them.
+        viewpoint-conditioned count router consumes them. ``compute_router_guide``
+        enables the online Grid pseudo target only during the configured training
+        portion; validation and the second half avoid its geometry cost.
         """
         lidar_points = _input.get("lidar_points_sensor", _input["lidar_points"])
         offset = _input["offset"]
@@ -229,7 +238,13 @@ class Point2Gaus(nn.Module):
         # Shared contract for both anchor modes: occupied Cartesian tokens and
         # optional grid-only variable-K seed geometry.
         token_batch = self.anchor_builder(
-            lidar_points, offset, pose, features, _input["ptv3_input"], self.grid_mapper
+            lidar_points,
+            offset,
+            pose,
+            features,
+            _input["ptv3_input"],
+            self.grid_mapper,
+            compute_router_guide=compute_router_guide,
         )
         pos_list = token_batch.positions
         ufeat_list = token_batch.utonia_features
@@ -237,6 +252,7 @@ class Point2Gaus(nn.Module):
         gc_list = token_batch.grid_coords
         grid_seed_list = token_batch.grid_seeds
         raw_membership_list = token_batch.raw_memberships
+        router_guide_list = token_batch.router_guides
         if self.anchor_mode == "grid" and grid_seed_list is None:
             raise RuntimeError("grid token builder did not return seed data")
         if self.anchor_mode == "spherical" and grid_seed_list is not None:
@@ -245,6 +261,12 @@ class Point2Gaus(nn.Module):
             raise RuntimeError("spherical token builder did not return raw-token membership")
         if self.anchor_mode == "grid" and raw_membership_list is not None:
             raise RuntimeError("grid token builder unexpectedly returned raw-token membership")
+        if self.anchor_mode == "spherical" and router_guide_list is not None:
+            raise RuntimeError("spherical token builder unexpectedly returned grid pseudo-GT")
+        if bool(compute_router_guide) != (router_guide_list is not None):
+            raise RuntimeError(
+                "grid pseudo-GT output does not match compute_router_guide"
+            )
 
         n_frames = len(pos_list)
 
@@ -318,9 +340,34 @@ class Point2Gaus(nn.Module):
                         "learned-count seed data must defer anchor_k prediction"
                     )
                 all_anchor_k = None
+            if router_guide_list is not None:
+                if len(router_guide_list) != n_frames:
+                    raise RuntimeError(
+                        "grid pseudo-GT must provide one aligned item per frame"
+                    )
+                all_router_guide = {
+                    "target_k": torch.cat(
+                        [item.target_k for item in router_guide_list], dim=0
+                    ),
+                    "ray_error_q_m": torch.cat(
+                        [item.ray_error_q_m for item in router_guide_list], dim=0
+                    ),
+                    "geometry_valid": torch.cat(
+                        [item.geometry_valid for item in router_guide_list], dim=0
+                    ),
+                    "raw_count": torch.cat(
+                        [item.raw_count for item in router_guide_list], dim=0
+                    ),
+                    "valid_loo_count": torch.cat(
+                        [item.valid_loo_count for item in router_guide_list], dim=0
+                    ),
+                }
+            else:
+                all_router_guide = None
         else:
             all_raw_point_sensor = torch.cat(all_raw_point_sensor, dim=0)
             all_raw_token_index = torch.cat(all_raw_token_index, dim=0)
+            all_router_guide = None
 
         if all_ufeat.shape[1] != self.utonia_feature_dim:
             raise RuntimeError(
@@ -420,6 +467,24 @@ class Point2Gaus(nn.Module):
         gaussian_batch = torch.repeat_interleave(
             frame_batch_idx.to(seeds.frame_offset.device), gauss_counts
         )
+        routing_guide = None
+        if all_router_guide is not None:
+            guide_logits = seeds.routing_budget_logits
+            if guide_logits is None:
+                raise RuntimeError(
+                    "grid pseudo-GT requires attached learned-count logits"
+                )
+            expected_rows = all_router_guide["target_k"].shape[0]
+            if guide_logits.ndim != 2 or guide_logits.shape[0] != expected_rows:
+                raise RuntimeError(
+                    "router pseudo-GT/logit alignment mismatch: "
+                    f"{expected_rows} targets vs {tuple(guide_logits.shape)} logits"
+                )
+            if guide_logits.shape[1] != self.grid_slot_head.k_max:
+                raise RuntimeError(
+                    "router pseudo-GT class count differs from learned K_max"
+                )
+            routing_guide = {"logits": guide_logits, **all_router_guide}
 
         return {
             "batch_gaussians": batch_gaussians,
@@ -429,4 +494,5 @@ class Point2Gaus(nn.Module):
             "timestamps": _input["timestamps"],
             "routing_stats": seeds.routing_stats,
             "routing_budget_logits": seeds.routing_budget_logits,
+            "routing_guide": routing_guide,
         }

@@ -498,7 +498,7 @@ def aggregate_points_to_cells_with_membership(
 def aggregate_points_to_cells_with_seeds(
     points_xyz, intensity, grid_coord, voxel_feats, voxel_coord, metric_origin,
     mapper, points_per_gaussian, k_max, exp=None, count_mode="legacy",
-    seed_mode=None,
+    seed_mode=None, return_membership=False,
 ):
     """Aggregate raw points and construct padded grid-mode seed tensors.
 
@@ -524,4 +524,5 @@ def aggregate_points_to_cells_with_seeds(
         points_xyz, intensity, grid_coord, voxel_feats,
         voxel_coord, metric_origin, mapper,
         seed_config=(count_mode, points_per_gaussian, k_max, exp, seed_mode),
+        return_membership=bool(return_membership),
     )

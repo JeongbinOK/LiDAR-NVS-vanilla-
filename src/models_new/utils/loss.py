@@ -99,8 +99,20 @@ def target_budget_loss(
     step: int,
     warmup_steps: int,
     ramp_steps: int,
+    one_sided: bool = False,
 ) -> dict[str, torch.Tensor]:
-    """Build the normalized global expected-mean-K target loss."""
+    """Build the normalized global expected-mean-K target loss.
+
+    ``one_sided=True`` turns ``target_mean_k`` from an alignment target into a
+    ceiling: only the positive violation is penalized, so the router carries no
+    budget gradient at all while the global expected mean K stays at or below
+    it, and rendering alone decides the allocation inside that headroom. The
+    default two-sided form pins the mean to the target from both directions and
+    is what an alignment phase (e.g. the pseudo-GT guide) wants.
+
+    ``violation`` is always reported signed so the logged diagnostic still
+    shows how much headroom is left under a ceiling.
+    """
     if logits.ndim != 2 or logits.shape[1] < 2:
         raise ValueError("budget k_logits must have shape (N, K) with K >= 2")
     k_max = int(logits.shape[1])
@@ -135,7 +147,10 @@ def target_budget_loss(
         }
 
     violation = expected_mean_k - target_mean_k
-    normalized_violation = violation / float(k_max - 1)
+    # clamp_min is exactly zero-gradient below the ceiling, so a router sitting
+    # under budget receives no count pressure whatsoever.
+    penalized = violation.clamp_min(0.0) if bool(one_sided) else violation
+    normalized_violation = penalized / float(k_max - 1)
     loss = normalized_violation.square()
     return {
         "expected_mean_k": expected_mean_k,
@@ -144,6 +159,136 @@ def target_budget_loss(
         "loss": loss,
         "weight": weight,
         "weighted_loss": weight * loss,
+    }
+
+
+def router_guide_loss(
+    logits: torch.Tensor,
+    target_k: torch.Tensor,
+    *,
+    geometry_valid: torch.Tensor,
+    raw_count: torch.Tensor,
+    weight: float,
+    min_raw_points: int,
+    label_smoothing: float = 0.0,
+) -> dict[str, torch.Tensor]:
+    """Exact global-token CE for the Grid pseudo-GT router guide.
+
+    Targets are one-based physical K values.  Invalid geometry is intentionally
+    retained in CE as its conservative K=1 policy; ``geometry_valid`` and
+    ``raw_count`` are used only for globally reduced diagnostics.
+
+    ``label_smoothing`` is what keeps the Gumbel router exploring.  Under the
+    Gumbel-max trick a hard sample lands on the argmax class with probability
+    ``softmax(logits)_argmax`` regardless of tau, so plain CE -- whose optimum
+    drives that probability to one -- anneals exploration to zero.  Smoothing
+    by ``eps`` over ``E`` classes caps the optimum at ``1 - eps*(E-1)/E`` and
+    therefore pins the exploration rate at ``eps*(E-1)/E`` for the whole guide
+    phase (eps=0.1, E=3 -> 6.7%).  SplatWeaver uses eps=0.1 for the same reason.
+
+    The value/gradient construction mirrors ``distributed_token_mean`` so DDP's
+    rank-averaged parameter gradients equal one global token-weighted CE even
+    when ranks contain different token counts.
+    """
+    if logits.ndim != 2 or logits.shape[1] < 2:
+        raise ValueError("router guide logits must have shape (N, K), K >= 2")
+    token_count = int(logits.shape[0])
+    aligned = (target_k, geometry_valid, raw_count)
+    if any(item.ndim != 1 or item.shape[0] != token_count for item in aligned):
+        raise ValueError("router guide fields must be one-dimensional and logit-aligned")
+    target_k = target_k.to(device=logits.device, dtype=torch.long)
+    geometry_valid = geometry_valid.to(device=logits.device, dtype=torch.bool)
+    raw_count = raw_count.to(device=logits.device, dtype=torch.long)
+    k_max = int(logits.shape[1])
+    if target_k.numel() > 0 and bool(
+        ((target_k < 1) | (target_k > k_max)).any()
+    ):
+        raise ValueError("router guide target_k must lie in [1, K_max]")
+    weight = float(weight)
+    min_raw_points = int(min_raw_points)
+    label_smoothing = float(label_smoothing)
+    if weight < 0.0:
+        raise ValueError("router guide weight must be non-negative")
+    if min_raw_points < 1:
+        raise ValueError("router guide min_raw_points must be positive")
+    if not 0.0 <= label_smoothing < 1.0:
+        raise ValueError("router guide label_smoothing must be in [0, 1)")
+
+    if token_count > 0:
+        local_loss_sum = F.cross_entropy(
+            logits.float(),
+            target_k - 1,
+            reduction="sum",
+            label_smoothing=label_smoothing,
+        )
+        predicted_k = logits.detach().argmax(dim=-1) + 1
+        correct = (predicted_k == target_k).sum()
+        class_counts = torch.stack([
+            (target_k == k).sum() for k in range(1, k_max + 1)
+        ])
+    else:
+        local_loss_sum = logits.sum() * 0.0
+        correct = target_k.new_zeros(())
+        class_counts = target_k.new_zeros((k_max,))
+
+    detached_statistics = torch.cat([
+        local_loss_sum.detach().reshape(1),
+        logits.detach().new_tensor([
+            float(correct.item()),
+            float(token_count),
+            float(target_k.sum().item()),
+            float(geometry_valid.sum().item()),
+            float((raw_count < min_raw_points).sum().item()),
+        ]),
+        class_counts.to(device=logits.device, dtype=logits.dtype),
+    ])
+    world_size = 1
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(detached_statistics, op=dist.ReduceOp.SUM)
+        world_size = dist.get_world_size()
+
+    (
+        global_loss_sum,
+        global_correct,
+        global_count,
+        global_target_sum,
+        global_valid_count,
+        global_low_support_count,
+    ) = detached_statistics[:6]
+    global_class_counts = detached_statistics[6:]
+    if not bool((global_count > 0).item()):
+        zero = local_loss_sum * 0.0
+        return {
+            "loss": zero,
+            "weighted_loss": zero,
+            "weight": zero.detach(),
+            "accuracy": zero.detach(),
+            "mean_target_k": zero.detach(),
+            "geometry_valid_fraction": zero.detach(),
+            "low_support_fraction": zero.detach(),
+            "target_fractions": zero.detach().expand(k_max),
+            "global_token_count": global_count,
+        }
+
+    local_surrogate = (
+        float(world_size)
+        * (local_loss_sum - local_loss_sum.detach())
+        / global_count
+    )
+    loss = global_loss_sum / global_count + local_surrogate
+    weight_tensor = loss.new_tensor(weight)
+    return {
+        "loss": loss,
+        "weighted_loss": weight_tensor * loss,
+        "weight": weight_tensor.detach(),
+        "accuracy": (global_correct / global_count).detach(),
+        "mean_target_k": (global_target_sum / global_count).detach(),
+        "geometry_valid_fraction": (global_valid_count / global_count).detach(),
+        "low_support_fraction": (
+            global_low_support_count / global_count
+        ).detach(),
+        "target_fractions": (global_class_counts / global_count).detach(),
+        "global_token_count": global_count,
     }
 
 
@@ -548,6 +693,7 @@ class Loss(nn.Module):
                 step=routing_budget["step"],
                 warmup_steps=routing_budget["warmup_steps"],
                 ramp_steps=routing_budget["ramp_steps"],
+                one_sided=routing_budget.get("one_sided", False),
             )
             losses["loss_budget"] = terms["loss"]
             losses["wc_budget"] = terms["weighted_loss"].detach()

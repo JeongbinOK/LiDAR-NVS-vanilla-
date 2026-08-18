@@ -44,6 +44,10 @@ from .intensity_encoder import (
     build_intensity_encoder,
     encode_intensity_features,
 )
+from ..grid_router_pseudo_gt import (
+    GridRouterPseudoGT,
+    grid_inverse_range_pseudo_gt,
+)
 
 
 @dataclass(frozen=True)
@@ -57,6 +61,7 @@ class OccupiedTokenBatch:
     raw_counts: list[torch.Tensor]
     grid_seeds: Optional[list[GridSeedData]]
     raw_memberships: Optional[list[RawTokenMembership]]
+    router_guides: Optional[list[GridRouterPseudoGT]]
 
 
 class OccupiedGridTokenBuilder(nn.Module):
@@ -65,6 +70,7 @@ class OccupiedGridTokenBuilder(nn.Module):
         self.cfg = cfg
         self.anchor_mode = str(getattr(cfg, "anchor_mode", "spherical")).lower()
         self.grid_seed_config = None
+        self.router_guide_kwargs = None
         if self.anchor_mode == "grid":
             grid_query = getattr(cfg, "grid_query", None)
             if grid_query is None:
@@ -129,6 +135,42 @@ class OccupiedGridTokenBuilder(nn.Module):
                 self.grid_seed_config = (
                     count_mode, None, int(k_max), None, seed_mode,
                 )
+                pseudo_gt = getattr(learned_count, "pseudo_gt", None)
+                if pseudo_gt is not None and bool(
+                    getattr(pseudo_gt, "enable", False)
+                ):
+                    if count_mode != "learned_gumbel":
+                        raise ValueError(
+                            "grid pseudo-GT currently supports count_mode="
+                            "'learned_gumbel' only"
+                        )
+                    thresholds_m = tuple(
+                        float(value)
+                        for value in getattr(pseudo_gt, "thresholds_m", ())
+                    )
+                    if len(thresholds_m) != int(k_max) - 1:
+                        raise ValueError(
+                            "learned_count.pseudo_gt.thresholds_m must contain "
+                            "K_max - 1 values"
+                        )
+                    self.router_guide_kwargs = {
+                        "thresholds_m": thresholds_m,
+                        "min_raw_points": int(
+                            getattr(pseudo_gt, "min_raw_points", 3)
+                        ),
+                        "loo_denominator_min": float(
+                            getattr(pseudo_gt, "loo_denominator_min", 1.0e-3)
+                        ),
+                        "min_valid_loo_count": int(
+                            getattr(pseudo_gt, "min_valid_loo_count", 3)
+                        ),
+                        "min_valid_loo_fraction": float(
+                            getattr(pseudo_gt, "min_valid_loo_fraction", 0.75)
+                        ),
+                        "residual_quantile": float(
+                            getattr(pseudo_gt, "residual_quantile", 0.75)
+                        ),
+                    }
             else:
                 raise ValueError(
                     "p2g.grid_query.count_mode must be 'legacy', "
@@ -140,8 +182,23 @@ class OccupiedGridTokenBuilder(nn.Module):
             self.intensity_out_dim,
         ) = build_intensity_encoder(cfg)
 
-    def forward(self, lidar_points, offset, pose, features, ptv3_input, mapper):
+    def forward(
+        self,
+        lidar_points,
+        offset,
+        pose,
+        features,
+        ptv3_input,
+        mapper,
+        *,
+        compute_router_guide=False,
+    ):
         device = features["feat"].device
+        compute_router_guide = bool(compute_router_guide)
+        if compute_router_guide and self.router_guide_kwargs is None:
+            raise RuntimeError(
+                "router pseudo-GT was requested without an enabled pseudo_gt config"
+            )
 
         grid_coord_list = split_by_offset(features["grid_coord"], features["offset"])
         feat_list = split_by_offset(features["feat"], features["offset"])
@@ -163,6 +220,7 @@ class OccupiedGridTokenBuilder(nn.Module):
         raw_count_list = []
         seed_data_list = [] if self.grid_seed_config is not None else None
         membership_list = [] if self.anchor_mode == "spherical" else None
+        guide_data_list = [] if compute_router_guide else None
         for i in range(len(feat_list)):
             pts = pts_list[i]
             xyz = pts[:, :3]
@@ -183,8 +241,26 @@ class OccupiedGridTokenBuilder(nn.Module):
                     coord_list[i], origins[i], mapper,
                     points_per_gaussian, k_max, exp=exp,
                     count_mode=count_mode, seed_mode=seed_mode,
+                    return_membership=compute_router_guide,
                 )
-                upos, ufeat, int5, occ, raw_count, seed_data = result
+                if compute_router_guide:
+                    (
+                        upos, ufeat, int5, occ, raw_count, membership, seed_data,
+                    ) = result
+                    guide = grid_inverse_range_pseudo_gt(
+                        membership.points_sensor,
+                        membership.token_index,
+                        int(upos.shape[0]),
+                        **self.router_guide_kwargs,
+                    )
+                    if not torch.equal(guide.raw_count, raw_count):
+                        raise RuntimeError(
+                            "grid pseudo-GT membership drifted from occupied-token "
+                            "raw counts"
+                        )
+                    guide_data_list.append(guide)
+                else:
+                    upos, ufeat, int5, occ, raw_count, seed_data = result
                 seed_data_list.append(seed_data)
             occ_gc = grid_coord_list[i].to(device)[occ]
             pos_list.append(upos)
@@ -213,4 +289,5 @@ class OccupiedGridTokenBuilder(nn.Module):
             raw_counts=raw_count_list,
             grid_seeds=seed_data_list,
             raw_memberships=membership_list,
+            router_guides=guide_data_list,
         )

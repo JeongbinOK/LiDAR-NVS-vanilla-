@@ -147,9 +147,25 @@ p2g:
     exp: 1                      # legacy only: null=raw-count range quantile;
                                 # 1=one raw-point medoid; 2=two token-coordinate seeds
     learned_count:              # learned modes only; legacy K_max/points_per_gaussian/exp와 독립
-      K_max: 4                  # total K=[1..4]; viewpt는 Common 1 + Additional (K-1)
+      K_max: 3                  # pseudo-GT가 지도하는 total K=[1..3]
       tau: 1.0                  # train: hard Gumbel-ST temperature; eval: deterministic argmax
       seed_mode: range_quantile # learned: all quantile; viewpt: medoid Common + quantile Additional
+      pseudo_gt:                # grid learned_gumbel only; 실제 occupied stage-3 token membership 사용
+        enable: true
+        weight: 1.0
+        train_fraction: 0.5     # epoch 0..19에서만 online 생성 + CE, 이후 계산 자체를 끔
+        thresholds_m: [0.0085, 0.0355]  # train1000/val200 log-E1 3-means: 8.5mm / 35.5mm
+        min_raw_points: 3       # 3점 미만 token은 geometry-invalid K=1
+        loo_denominator_min: 0.001
+        min_valid_loo_count: 3
+        min_valid_loo_fraction: 0.75
+        residual_quantile: 0.75 # inverse-range exact-LOO ray-depth error Q75
+        label_smoothing: 0.1    # Gumbel 탐색률을 유지하는 유일한 장치.
+          # hard=True에서 표본은 argmax(logits+g)라 tau는 탐색에 아무 영향이 없다
+          # (실측: tau 0.5/1.0/5.0에서 탐색률 0.066으로 동일). 평활 없는 CE는
+          # p_true->1로 몰아 탐색을 0으로 만든다(logit gap 10이면 0.01%).
+          # eps=0.1, E=3이면 최적 gap이 3.33에 고정 -> 탐색률 6.7% 유지.
+          # SplatWeaver loss_expert.py도 같은 이유로 label_smoothing=0.1.
       viewpoint:                # learned_gumbel_viewpt only: gt.pose = T_(0<-t)
         # router 입력 = token 위치를 target sensor frame으로 옮긴 R^T(p_ref - t)의
         # Fourier 인코딩. token마다 값이 달라 pose 하나를 전 token에 동일 concat하던
@@ -162,8 +178,17 @@ p2g:
       grad_balance_scope: token
       budget:
         enable: true
-        # DDP 전체 token의 noise-free policy E[K] 평균을 이 값에 맞춤.
+        # DDP 전체 token의 noise-free policy E[K] 평균 기준값.
         target_mean_k: 2.0
+        # true면 이 값이 "목표"가 아니라 "상한"이 된다: max(0, E[K]-2.0)^2 이라
+        # 상한 아래에서는 budget gradient가 정확히 0이다. 그래서 한 설정이 두
+        # phase를 모두 커버한다 — guide 구간에는 CE가 평균을 1.2 근처로 끌어
+        # 내리므로 사실상 비활성이고, guide 종료 후에는 K 할당을 render loss가
+        # 단독으로 결정하되 전역 폭주만 이 천장이 막는다. 상한 2.0은 나머지가
+        # K=1일 때 토큰의 50%까지 K=3을 허용 — pseudo-GT 기하 수요(K3 4.5% /
+        # K2 8.8%)의 약 10배 여유라 실제 수요를 제약하지 않는다.
+        # pseudo_gt.enable=true면 이 값은 true여야 한다(양방향은 CE와 충돌).
+        one_sided: true
         weight: 1.0
         warmup_steps: 500       # 이 optimizer step 전까지 budget gradient=0
         ramp_steps: 1000        # 이후 weight를 0 -> 1.0으로 선형 증가
