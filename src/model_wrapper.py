@@ -13,7 +13,6 @@ from src.models_new.utils.debug_finite import (
 )
 from src.models_new.utils.routing_logging import (
     distributed_sum_statistics,
-    range_bin_labels,
     routing_sufficient_statistics,
 )
 
@@ -36,7 +35,6 @@ WANDB_COMMON_LOSS_KEYS = {
     "router_guide_frac_k2",
     "router_guide_frac_k3",
     "router_guide_frac_k4",
-    "render_points_mean",
     "intensity_psnr_valid",
     "intensity_ssim_valid",
     "depth_psnr_valid",
@@ -49,21 +47,6 @@ WANDB_COMMON_LOSS_KEYS = {
 }
 
 GLOBAL_REDUCED_LOSS_KEYS = {
-    "loss_budget",
-    "budget_expected_mean_k",
-    "budget_violation",
-    "loss_router_guide",
-    "router_guide_accuracy",
-    "router_guide_mean_target_k",
-    "router_guide_geometry_valid_fraction",
-    "router_guide_low_support_fraction",
-    "router_guide_frac_k1",
-    "router_guide_frac_k2",
-    "router_guide_frac_k3",
-    "router_guide_frac_k4",
-}
-
-ROUTING_EPOCH_LOG_KEYS = {
     "loss_budget",
     "budget_expected_mean_k",
     "budget_violation",
@@ -119,16 +102,10 @@ class ModelWrapper(LightningModule):
         self._routing_logging_interval = int(self._cfg_get(
             f"{learned_count_block}.logging.interval", 20
         ))
-        self._routing_range_edges = tuple(float(value) for value in self._cfg_get(
-            f"{learned_count_block}.logging.range_edges_m",
-            (0, 10, 20, 30, 40, 60, 80, 110),
-        ))
         if self._routing_logging_interval <= 0:
             raise ValueError(
                 "learned_count.logging.interval must be positive"
             )
-        # Validates lower-bound ordering once, before the first train batch.
-        range_bin_labels(self._routing_range_edges)
         self._last_train_routing_step = -1
         budget_requested = bool(self._cfg_get(
             f"{learned_count_block}.budget.enable", False
@@ -456,11 +433,10 @@ class ModelWrapper(LightningModule):
                 continue
             if not torch.is_tensor(value):
                 continue
-            epoch_only = key in ROUTING_EPOCH_LOG_KEYS
             self.log(
                 f"{prefix}/{key}",
                 value,
-                on_step=not epoch_only,
+                on_step=False,
                 on_epoch=True,
                 prog_bar=(key == "total" or key.startswith("loss_")),
                 # Budget terms already contain an autograd-safe global token
@@ -512,11 +488,7 @@ class ModelWrapper(LightningModule):
                 return
             self._last_train_routing_step = step
 
-        statistics = routing_sufficient_statistics(
-            routing,
-            self._routing_range_edges,
-            include_breakdowns=self._routing_unit_name == "token",
-        )
+        statistics = routing_sufficient_statistics(routing)
         statistics = distributed_sum_statistics(statistics)
         unit_count = statistics["token_count"]
         if not bool((unit_count > 0).item()):
@@ -554,69 +526,6 @@ class ModelWrapper(LightningModule):
                 f"argmax/frac_k{k}",
                 statistics["argmax_counts"][index] / unit_count,
             )
-
-        # Spherical routing only needs a coarse collapse/learning check in W&B:
-        # global mean K and per-K sampled/argmax fractions. Keep the historical
-        # range and bg/fg diagnostics for Grid without computing them for anchors.
-        if self._routing_unit_name == "anchor":
-            return
-
-        range_labels = range_bin_labels(self._routing_range_edges)
-        for index, label in enumerate(range_labels):
-            count = statistics["range_token_counts"][index]
-            log_value(
-                f"range/{label}/{self._routing_unit_name}_frac",
-                count / unit_count,
-            )
-            if not bool((count > 0).item()):
-                continue
-            bin_batch_size = int(count.item())
-            log_value(
-                f"range/{label}/sampled_mean_k",
-                statistics["range_sampled_k_sums"][index] / count,
-                batch_size=bin_batch_size,
-            )
-            log_value(
-                f"range/{label}/argmax_mean_k",
-                statistics["range_argmax_k_sums"][index] / count,
-                batch_size=bin_batch_size,
-            )
-
-        for group_index, group_name in enumerate(("bg", "fg")):
-            count = statistics["group_token_counts"][group_index]
-            log_value(
-                f"{group_name}/{self._routing_unit_name}_frac",
-                count / unit_count,
-            )
-            if not bool((count > 0).item()):
-                continue
-            group_batch_size = int(count.item())
-            log_value(
-                f"{group_name}/sampled_mean_k",
-                statistics["group_sampled_k_sums"][group_index] / count,
-                batch_size=group_batch_size,
-            )
-            log_value(
-                f"{group_name}/argmax_mean_k",
-                statistics["group_argmax_k_sums"][group_index] / count,
-                batch_size=group_batch_size,
-            )
-            for index in range(k_max):
-                k = index + 1
-                log_value(
-                    f"{group_name}/sampled_frac_k{k}",
-                    statistics["group_selected_counts"][
-                        group_index, index
-                    ] / count,
-                    batch_size=group_batch_size,
-                )
-                log_value(
-                    f"{group_name}/argmax_frac_k{k}",
-                    statistics["group_argmax_counts"][
-                        group_index, index
-                    ] / count,
-                    batch_size=group_batch_size,
-                )
 
     def _record_eval_summary(self, losses: dict, *, batch_idx: int, prefix: str) -> None:
         summary = {

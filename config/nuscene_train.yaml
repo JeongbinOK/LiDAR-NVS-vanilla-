@@ -196,8 +196,6 @@ p2g:
       logging:
         enable: true
         interval: 20            # optimizer step 기준 train routing 통계 주기
-        # 각 값은 bin lower bound: [0,10), ... [80,110), [110,inf)
-        range_edges_m: [0, 10, 20, 30, 40, 60, 80, 110]
     bg_radius_m: 0.8
     bg_max_kv_per_frame: 8
     num_heads: 8
