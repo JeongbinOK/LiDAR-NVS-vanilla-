@@ -279,12 +279,6 @@ p2g:
   # Preprocessing
   ego_radius: 2.5
 
-  # Debug (NaN-collapse tracking — see scripts/nan_collapse_diagnosis.md)
-  debug_finite_check: false     # log raw gaussian/render absmax + report first non-finite fwd tensor
-  debug_anomaly_batch: -1      # >=0 -> torch.autograd.set_detect_anomaly (slow, raises on first NaN)
-  debug_bad_grad_trace: false   # on non-finite grad: list offending params, then SKIP the step
-  debug_bad_grad_trace_max: 16
-
 g2g: {}                   # GausTemp takes no config; block kept so cfg.g2g resolves
 g2p:
   neg_fov: true
