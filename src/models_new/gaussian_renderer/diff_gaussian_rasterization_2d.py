@@ -18,7 +18,23 @@ if (environment_bin_path / "nvcc").is_file():
     # Set this before importing cpp_extension: CUDA_HOME is detected at module
     # import time. This avoids accidentally selecting an older system toolkit.
     os.environ["CUDA_HOME"] = str(environment_root)
-os.environ["TORCH_CUDA_ARCH_LIST"] = "8.9"
+# Build for the GPU actually present rather than a hardcoded architecture:
+# an sm_89 cubin does not run on sm_80, and compute_89 PTX cannot JIT backward
+# to older hardware, so a fixed value silently breaks on a different machine.
+if torch.cuda.is_available():
+    _cuda_major, _cuda_minor = torch.cuda.get_device_capability()
+else:
+    # No visible device (docs build, CPU-only import): fall back to the torch
+    # default rather than guessing an architecture.
+    _cuda_major, _cuda_minor = None, None
+if _cuda_major is not None:
+    os.environ["TORCH_CUDA_ARCH_LIST"] = f"{_cuda_major}.{_cuda_minor}"
+    _gencode_flags = [
+        f"-gencode=arch=compute_{_cuda_major}{_cuda_minor},"
+        f"code=sm_{_cuda_major}{_cuda_minor}"
+    ]
+else:
+    _gencode_flags = []
 for compiler_variable, compiler_path in (
     ("CC", "/usr/bin/gcc-12"),
     ("CXX", "/usr/bin/g++-12"),
@@ -26,6 +42,12 @@ for compiler_variable, compiler_path in (
 ):
     if Path(compiler_path).is_file():
         os.environ[compiler_variable] = compiler_path
+# nvcc rejects a --compiler-bindir that does not exist, so only pin the host
+# compiler when this machine actually has it.
+_host_compiler_flags = (
+    ["--compiler-bindir", "/usr/bin/gcc-12"]
+    if Path("/usr/bin/gcc-12").is_file() else []
+)
 
 from torch.utils.cpp_extension import load
 
@@ -47,7 +69,12 @@ extension_build_dir.mkdir(parents=True, exist_ok=True)
 _C = load(
     name='diff_gaussian_rasterization',
     build_directory=str(extension_build_dir),
-    extra_cuda_cflags=["-I " + os.path.join(parent_dir, "third_party/glm/"), "-g", "-gencode=arch=compute_89,code=sm_89", "--compiler-bindir", "/usr/bin/gcc-12"],
+    extra_cuda_cflags=[
+        "-I " + os.path.join(parent_dir, "third_party/glm/"),
+        "-g",
+        *_gencode_flags,
+        *_host_compiler_flags,
+    ],
     sources=[
         os.path.join(parent_dir, "cuda_rasterizer/rasterizer_impl.cu"),
         os.path.join(parent_dir, "cuda_rasterizer/forward.cu"),

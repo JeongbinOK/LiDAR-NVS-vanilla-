@@ -4,6 +4,11 @@ __pycache__/
 *$py.class
 .pytest_cache/
 
+# CUDA extension build output. These are per-GPU-architecture binaries: a
+# committed sm_89 .so is imported in preference to a rebuild and then fails on
+# any other card, so let each machine JIT its own.
+src/models_new/utils/chamfer/tmp/
+
 # Checkpoints / Models
 *.pt
 *.pth
