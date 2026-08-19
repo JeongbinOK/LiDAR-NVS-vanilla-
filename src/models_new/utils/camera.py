@@ -110,6 +110,7 @@ from pyquaternion import Quaternion
 class Camera(nn.Module):
     def __init__(self, R, T, vfov=None, hfov=None, 
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device="cpu", timestamp=0.0,
+                 timestamp_sec=None,
                  resolution=None, 
                  pts_depth=None, pts_intensity=None, points=None,
                  viewmatrix=None,
@@ -162,6 +163,9 @@ class Camera(nn.Module):
         self.camera_center = self.world_view_transform.inverse()[3, :3]
         self.c2w = self.world_view_transform.transpose(0, 1).inverse()
         self.timestamp = timestamp
+        self.timestamp_sec = (
+            None if timestamp_sec is None else float(timestamp_sec)
+        )
         self.grid = kornia.utils.create_meshgrid(
             self.image_height,
             self.image_width,
@@ -187,7 +191,8 @@ class Camera(nn.Module):
 
     @classmethod
     def from_nuscenes(cls, nusc, lidar_token, timestamp_normalized,
-                      pts_sensor, cfg, uid=0, lidar_ring=None, ref_to_sensor=None):
+                      pts_sensor, cfg, uid=0, lidar_ring=None, ref_to_sensor=None,
+                      timestamp_seconds=None):
         """
         NuScenes lidar_token으로 Camera 객체 생성
         pts_sensor : (N, 4) sensor frame xyz+intensity
@@ -289,6 +294,7 @@ class Camera(nn.Module):
             vfov=vfov, hfov=hfov,
             data_device="cpu",
             timestamp=timestamp_normalized,
+            timestamp_sec=timestamp_seconds,
             resolution=(W, H),
             points = pts_sensor[:,:3],
             pts_depth=torch.from_numpy(pts_depth_np).float(),
@@ -296,4 +302,3 @@ class Camera(nn.Module):
             viewmatrix=ref_to_sensor,
             ring_to_elevation_deg=ring_to_elevation_deg,
         )
-

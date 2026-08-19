@@ -18,6 +18,31 @@ NUSCENES_SWEEP_US = 50_000      # LIDAR_TOP sample_data chain is 20Hz.
 MIN_GAP_US = 100_000            # 0.1 s minimum gap between sampled frames
 MAX_WIN_US = 1_000_000          # 1.0 s maximum window
 DEFAULT_GT_MIDDLE_COUNT = 3
+
+
+def relative_time_coordinates(timestamps_us, window_start_us, window_end_us):
+    """Return normalized time, relative seconds, and physical window duration."""
+    span_us = max(int(window_end_us) - int(window_start_us), 1)
+    # Preserve the legacy normalized-time arithmetic exactly: integer
+    # microsecond delta divided directly by the integer window span, followed by
+    # the float32 tensor conversion. Physical seconds are an additional view of
+    # the same timestamps and must not perturb old bbox checkpoints.
+    normalized = torch.tensor(
+        [
+            (int(timestamp) - int(window_start_us)) / span_us
+            for timestamp in timestamps_us
+        ],
+        dtype=torch.float32,
+    )
+    duration_sec = torch.tensor(span_us / US_PER_SEC, dtype=torch.float32)
+    relative_sec = torch.tensor(
+        [
+            (int(timestamp) - int(window_start_us)) / US_PER_SEC
+            for timestamp in timestamps_us
+        ],
+        dtype=torch.float32,
+    )
+    return normalized, relative_sec, duration_sec
  
  
 def _sensor_to_world(nusc, sample_data_token: str) -> np.ndarray:
@@ -250,6 +275,8 @@ class NuScenesNVSDataset(Dataset):
     point_iid    : Tensor(N,)        instance id per point (-1 = background)
     pose         : Tensor(V, 4, 4)   frame_i → ref_frame (frame_0) rel pose
     timestamps   : Tensor(V,)        normalised to [0, 1]
+    timestamps_sec: Tensor(V,)       seconds relative to window start
+    window_duration_sec: Tensor(())  actual endpoint interval in seconds
     """
     #n_input = 2 + max_input_extra
     def __init__(self, cfg, split: str):
@@ -493,12 +520,15 @@ class NuScenesNVSDataset(Dataset):
             poses.append(torch.from_numpy(rel))
         pose = torch.stack(poses)                               # (V, 4, 4)
  
-        # Normalised timestamps: 0 = window start, 1 = window end
+        # Keep both coordinate systems. Legacy bbox/V1 experiments consume the
+        # per-window normalized coordinate; physical-velocity V3 conditions on
+        # relative seconds (with one fixed reference-second scale) and transports
+        # Gaussians in seconds, preserving irregular nuScenes keyframe gaps.
         t0 = window[0][2]
         t_last = window[-1][2]
-        span = max(t_last - t0, 1)
-        timestamps = torch.tensor(
-            [(t - t0) / span for t in timestamps_us], dtype=torch.float32)  # (V_gt,)
+        timestamps, timestamps_sec, window_duration_sec = (
+            relative_time_coordinates(timestamps_us, t0, t_last)
+        )
  
         # ── Points (transform each frame into ref frame) ──────────────────
         ego_radius = float(_cfg_get(self.cfg, "ego_radius", 0.0) or 0.0)
@@ -552,6 +582,7 @@ class NuScenesNVSDataset(Dataset):
         input_ring       = [all_lidar_ring[i] for i in input_indices]
         input_pose       = pose[input_indices]                  # (n_input, 4, 4)
         input_timestamps = timestamps[input_indices]            # (n_input,)
+        input_timestamps_sec = timestamps_sec[input_indices]    # (n_input,)
         input_frame_counts = torch.tensor([p.shape[0] for p in input_pts_ref])
         ref_to_sensor = torch.linalg.inv(pose)
 
@@ -564,14 +595,22 @@ class NuScenesNVSDataset(Dataset):
                 nusc=self.nusc,
                 lidar_token=lidar_tok,
                 timestamp_normalized=ts_norm,
+                timestamp_seconds=ts_sec,
                 pts_sensor=pts_sensor,
                 lidar_ring=ring,
                 cfg=self.cfg,
                 uid=uid,
                 ref_to_sensor=ref_pose.numpy(),
             )
-            for uid, (lidar_tok, pts_sensor, ring, ts_norm, ref_pose) in enumerate(
-                zip(lidar_tokens, all_pts_sensor, all_lidar_ring, timestamps.tolist(), ref_to_sensor)
+            for uid, (lidar_tok, pts_sensor, ring, ts_norm, ts_sec, ref_pose) in enumerate(
+                zip(
+                    lidar_tokens,
+                    all_pts_sensor,
+                    all_lidar_ring,
+                    timestamps.tolist(),
+                    timestamps_sec.tolist(),
+                    ref_to_sensor,
+                )
             )
         ]
 
@@ -587,6 +626,8 @@ class NuScenesNVSDataset(Dataset):
             'point_iid':              torch.cat(input_iid, dim=0),
             'pose':                   input_pose,                          # (n_input, 4, 4)
             'timestamps':             input_timestamps,                    # (n_input,)
+            'timestamps_sec':         input_timestamps_sec,                # (n_input,)
+            'window_duration_sec':    window_duration_sec,                 # scalar
             'input_indices':          torch.tensor(input_indices),         # selected GT 안에서 input 위치
             'input_window_indices':   torch.tensor(input_window_indices),  # 11-frame window 안에서 input 위치
             },
@@ -601,6 +642,8 @@ class NuScenesNVSDataset(Dataset):
             'gt_point_iid':           torch.cat(iid_list, dim=0),
             'gt_pose':                pose,                               # (V, 4, 4)
             'gt_timestamps':          timestamps,                         # (V,)
+            'gt_timestamps_sec':      timestamps_sec,                     # (V,)
+            'window_duration_sec':    window_duration_sec,                # scalar
             'gt_cameras':             gt_cameras,
             'window_indices':         torch.tensor(source_window_indices),
             }
@@ -624,6 +667,8 @@ def multiframe_collate_fn(batch):
     all_input_bbox_iids  = []
     all_input_pose       = []
     all_input_timestamps = []
+    all_input_timestamps_sec = []
+    all_input_window_duration_sec = []
     all_input_indices    = []
     all_input_window_indices = []
 
@@ -636,6 +681,8 @@ def multiframe_collate_fn(batch):
     all_gt_bbox_iids  = []
     all_gt_pose       = []
     all_gt_timestamps = []
+    all_gt_timestamps_sec = []
+    all_gt_window_duration_sec = []
     all_gt_cameras    = []
     all_gt_window_indices = []
 
@@ -654,6 +701,8 @@ def multiframe_collate_fn(batch):
         all_input_bbox_iids.append(inp["bbox_instance_ids"])
         all_input_pose.append(inp["pose"])
         all_input_timestamps.append(inp["timestamps"])
+        all_input_timestamps_sec.append(inp["timestamps_sec"])
+        all_input_window_duration_sec.append(inp["window_duration_sec"])
         all_input_indices.append(inp["input_indices"])
         all_input_window_indices.append(inp["input_window_indices"])
 
@@ -666,6 +715,8 @@ def multiframe_collate_fn(batch):
         all_gt_bbox_iids.append(gt["gt_bbox_instance_ids"])
         all_gt_pose.append(gt["gt_pose"])
         all_gt_timestamps.append(gt["gt_timestamps"])
+        all_gt_timestamps_sec.append(gt["gt_timestamps_sec"])
+        all_gt_window_duration_sec.append(gt["window_duration_sec"])
         all_gt_cameras.append(gt["gt_cameras"])
         all_gt_window_indices.append(gt["window_indices"])
 
@@ -737,6 +788,8 @@ def multiframe_collate_fn(batch):
             "bbox_instance_ids":    all_input_bbox_iids,  # List[List[Tensor(B_f,)]]
             "pose":                all_input_pose,       # List[Tensor(n_input, 4, 4)]
             "timestamps":          all_input_timestamps, # List[Tensor(n_input,)]
+            "timestamps_sec":      all_input_timestamps_sec,
+            "window_duration_sec": torch.stack(all_input_window_duration_sec),
             "input_indices":       all_input_indices,    # List[Tensor]
             "input_window_indices": all_input_window_indices,
             "ptv3_input":          ptv3_input,
@@ -751,6 +804,8 @@ def multiframe_collate_fn(batch):
             "bbox_instance_ids":    all_gt_bbox_iids,        # List[List[Tensor(B_f,)]]
             "pose":                all_gt_pose,             # List[Tensor(V, 4, 4)]
             "timestamps":          all_gt_timestamps,       # List[Tensor(V,)]
+            "timestamps_sec":      all_gt_timestamps_sec,
+            "window_duration_sec": torch.stack(all_gt_window_duration_sec),
             "cameras":             all_gt_cameras,          # List[List[Camera]]
             "window_indices":      all_gt_window_indices,
         },
