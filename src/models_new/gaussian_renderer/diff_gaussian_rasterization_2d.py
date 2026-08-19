@@ -1,47 +1,60 @@
 import os
-import importlib.util
+import sys
+from pathlib import Path
 from typing import NamedTuple
 import torch.nn as nn
 import torch
+
+environment_bin_path = Path(sys.executable).resolve().parent
+environment_root = environment_bin_path.parent
+path_entries = os.environ.get("PATH", "").split(os.pathsep)
+if str(environment_bin_path) not in path_entries:
+    # Absolute interpreter invocations do not necessarily put their conda
+    # environment's Ninja/NVCC executables on PATH.
+    os.environ["PATH"] = os.pathsep.join([
+        str(environment_bin_path), *path_entries,
+    ])
+if (environment_bin_path / "nvcc").is_file():
+    # Set this before importing cpp_extension: CUDA_HOME is detected at module
+    # import time. This avoids accidentally selecting an older system toolkit.
+    os.environ["CUDA_HOME"] = str(environment_root)
+os.environ["TORCH_CUDA_ARCH_LIST"] = "8.9"
+for compiler_variable, compiler_path in (
+    ("CC", "/usr/bin/gcc-12"),
+    ("CXX", "/usr/bin/g++-12"),
+    ("CUDAHOSTCXX", "/usr/bin/g++-12"),
+):
+    if Path(compiler_path).is_file():
+        os.environ[compiler_variable] = compiler_path
+
 from torch.utils.cpp_extension import load
 
 parent_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "diff-gaussian-rasterization-2d")
+repository_root = Path(__file__).resolve().parents[3]
+extension_build_dir = (
+    repository_root
+    / ".cache"
+    / "torch_extensions"
+    / "diff_gaussian_rasterization"
+)
+extension_build_dir.mkdir(parents=True, exist_ok=True)
 
-
-def _load_prebuilt_extension():
-    extension_root = os.environ.get("TORCH_EXTENSIONS_DIR")
-    if not extension_root:
-        return None
-
-    extension_path = os.path.join(
-        extension_root,
-        "diff_gaussian_rasterization",
-        "diff_gaussian_rasterization.so",
-    )
-    if not os.path.isfile(extension_path):
-        return None
-
-    spec = importlib.util.spec_from_file_location("diff_gaussian_rasterization", extension_path)
-    if spec is None or spec.loader is None:
-        return None
-
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-_C = _load_prebuilt_extension()
-if _C is None:
-    _C = load(
-        name='diff_gaussian_rasterization',
-        extra_cuda_cflags=["-I " + os.path.join(parent_dir, "third_party/glm/"), "-g", "-gencode=arch=compute_89,code=sm_89", "--compiler-bindir", "/usr/bin/gcc-12"],
-        sources=[
-            os.path.join(parent_dir, "cuda_rasterizer/rasterizer_impl.cu"),
-            os.path.join(parent_dir, "cuda_rasterizer/forward.cu"),
-            os.path.join(parent_dir, "cuda_rasterizer/backward.cu"),
-            os.path.join(parent_dir, "rasterize_points.cu"),
-            os.path.join(parent_dir, "ext.cpp")],
-        verbose=True)
+# Keep the binary coupled to this worktree's source tree. Passing an explicit
+# build_directory prevents a machine-level TORCH_EXTENSIONS_DIR from silently
+# loading a rasterizer compiled by another checkout. cpp_extension.load uses
+# Ninja's dependency checks, so unchanged runs reuse the binary and edited
+# CUDA/C++ sources are rebuilt automatically.
+_C = load(
+    name='diff_gaussian_rasterization',
+    build_directory=str(extension_build_dir),
+    extra_cuda_cflags=["-I " + os.path.join(parent_dir, "third_party/glm/"), "-g", "-gencode=arch=compute_89,code=sm_89", "--compiler-bindir", "/usr/bin/gcc-12"],
+    sources=[
+        os.path.join(parent_dir, "cuda_rasterizer/rasterizer_impl.cu"),
+        os.path.join(parent_dir, "cuda_rasterizer/forward.cu"),
+        os.path.join(parent_dir, "cuda_rasterizer/backward.cu"),
+        os.path.join(parent_dir, "rasterize_points.cu"),
+        os.path.join(parent_dir, "ext.cpp")],
+    verbose=True)
 
 
 def cpu_deep_copy_tuple(input_tuple):
