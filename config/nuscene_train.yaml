@@ -1,5 +1,5 @@
 # CUDA_VISIBLE_DEVICES=4,5로 실행하므로 Lightning에는 logical index를 전달한다.
-device: [0, 1]
+device: [2, 5, 6]
 seed: 42
 
 project_name: 2dgs-utonia
@@ -8,7 +8,7 @@ mode: train
 
 
 loss:
-  w_chamfer: 0.02
+  w_chamfer: 0
   w_depth: 0.5          # depth supervision = 0.5 * mean-depth L1
   w_depth_median: 0.5   #                   + 0.5 * median-depth L1
   w_intensity: 0.2

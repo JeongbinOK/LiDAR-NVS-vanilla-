@@ -41,6 +41,21 @@ WANDB_COMMON_LOSS_KEYS = {
     "total",
 }
 
+# Progress-bar entries, in display order. These never reach W&B: they exist so
+# the terminal stays readable while the logged surface remains epoch-level.
+# ``loss_chamfer`` is included unconditionally because Loss computes the chamfer
+# distance on every batch regardless of ``w_chamfer`` -- a zero weight removes
+# it from the gradient, not from the forward pass, so the value stays real.
+PROGRESS_BAR_LOSS_KEYS = (
+    ("total", "total"),
+    ("loss_depth", "depth"),
+    ("loss_depth_median", "depth_med"),
+    ("loss_intensity", "inten"),
+    ("loss_raydrop", "raydrop"),
+    ("loss_chamfer", "chamfer"),
+    ("loss_scale", "scale"),
+)
+
 GLOBAL_REDUCED_LOSS_KEYS = {
     "loss_budget",
     "budget_expected_mean_k",
@@ -367,11 +382,37 @@ class ModelWrapper(LightningModule):
                 value,
                 on_step=False,
                 on_epoch=True,
-                prog_bar=(key == "total" or key.startswith("loss_")),
+                # Progress-bar display is handled separately below: a metric
+                # logged on_epoch only has nothing to show until the epoch ends,
+                # which would leave the bar blank for a whole epoch.
+                prog_bar=False,
                 # Budget terms already contain an autograd-safe global token
                 # reduction and therefore have identical forward values on all
                 # ranks. Avoid redundant logging collectives for those keys.
                 sync_dist=(key not in GLOBAL_REDUCED_LOSS_KEYS),
+                batch_size=batch_size,
+            )
+
+        # Terminal-only values. ``logger=False`` keeps these out of W&B, so the
+        # logged surface stays epoch-level while the bar still carries numbers.
+        # Train reports the running step value so the bar moves within an epoch;
+        # validation reports its epoch aggregate, which appears once the val
+        # loop finishes and then persists next to the training numbers.
+        is_train = prefix == "train"
+        for key, label in PROGRESS_BAR_LOSS_KEYS:
+            value = losses.get(key)
+            if not torch.is_tensor(value):
+                continue
+            self.log(
+                label if is_train else f"{prefix}_{label}",
+                value,
+                on_step=is_train,
+                on_epoch=not is_train,
+                prog_bar=True,
+                logger=False,
+                # Epoch-level entries would otherwise draw a per-key Lightning
+                # warning under DDP; a step-level one must not add a collective.
+                sync_dist=not is_train,
                 batch_size=batch_size,
             )
 
