@@ -41,6 +41,39 @@ WANDB_COMMON_LOSS_KEYS = {
     "total",
 }
 
+# Historical W&B key names. Lightning appends ``_epoch`` to a metric only when
+# it is logged with ``on_step`` and ``on_epoch`` both true, so every run before
+# the epoch-only switch wrote ``train/loss_scale_epoch``. Logging the same value
+# with ``on_epoch`` alone writes ``train/loss_scale``, which W&B treats as a
+# different metric and puts on its own panel, breaking comparison with those
+# runs. The suffix is therefore spelled out instead of being inherited from the
+# step/epoch fork. The routing budget and guide terms were epoch-only from the
+# day they were added and never carried a suffix, so they keep their bare names.
+# That list is written out rather than aliased to GLOBAL_REDUCED_LOSS_KEYS,
+# which encodes a collective-reduction property and only happens to hold the
+# same keys today.
+UNSUFFIXED_WANDB_LOSS_KEYS = frozenset({
+    "loss_budget",
+    "budget_expected_mean_k",
+    "budget_violation",
+    "loss_router_guide",
+    "router_guide_accuracy",
+    "router_guide_mean_target_k",
+    "router_guide_geometry_valid_fraction",
+    "router_guide_low_support_fraction",
+    "router_guide_frac_k1",
+    "router_guide_frac_k2",
+    "router_guide_frac_k3",
+    "router_guide_frac_k4",
+})
+
+
+def wandb_loss_key(prefix: str, key: str) -> str:
+    """Name an epoch-logged loss the way earlier runs named it."""
+    suffix = "" if key in UNSUFFIXED_WANDB_LOSS_KEYS else "_epoch"
+    return f"{prefix}/{key}{suffix}"
+
+
 # Progress-bar entries, in display order. These never reach W&B: they exist so
 # the terminal stays readable while the logged surface remains epoch-level.
 # ``loss_chamfer`` is included unconditionally because Loss computes the chamfer
@@ -378,7 +411,7 @@ class ModelWrapper(LightningModule):
             if not torch.is_tensor(value):
                 continue
             self.log(
-                f"{prefix}/{key}",
+                wandb_loss_key(prefix, key),
                 value,
                 on_step=False,
                 on_epoch=True,
