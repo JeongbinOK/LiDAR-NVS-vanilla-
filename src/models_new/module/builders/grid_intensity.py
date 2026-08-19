@@ -60,12 +60,17 @@ class OccupiedTokenBatch:
 
 
 class OccupiedGridTokenBuilder(nn.Module):
-    def __init__(self, cfg):
+    def __init__(self, cfg, *, one_seed_per_token=False):
         super().__init__()
         self.cfg = cfg
         self.anchor_mode = str(getattr(cfg, "anchor_mode", "spherical")).lower()
         self.grid_seed_config = None
-        if self.anchor_mode == "grid":
+        if self.anchor_mode == "grid" and one_seed_per_token:
+            # Dynamic 2DGS owns its Gaussian-count contract: one observed
+            # medoid seed for every occupied token. Do not require or read the
+            # legacy GridSlotHead routing/count configuration.
+            self.grid_seed_config = ("legacy", 1, 1, 1, None)
+        elif self.anchor_mode == "grid":
             grid_query = getattr(cfg, "grid_query", None)
             if grid_query is None:
                 raise ValueError("p2g.grid_query config block is required for anchor_mode='grid'")

@@ -15,7 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ..utils import boxes as box_utils
-from ..utils.attention import Rotary3D
+from ..utils.attention import FourierPositionEncoder3D, Rotary3D
 from .gaussian_assembly import gradient_scale_identity, opacity_gate_st
 
 
@@ -570,28 +570,23 @@ class ViewTokenPositionEncoder(nn.Module):
 
     def __init__(self, cfg):
         super().__init__()
-        self.position_frequencies = int(
-            getattr(cfg, "position_frequencies", 8)
-        )
-        if self.position_frequencies <= 0:
-            raise ValueError("viewpoint position frequency count must be positive")
+        self.position_frequencies = int(getattr(cfg, "position_frequencies", 8))
         # Half-period of the lowest band. It must cover the farthest returns
         # (110 m here), otherwise band 0 wraps inside the sensing range and two
         # tokens at very different distances collide in the embedding.
-        position_scale = float(getattr(cfg, "position_scale_m", 110.0))
-        if position_scale <= 0.0:
-            raise ValueError("viewpoint position_scale_m must be positive")
-        self.register_buffer(
-            "position_scale",
-            torch.tensor(position_scale, dtype=torch.float32),
-            persistent=False,
+        self.encoder = FourierPositionEncoder3D(
+            self.position_frequencies,
+            float(getattr(cfg, "position_scale_m", 110.0)),
         )
-        self.register_buffer(
-            "position_bands",
-            2.0 ** torch.arange(self.position_frequencies, dtype=torch.float32),
-            persistent=False,
-        )
-        self.out_dim = 3 * 2 * self.position_frequencies
+        self.out_dim = self.encoder.out_dim
+
+    @property
+    def position_scale(self):
+        return self.encoder.position_scale
+
+    @property
+    def position_bands(self):
+        return self.encoder.position_bands
 
     @staticmethod
     def to_view_frame(position_ref, pose):
@@ -613,11 +608,7 @@ class ViewTokenPositionEncoder(nn.Module):
 
     def forward(self, position_ref, pose):
         position_view = self.to_view_frame(position_ref.float(), pose.float())
-        normalized = position_view / self.position_scale
-        angles = torch.pi * normalized.unsqueeze(-1) * self.position_bands
-        return torch.cat(
-            [torch.sin(angles), torch.cos(angles)], dim=-1
-        ).flatten(-2)
+        return self.encoder(position_view)
 
 
 class GridSlotHead(nn.Module):

@@ -14,6 +14,11 @@ class GausRender(nn.Module):
         # should carry zero intensity/depth support and raydrop probability 1.
         self.background = torch.tensor([0, 0, 0, 1], dtype=torch.float32)
 
+    @staticmethod
+    def render_timestamp(camera):
+        """Legacy bbox transport uses the normalized window coordinate."""
+        return camera.timestamp
+
     def pack_lidar_shs(self, shs):
         if shs.dim() == 3:
             return shs
@@ -273,7 +278,7 @@ class GausRender(nn.Module):
             )
 
             for view_index, gt_cam in enumerate(gt_cameras):
-                t = gt_cam.timestamp
+                t = self.render_timestamp(gt_cam)
                 view_gs = self.select_target_view(
                     b_gs, view_index, target_view_groups[view_index]
                 )
@@ -377,3 +382,42 @@ class GausRender(nn.Module):
             "render_points": all_render_points,
             "gt_points": all_gt_points
         }
+
+
+class DynamicGausRender(GausRender):
+    """Render linearly transported Dynamic 2D Gaussians in physical seconds."""
+
+    @staticmethod
+    def render_timestamp(camera):
+        if getattr(camera, "timestamp_sec", None) is None:
+            raise AttributeError(
+                "Dynamic rendering requires Camera.timestamp_sec from the dataloader"
+            )
+        return camera.timestamp_sec
+
+    def get_means3D(self, b_gs, t):
+        position = b_gs["position"]
+        velocity = b_gs.get("velocity")
+        source_time = b_gs.get("source_time_sec")
+        if velocity is None or source_time is None:
+            raise KeyError(
+                "Dynamic Gaussian render input needs velocity and source_time_sec"
+            )
+        if velocity.shape != position.shape:
+            raise ValueError("Dynamic velocity must align with Gaussian positions")
+        if source_time.shape != (position.shape[0],):
+            raise ValueError("source_time_sec must provide one value per Gaussian")
+        target_time = torch.as_tensor(
+            t, device=position.device, dtype=position.dtype
+        )
+        delta_t = target_time - source_time.to(
+            device=position.device, dtype=position.dtype
+        )
+        return position + velocity * delta_t.unsqueeze(-1)
+
+    def get_rotations(self, b_gs, t):
+        # The first Dynamic 2DGS representation transports only position.
+        return b_gs["rotation"]
+
+
+__all__ = ["GausRender", "DynamicGausRender"]

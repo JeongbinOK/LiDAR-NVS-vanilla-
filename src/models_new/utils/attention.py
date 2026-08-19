@@ -94,6 +94,47 @@ class Rotary3D(nn.Module):
         )
         return rotated.flatten(-2)
 
+
+class FourierPositionEncoder3D(nn.Module):
+    """Explicit 3D Fourier features for an MLP input.
+
+    ``Rotary3D`` above is an attention operator: it rotates Q/K channels and
+    therefore cannot be concatenated directly to a non-attention decoder.  This
+    module provides the corresponding explicit sin/cos representation for
+    heads that need a position vector as ordinary input.
+    """
+
+    def __init__(self, num_frequencies: int = 4, position_scale_m: float = 110.0):
+        super().__init__()
+        self.num_frequencies = int(num_frequencies)
+        if self.num_frequencies <= 0:
+            raise ValueError("position frequency count must be positive")
+        position_scale_m = float(position_scale_m)
+        if position_scale_m <= 0.0:
+            raise ValueError("position_scale_m must be positive")
+        self.register_buffer(
+            "position_scale",
+            torch.tensor(position_scale_m, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "position_bands",
+            2.0 ** torch.arange(self.num_frequencies, dtype=torch.float32),
+            persistent=False,
+        )
+        self.out_dim = 3 * 2 * self.num_frequencies
+
+    def forward(self, position: torch.Tensor) -> torch.Tensor:
+        if position.shape[-1] != 3:
+            raise ValueError(
+                f"Fourier positions must end in 3 channels, got {tuple(position.shape)}"
+            )
+        normalized = position.float() / self.position_scale
+        angles = torch.pi * normalized.unsqueeze(-1) * self.position_bands
+        return torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1).flatten(-2).to(
+            position.dtype
+        )
+
 class AnchorQueryCrossAttention(nn.Module):
     """Varlen cross-attention: the queries of each anchor attend to that
     anchor's variable-length K/V token set.

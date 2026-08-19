@@ -15,12 +15,15 @@ def resolve_anchor_mode(cfg):
     return mode
 
 
-def build_token_builder(cfg):
+def build_token_builder(cfg, *, one_seed_per_token=False):
     """Build the tokenization path shared by spherical and grid modes."""
     mode = resolve_anchor_mode(cfg)
     from .grid_intensity import OccupiedGridTokenBuilder
 
-    return mode, OccupiedGridTokenBuilder(cfg)
+    return mode, OccupiedGridTokenBuilder(
+        cfg,
+        one_seed_per_token=one_seed_per_token,
+    )
 
 
 __all__ = ["SUPPORTED_ANCHOR_MODES", "build_token_builder", "resolve_anchor_mode"]

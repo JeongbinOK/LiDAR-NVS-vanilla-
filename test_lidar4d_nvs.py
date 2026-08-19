@@ -33,6 +33,7 @@ from torchvision.utils import make_grid, save_image
 
 from src.model_wrapper import ModelWrapper
 from src.config_loader import (
+    DYNAMIC_VARIANTS,
     assert_model_variant_implemented,
     resolve_eval_config,
 )
@@ -233,7 +234,14 @@ def main(cfg, config_source="unspecified"):
             target_pose=gt.get("pose"),
             target_timestamps=gt.get("timestamps"),
         )
-        out = model.g2g_model(out, _input["timestamps"])
+        if model.model_variant in DYNAMIC_VARIANTS:
+            out = model.g2g_model(
+                out,
+                _input["timestamps_sec"],
+                _input["window_duration_sec"],
+            )
+        else:
+            out = model.g2g_model(out, _input["timestamps"])
         renders = model.g2p_model(out, gt)
 
         b = 0
@@ -295,13 +303,14 @@ def main(cfg, config_source="unspecified"):
         # Viewpoint mode stores Common once and Additional per target view;
         # diagnostics must build the same transient union as the renderer.
         target_gaussians = model.g2p_model.select_target_view(out[b], target_cam)
+        render_t = float(model.g2p_model.render_timestamp(gt_cam))
         static_xyz, dynamic_xyz = gaussians_from_output(
-            model.g2p_model, target_gaussians, float(gt_cam.timestamp))
+            model.g2p_model, target_gaussians, render_t)
         seq_gauss[seq_name].append({
             "label": f"T={target_s}s", "static": static_xyz, "dynamic": dynamic_xyz,
             "input_points": in_pts, "gt_points": gt_pts})
         surf = surfels_from_output(
-            model.g2p_model, target_gaussians, float(gt_cam.timestamp)
+            model.g2p_model, target_gaussians, render_t
         )
         seq_surfel[seq_name].append({
             "label": f"T={target_s}s", "static": surf["static"],
@@ -311,7 +320,7 @@ def main(cfg, config_source="unspecified"):
 
         # per-window Gaussian-size statistics (effective radius vs geometry)
         st = collect_window_stats(
-            model.g2p_model, target_gaussians, float(gt_cam.timestamp)
+            model.g2p_model, target_gaussians, render_t
         )
         size_records.append(st)
         size_by_split[nuscenes_split].append(st)

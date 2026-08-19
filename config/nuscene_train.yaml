@@ -1,6 +1,11 @@
 device: [8, 9]
 seed: 42
 
+model:
+  # This dedicated worktree defaults to the current Dynamic 2DGS baseline.
+  # Historical configs with no model block are still restored as bbox_rigid_v1.
+  variant: dynamic_2dgs_attention_velocity_v5
+
 project_name: 2dgs-utonia
 exp_name:  ${p2g.anchor_mode}-bs-${train.batch_size}-n-cd
 mode: train

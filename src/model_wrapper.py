@@ -4,9 +4,15 @@ import math
 from pathlib import Path
 from omegaconf import OmegaConf
 
-from src.models_new.module import Point2Gaus, GausTemp, GausRender
+from src.models_new.module import (
+    Point2Gaus,
+    GausTemp,
+    GausRender,
+    DynamicGausTemp,
+    DynamicGausRender,
+)
 from lightning.pytorch import LightningModule
-from src.models_new.utils.loss import Loss
+from src.models_new.utils.loss import Loss, budget_weight_at_step
 from src.models_new.utils.routing_logging import (
     distributed_sum_statistics,
     range_bin_labels,
@@ -14,17 +20,18 @@ from src.models_new.utils.routing_logging import (
 )
 from src.config_loader import DYNAMIC_VARIANTS, LEGACY_VARIANT
 
-WANDB_COMMON_LOSS_KEYS = {
+WANDB_BASE_LOSS_KEYS = {
     "loss_depth",
     "loss_depth_median",
     "loss_intensity",
     "loss_raydrop",
-    "loss_chamfer",
     "loss_scale",
-    "loss_budget",
-    "budget_expected_mean_k",
-    "budget_violation",
-    "render_points_mean",
+    "total",
+    # Reconstruction quality. Keys absent from a given step's loss dict are
+    # skipped by _log_losses, so these follow whatever schedule produced them:
+    # chamfer is computed for val/test (and for train only when w_chamfer>0),
+    # while the PSNR/SSIM pairs follow _metric_schedule.
+    "loss_chamfer",
     "intensity_psnr_valid",
     "intensity_ssim_valid",
     "depth_psnr_valid",
@@ -33,7 +40,6 @@ WANDB_COMMON_LOSS_KEYS = {
     "intensity_ssim_raydrop",
     "depth_psnr_raydrop",
     "depth_ssim_raydrop",
-    "total",
 }
 
 GLOBAL_REDUCED_LOSS_KEYS = {
@@ -69,9 +75,20 @@ class ModelWrapper(LightningModule):
         self.g2p_cfg = cfg.g2p
 
         # Set up the model.
-        self.p2g_model = Point2Gaus(self.p2g_cfg)
-        self.g2g_model = GausTemp(self.g2g_cfg)
-        self.g2p_model = GausRender(self.g2p_cfg)
+        if self.model_variant in DYNAMIC_VARIANTS:
+            self.dynamic_cfg = cfg.dynamic_2dgs
+            self.p2g_model = Point2Gaus(
+                self.p2g_cfg,
+                dynamic_cfg=self.dynamic_cfg,
+                dynamic_variant=self.model_variant,
+            )
+            self.g2g_model = DynamicGausTemp(self.g2g_cfg)
+            self.g2p_model = DynamicGausRender(self.g2p_cfg)
+        else:
+            self.dynamic_cfg = None
+            self.p2g_model = Point2Gaus(self.p2g_cfg)
+            self.g2g_model = GausTemp(self.g2g_cfg)
+            self.g2p_model = GausRender(self.g2p_cfg)
         self.loss = Loss(self.cfg.loss)
         self._eval_pair_summaries: dict[str, list[dict]] = {}
         self._metric_interval = int(self._cfg_get("metrics.interval", 50))
@@ -147,6 +164,23 @@ class ModelWrapper(LightningModule):
                     "learned_count.budget warmup_steps/ramp_steps must be "
                     "non-negative"
                 )
+        self._wandb_loss_keys = set(WANDB_BASE_LOSS_KEYS)
+        if self._budget_enable:
+            self._wandb_loss_keys.add("loss_budget")
+        regularization = getattr(self.dynamic_cfg, "regularization", None)
+        small_motion = getattr(regularization, "small_motion", None)
+        if small_motion is not None and bool(getattr(small_motion, "enabled", False)):
+            self._wandb_loss_keys.add("loss_velocity_prior")
+        velocity_l2 = getattr(regularization, "velocity_l2", None)
+        self._velocity_l2_cfg = (
+            velocity_l2
+            if velocity_l2 is not None and bool(getattr(velocity_l2, "enabled", False))
+            else None
+        )
+        if self._velocity_l2_cfg is not None:
+            if float(getattr(self._velocity_l2_cfg, "weight", 0.0)) < 0.0:
+                raise ValueError("velocity_l2.weight must be non-negative")
+            self._wandb_loss_keys.add("loss_velocity_l2")
 
     def on_save_checkpoint(self, checkpoint) -> None:
         """Bind the resolved experiment config immutably to each checkpoint."""
@@ -179,7 +213,14 @@ class ModelWrapper(LightningModule):
         # Keep detached diagnostics outside the renderer/temporal model input.
         routing_stats = p2g_out.pop("routing_stats", None)
         routing_budget_logits = p2g_out.pop("routing_budget_logits", None)
-        out = self.g2g_model(p2g_out, _input["timestamps"])
+        if self.model_variant in DYNAMIC_VARIANTS:
+            out = self.g2g_model(
+                p2g_out,
+                _input["timestamps_sec"],
+                _input["window_duration_sec"],
+            )
+        else:
+            out = self.g2g_model(p2g_out, _input["timestamps"])
         all_renders = self.g2p_model(out, gt)
 
         compute_valid_metrics, compute_official_metrics = self._metric_schedule(
@@ -196,6 +237,8 @@ class ModelWrapper(LightningModule):
             compute_valid_metrics=compute_valid_metrics,
             compute_raydrop_metrics=compute_official_metrics,
         )
+        if self.model_variant in DYNAMIC_VARIANTS:
+            self._add_dynamic_motion_regularization(loss_dict, out, prefix=prefix)
         self._log_losses(loss_dict, prefix=prefix, batch_size=self._batch_size(_input))
         self._log_routing_stats(routing_stats, prefix=prefix)
 
@@ -204,13 +247,163 @@ class ModelWrapper(LightningModule):
 
         return loss_dict["total"]
 
+    def _add_dynamic_motion_regularization(self, losses, gaussians, *, prefix):
+        """Apply the configured motion priors and log runaway diagnostics."""
+        self._add_small_motion_prior(losses, gaussians, prefix=prefix)
+        self._add_velocity_l2_prior(losses, gaussians, prefix=prefix)
+        self._log_velocity_statistics(gaussians, prefix=prefix)
+        self._log_attention_temperature(prefix=prefix)
+
+    def _log_attention_temperature(self, *, prefix: str) -> None:
+        """Softmax-temperature alarm for the motion attention (V5 QK-Norm).
+
+        Under QK-Norm ``|q| = gamma * sqrt(head_dim)`` exactly, so the norm gains
+        alone bound the logit and no attention probabilities have to be built to
+        watch for saturation. V4 collapsed to a hard argmax by epoch 2-9 with
+        nothing logged; this is that missing alarm.
+        """
+        temporal = getattr(
+            getattr(self.p2g_model, "dynamic_backend", None), "temporal", None
+        )
+        stats = temporal.attention_temperature_stats() if temporal is not None else None
+        if not stats:
+            return
+        for name, value in stats.items():
+            self.log(
+                f"{prefix}/dynamic/{name}",
+                float(value),
+                on_step=False,
+                on_epoch=True,
+                sync_dist=False,
+                batch_size=1,
+            )
+
+    @staticmethod
+    def _active_motion_items(gaussians):
+        return [
+            item for item in gaussians
+            if item is not None and item["velocity"].numel() > 0
+        ]
+
+    def _add_velocity_l2_prior(self, losses, gaussians, *, prefix):
+        """STORM-style mean-squared velocity prior, in metres/second.
+
+        The penalty is a mean over every Gaussian *and* component (``|v|^2/3``),
+        matching the normalization the reference weight 0.005 was tuned for.
+        That normalization is what makes it selective rather than a blanket
+        freeze: the escape shortcut only pays off when a large fraction of
+        tokens leave the scene, which the mean punishes hard, while genuine
+        traffic is a small fraction of tokens and stays affordable.
+
+        The raw term is logged in every mode, but only train adds it to the
+        optimized total, so validation totals stay a pure reconstruction score.
+        """
+        cfg = self._velocity_l2_cfg
+        if cfg is None:
+            return
+
+        active = self._active_motion_items(gaussians)
+        if not active:
+            # Keep the term attached to the graph so DDP sees identical
+            # parameter usage on every rank.
+            raw_loss = losses["total"] * 0.0
+        else:
+            velocity = torch.cat([item["velocity"] for item in active], dim=0)
+            raw_loss = velocity.square().mean()
+        losses["loss_velocity_l2"] = raw_loss
+
+        if prefix != "train":
+            return
+        effective_weight = budget_weight_at_step(
+            float(getattr(cfg, "weight", 0.0)),
+            int(self.global_step),
+            int(getattr(cfg, "warmup_steps", 0)),
+            int(getattr(cfg, "ramp_steps", 0)),
+        )
+        weighted = raw_loss * effective_weight
+        losses["wc_velocity_l2"] = weighted.detach()
+        losses["total"] = losses["total"] + weighted
+
+    @torch.no_grad()
+    def _log_velocity_statistics(self, gaussians, *, prefix: str) -> None:
+        """Motion-magnitude alarms; V3 diverged without these being visible."""
+        active = self._active_motion_items(gaussians)
+        if not active:
+            # Unreachable during training: the renderer rejects a None batch and
+            # every occupied token emits a Gaussian, so all ranks reach the
+            # sync_dist logging below together. This guard only covers callers
+            # that hand in an empty list.
+            return
+        velocity = torch.cat([item["velocity"] for item in active], dim=0)
+        speed = velocity.norm(dim=-1)
+        statistics = {
+            "velocity_speed_mean": speed.mean(),
+            # Under DDP this reduces to the mean of per-rank maxima rather than
+            # a global max. It is still a usable runaway alarm.
+            "velocity_speed_max": speed.max(),
+            "velocity_abs_mean": velocity.abs().mean(),
+            # nuScenes traffic tops out near 30 m/s, so a rising fraction here
+            # is motion the scene cannot physically contain.
+            "velocity_frac_over_30mps": (speed > 30.0).to(speed.dtype).mean(),
+        }
+        for name, value in statistics.items():
+            self.log(
+                f"{prefix}/dynamic/{name}",
+                value,
+                on_step=(prefix == "train"),
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=int(speed.numel()),
+            )
+
+    def _add_small_motion_prior(self, losses, gaussians, *, prefix):
+        """Optional robust prior on physical displacement over each window."""
+        cfg = getattr(getattr(self.dynamic_cfg, "regularization", None),
+                      "small_motion", None)
+        enabled = bool(getattr(cfg, "enabled", False)) if cfg else False
+        if not enabled or prefix != "train":
+            return
+
+        active = self._active_motion_items(gaussians)
+        if not active:
+            reference = losses["total"]
+            raw_loss = reference * 0.0
+        else:
+            displacement = torch.cat([
+                item["velocity"] * item["window_duration_sec"].unsqueeze(-1)
+                for item in active
+            ], dim=0)
+            epsilon = float(getattr(cfg, "epsilon_m", 1.0e-3)) if cfg else 1.0e-3
+            speed = displacement.norm(dim=-1)
+            raw_loss = (
+                torch.sqrt(speed.square() + epsilon * epsilon) - epsilon
+            ).mean()
+
+        max_weight = float(getattr(cfg, "weight", 0.0)) if cfg else 0.0
+        warmup = int(getattr(cfg, "warmup_steps", 0)) if cfg else 0
+        ramp = int(getattr(cfg, "ramp_steps", 0)) if cfg else 0
+        step = int(self.global_step)
+        if step < warmup:
+            effective_weight = 0.0
+        elif ramp <= 0:
+            effective_weight = max_weight
+        else:
+            effective_weight = max_weight * min(
+                1.0, float(step - warmup + 1) / float(ramp)
+            )
+        weighted = raw_loss * effective_weight
+        losses["loss_velocity_prior"] = raw_loss
+        losses["wc_velocity_prior"] = weighted.detach()
+        losses["total"] = losses["total"] + weighted
+
     def _metric_schedule(self, prefix: str, batch_idx: int) -> tuple[bool, bool]:
         """Return ``(valid, official_raydrop)`` metric switches for this batch.
 
         Train computes both diagnostic and official metrics once per configured
         optimizer-step interval. Validation/test computes official LiDAR4D /
-        GS-LiDAR metrics for every frame, while the valid-only diagnostics stay
-        sparse. Every rank follows the same schedule, so conditional
+        GS-LiDAR metrics for every frame, while the valid-only metrics stay
+        sparse. Train keys off ``global_step`` and validation off ``batch_idx``,
+        both of which advance identically on every rank, so conditional
         ``sync_dist=True`` logging cannot deadlock under DDP.
         """
         if prefix == "train":
@@ -249,7 +442,7 @@ class ModelWrapper(LightningModule):
 
     def _log_losses(self, losses: dict, *, prefix: str, batch_size: int) -> None:
         for key, value in losses.items():
-            if key not in WANDB_COMMON_LOSS_KEYS:
+            if key not in self._wandb_loss_keys:
                 continue
             if not torch.is_tensor(value):
                 continue

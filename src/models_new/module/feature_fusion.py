@@ -40,13 +40,18 @@ def build_feature_fusion(cfg, *, utonia_dim: int, intensity_dim: int,
         utonia_dim, bottleneck=bottleneck or None
     )
     agg_cfg = cfg.agg_mlp
-    fusion_mlp = nn.Sequential(
-        nn.Linear(utonia_dim + intensity_dim, int(agg_cfg.hidden_dim)),
+    hidden_dim = int(agg_cfg.hidden_dim)
+    hidden_layers = int(getattr(agg_cfg, "hidden_layers", 2))
+    if hidden_layers < 1:
+        raise ValueError("p2g.agg_mlp.hidden_layers must be at least one")
+    fusion_layers = [
+        nn.Linear(utonia_dim + intensity_dim, hidden_dim),
         nn.SiLU(),
-        nn.Linear(int(agg_cfg.hidden_dim), int(agg_cfg.hidden_dim)),
-        nn.SiLU(),
-        nn.Linear(int(agg_cfg.hidden_dim), int(agg_cfg.out_dim)),
-    )
+    ]
+    for _ in range(hidden_layers - 1):
+        fusion_layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.SiLU()])
+    fusion_layers.append(nn.Linear(hidden_dim, int(agg_cfg.out_dim)))
+    fusion_mlp = nn.Sequential(*fusion_layers)
     refiner = build_joint_refiner(
         getattr(cfg, "joint_refiner", None),
         dim=int(agg_cfg.out_dim),

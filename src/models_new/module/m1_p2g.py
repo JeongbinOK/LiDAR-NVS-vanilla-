@@ -23,9 +23,11 @@ from .gaussian_assembly import (
 class Point2Gaus(nn.Module):
     """Point to Gaussian."""
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, dynamic_cfg=None, dynamic_variant=None):
         super().__init__()
         self.cfg = cfg
+        self.dynamic_cfg = dynamic_cfg
+        self.dynamic_variant = dynamic_variant
 
         self.freeze_utonia = bool(getattr(cfg, "freeze_utonia", True))
         # Load the frozen Utonia encoder from a repo-local checkpoint so the weights
@@ -57,7 +59,10 @@ class Point2Gaus(nn.Module):
         self.grid_mapper = UtoniaGridMapper(
             self.utonia_coord_scale, self.utonia_input_grid_size, self.utonia_stride_factor
         )
-        self.anchor_mode, self.anchor_builder = build_token_builder(cfg)
+        self.anchor_mode, self.anchor_builder = build_token_builder(
+            cfg,
+            one_seed_per_token=self.dynamic_cfg is not None,
+        )
 
         self.agg_mlp = cfg.agg_mlp
         # Intensity width is part of the shared token-builder contract.
@@ -89,6 +94,50 @@ class Point2Gaus(nn.Module):
         ] + ([self.offset_size] if self.use_offset else [])
         gs_out_dim = sum(self.gs_param_sizes)
         trunk_dim = int(self.agg_mlp.out_dim)
+
+        # Dynamic 2DGS shares everything above this boundary (frozen Utonia,
+        # occupied-grid construction, intensity fusion, and joint refiner) but
+        # registers only its own temporal/GS/motion backend below it. Keeping
+        # the legacy modules absent avoids DDP unused parameters and makes the
+        # variant checkpoint structure unambiguous.
+        if self.dynamic_cfg is not None:
+            if self.anchor_mode != "grid":
+                raise ValueError("Dynamic 2DGS requires p2g.anchor_mode='grid'")
+            from src.config_loader import (
+                DYNAMIC_VARIANT,
+                DYNAMIC_VARIANT_V1,
+                DYNAMIC_VARIANT_V3,
+                DYNAMIC_VARIANT_V3_1,
+                DYNAMIC_VARIANT_V4,
+            )
+            from .dynamic_gaussian import (
+                AttentionInitializedVelocityGaussianBackend,
+                DynamicGaussianBackend,
+                PhysicalVelocityGaussianBackend,
+            )
+
+            # V3.1 differs from V3 only by its objective. V4 preserves the same
+            # parameter structure but activates attention-derived initialization.
+            # V5 shares V4's backend and differs only by temporal config keys
+            # (QK-Norm and a finer motion-head RoPE band).
+            backend_cls = {
+                DYNAMIC_VARIANT_V1: DynamicGaussianBackend,
+                DYNAMIC_VARIANT_V3: PhysicalVelocityGaussianBackend,
+                DYNAMIC_VARIANT_V3_1: PhysicalVelocityGaussianBackend,
+                DYNAMIC_VARIANT_V4: AttentionInitializedVelocityGaussianBackend,
+                DYNAMIC_VARIANT: AttentionInitializedVelocityGaussianBackend,
+            }.get(self.dynamic_variant)
+            if backend_cls is None:
+                raise ValueError(
+                    f"Unsupported dynamic model variant={self.dynamic_variant!r}"
+                )
+            self.dynamic_backend = backend_cls(
+                self.dynamic_cfg,
+                cfg.gs_params,
+                dim=trunk_dim,
+                offset_bound=self.offset_bound,
+            )
+            return
 
         # Both anchor modes share the token temporal-fusion stage (background
         # 0.8 m radius cross-frame attention + per-instance self-attention).
@@ -222,8 +271,14 @@ class Point2Gaus(nn.Module):
         offset = _input["offset"]
         point_batch_idx = _input["batch_idx"]
         pose = _input["pose"]
-        bbox = _input["bbox"]
-        bbox_instance_ids = _input.get("bbox_instance_ids")
+        # Bboxes remain in the dataloader for legacy runs, but the dynamic
+        # backend does not even read their keys. This keeps its model contract
+        # genuinely bbox-free and lets the loader be simplified independently
+        # later without touching the representation.
+        bbox = _input["bbox"] if self.dynamic_cfg is None else None
+        bbox_instance_ids = (
+            _input.get("bbox_instance_ids") if self.dynamic_cfg is None else None
+        )
         features = self._forward_utonia_features(_input["ptv3_input"])
 
         # Shared contract for both anchor modes: occupied Cartesian tokens and
@@ -278,9 +333,10 @@ class Point2Gaus(nn.Module):
             all_ifeat.append(ifeat_list[i])
             all_gc.append(gc_list[i])
             all_frame_batch.append(b)
-            all_bbox.append(bbox[b][local_f])   # Tensor(B_f, 7)
-            if bbox_instance_ids is not None:
-                all_bbox_iids.append(bbox_instance_ids[b][local_f])
+            if self.dynamic_cfg is None:
+                all_bbox.append(bbox[b][local_f])   # Tensor(B_f, 7)
+                if bbox_instance_ids is not None:
+                    all_bbox_iids.append(bbox_instance_ids[b][local_f])
             if raw_membership_list is not None:
                 membership = raw_membership_list[i]
                 all_raw_point_sensor.append(membership.points_sensor)
@@ -304,7 +360,9 @@ class Point2Gaus(nn.Module):
             all_delta_sensor = torch.cat(
                 [item.delta_sensor for item in grid_seed_list], dim=0
             )
-            if self.grid_slot_head.count_mode == "legacy":
+            if self.dynamic_cfg is not None:
+                all_anchor_k = None
+            elif self.grid_slot_head.count_mode == "legacy":
                 if any(item.anchor_k is None for item in grid_seed_list):
                     raise RuntimeError(
                         "legacy grid seed data must provide anchor_k"
@@ -338,6 +396,35 @@ class Point2Gaus(nn.Module):
             grid_coord=all_gc,
             offset=new_offset,
         )
+
+        if self.dynamic_cfg is not None:
+            timestamps_sec = _input.get("timestamps_sec")
+            window_duration_sec = _input.get("window_duration_sec")
+            if timestamps_sec is None or window_duration_sec is None:
+                raise KeyError(
+                    "Dynamic 2DGS requires timestamps_sec and "
+                    "window_duration_sec from the dataloader"
+                )
+            dynamic_out = self.dynamic_backend(
+                agg_feat_i,
+                all_pos,
+                all_seed_sensor,
+                new_offset,
+                frame_batch_idx,
+                pose,
+                _input["timestamps"],
+                timestamps_sec,
+                window_duration_sec,
+            )
+            return {
+                **dynamic_out,
+                "pose": pose,
+                "timestamps": _input["timestamps"],
+                "timestamps_sec": timestamps_sec,
+                "window_duration_sec": window_duration_sec,
+                "routing_stats": None,
+                "routing_budget_logits": None,
+            }
 
         if self.anchor_mode == "spherical":
             seeds = build_spherical_gaussian_seeds(
