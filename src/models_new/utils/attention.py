@@ -151,7 +151,7 @@ class AnchorQueryCrossAttention(nn.Module):
         # (cross-attn sublayer -> FFN sublayer, both post-norm residual). The
         # second linear is zero-init so the FFN branch contributes 0 at init:
         # training starts from the pre-FFN behaviour and learns the delta (same
-        # zero-init-residual trick as UtoniaResidualAdapter; guards the NaN-collapse
+        # Start the residual adapter as an identity mapping.
         # history from injecting random activations here).
         hidden = int(dim * mlp_ratio)
         self.ffn = nn.ModuleList([
@@ -302,7 +302,7 @@ class AnchorQueryCrossAttention(nn.Module):
                 kf = kf.reshape(cs, L_max, H, dh)
                 vf = vf.reshape(cs, L_max, H, dh)
 
-                # fp32 scores / softmax (NaN-collapse guard), rotary q/k
+                # Evaluate rotary Q/K scores and softmax in fp32.
                 q_rot = self.rope.rotate(qh.float(), q_ang[:, :, None, :, :])
                 k_rot = self.rope.rotate(kf.float(), k_ang[:, :, None, :, :])
                 scores = torch.einsum('ckhd,clhd->chkl', q_rot, k_rot) * self.scale

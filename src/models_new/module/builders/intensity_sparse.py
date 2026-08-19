@@ -25,7 +25,7 @@ same convention as ``IntensityMLPEncoder._encode``.
 
 Norm: LayerNorm on features (batch-independent -> stable with batch_size 2 and
 frame-varying point counts; consistent with the PTv3 LN style; safer given the
-NaN-collapse history) rather than the BatchNorm usual for sparse convs. Each conv
+stable small-batch training) rather than the BatchNorm usual for sparse convs. Each conv
 is post-normed (conv -> LN -> SiLU); the 5D input is already ~unit scale.
 
 Downsampling uses kernel-2/stride-2 SparseConv (non-overlapping -> floor(in/2),

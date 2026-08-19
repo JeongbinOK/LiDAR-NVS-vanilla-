@@ -88,9 +88,7 @@ def build_scaling_rotation(s, r):
 
 class Gaussianutil: 
     def __init__(self, cfg):
-        # softplus (not exp): its derivative is sigmoid (<=1) and growth is linear, not
-        # explosive, so a large raw scale logit can no longer overflow the rasterizer
-        # backward into a NaN gradient (the epoch-9 collapse trigger). c=1, plain softplus.
+        # Softplus keeps scales positive with bounded derivative and linear growth.
         self.scaling_activation = torch.nn.functional.softplus
         self.scaling_inverse_activation = lambda x: torch.log(torch.expm1(x))
 

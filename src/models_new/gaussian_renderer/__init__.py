@@ -52,7 +52,7 @@ def render(viewpoint_camera, pc, cfg, bg_color, input_timestamp, scaling_modifie
         sh_degree=cfg.sh_degree,
         campos=viewpoint_camera.camera_center.to(device=render_device, dtype=render_dtype),
         prefiltered=False,
-        debug=cfg.debug,
+        debug=False,
         vfov=viewpoint_camera.vfov,
         hfov=viewpoint_camera.hfov,
         row_to_theta=viewpoint_camera.row_to_theta.to(device=render_device, dtype=render_dtype),
