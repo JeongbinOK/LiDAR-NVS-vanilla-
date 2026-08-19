@@ -1,0 +1,79 @@
+# Historical bbox-routed rigid-object transport.  Keep this overlay minimal so
+# old configs/checkpoints remain the default when model.variant is absent.
+model:
+  variant: bbox_rigid_v1
+
+p2g:
+  squery:                       # spherical mode only: raw-point occupied cell = anchor
+    count_mode: learned_gumbel  # legacy | learned_gumbel
+    token_stride_m: 0.4
+    dtheta_deg: 4.5
+    dphi_deg: 3.0
+    dlogr: 0.12
+    dr_m: 0.8
+    r_min: 2.0
+    r_max: 110.0
+    max_kv: 64
+    rope_scale_bg: adaptive
+    rope_scale_fg: adaptive
+    attn_chunk: 8192
+    n_layers: 2
+    cross_attn_backend: flash_varlen
+    self_attn_layers: 1
+    self_attn_backend: flash_varlen
+    grad_balance: sqrt_k
+    learned_count:
+      K_max: 4
+      tau: 1.0
+      local_attn_heads: 8
+      local_attn_layers: 2
+      local_ffn_ratio: 4
+      stat_embedding_dim: 64
+      stat_min_raw: 6
+      stat_min_valid_loo: 3
+      stat_loo_eps: 0.001
+      stat_range_min_m: 2.5
+      stat_range_max_m: 110.0
+      stat_loo_knee_m: 0.01
+      stat_loo_cap_m: 0.8
+      ray_azimuth_count: 1085
+      grad_balance_scope: token
+      budget:
+        enable: true
+        target_mean_k: 2.0
+        weight: 1.0
+        warmup_steps: 500
+        ramp_steps: 1000
+      logging:
+        enable: true
+        interval: 20
+
+  grid_query:
+    count_mode: learned_gumbel
+    K_max: 3
+    points_per_gaussian: 4
+    exp: 1
+    learned_count:
+      K_max: 4
+      tau: 1.0
+      seed_mode: range_quantile
+      viewpoint:
+        position_frequencies: 8
+        position_scale_m: 110.0
+      grad_balance_scope: token
+      budget:
+        enable: true
+        target_mean_k: 2.0
+        weight: 1.0
+        warmup_steps: 500
+        ramp_steps: 1000
+      logging:
+        enable: true
+        interval: 20
+        range_edges_m: [0, 10, 20, 30, 40, 60, 80, 110]
+    bg_radius_m: 0.8
+    bg_max_kv_per_frame: 8
+    num_heads: 8
+    bg_layers: 2
+    fg_layers: 2
+    grad_balance: sqrt_k

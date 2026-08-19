@@ -1,0 +1,54 @@
+# Historical direct-velocity Dynamic 2DGS. Kept runnable so checkpoints from the
+# first experiment retain an exact architecture. Fresh runs default to v3.
+model:
+  variant: dynamic_2dgs_direct_velocity_v1
+
+exp_name: ${model.variant}-grid-bs-${train.batch_size}
+
+p2g:
+  anchor_mode: grid
+
+data:
+  # Keep the current loader contract. Bboxes remain loaded and collated, but
+  # the dynamic backend must not consume them.
+  mode: bbox
+
+g2p:
+  # This is an unrelated, incomplete legacy renderer flag. Dynamic transport
+  # is selected by model.variant and must not enable it.
+  dynamic: false
+
+dynamic_2dgs:
+  temporal:
+    implementation: flash_varlen
+    layers: 2
+    num_heads: 8
+    mlp_ratio: 4
+    time_embedding_dim: 64
+    time_frequencies: 8
+    rope_base: 10.0
+    rope_range_m: 110.0
+    layer_scale_init: 0.1
+
+  gaussian_head:
+    cell_size_m: 0.8
+    geometry_dim: 64
+    initial_opacity: 0.2
+    initial_scale_m: 0.3
+
+  motion:
+    max_speed_mps: 25.0
+    zero_init: true
+    duration_embedding_dim: 32
+    position_frequencies: 4
+    position_range_m: 110.0
+
+  regularization:
+    # Enable only after the no-prior dynamics smoke test establishes the loss
+    # scale; a full-strength prior at step zero can collapse sparse motion to 0.
+    small_motion:
+      enabled: false
+      weight: 0.005
+      epsilon_m: 0.001
+      warmup_steps: 300
+      ramp_steps: 1700

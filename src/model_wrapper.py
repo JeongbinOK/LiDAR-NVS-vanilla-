@@ -2,6 +2,7 @@ import torch
 import json
 import math
 from pathlib import Path
+from omegaconf import OmegaConf
 
 from src.models_new.module import Point2Gaus, GausTemp, GausRender
 from lightning.pytorch import LightningModule
@@ -11,6 +12,7 @@ from src.models_new.utils.routing_logging import (
     range_bin_labels,
     routing_sufficient_statistics,
 )
+from src.config_loader import DYNAMIC_VARIANTS, LEGACY_VARIANT
 
 WANDB_COMMON_LOSS_KEYS = {
     "loss_depth",
@@ -54,6 +56,13 @@ class ModelWrapper(LightningModule):
     ):
         super().__init__()
         self.cfg = cfg
+        model_cfg = getattr(cfg, "model", None)
+        self.model_variant = str(
+            getattr(model_cfg, "variant", LEGACY_VARIANT)
+            if model_cfg is not None else LEGACY_VARIANT
+        )
+        if self.model_variant not in (LEGACY_VARIANT, *DYNAMIC_VARIANTS):
+            raise ValueError(f"Unsupported model.variant={self.model_variant!r}")
         #self.optimizer_cfg = cfg.optimizer
         self.p2g_cfg = cfg.p2g
         self.g2g_cfg = cfg.g2g
@@ -138,6 +147,15 @@ class ModelWrapper(LightningModule):
                     "learned_count.budget warmup_steps/ramp_steps must be "
                     "non-negative"
                 )
+
+    def on_save_checkpoint(self, checkpoint) -> None:
+        """Bind the resolved experiment config immutably to each checkpoint."""
+
+        checkpoint["experiment_config_schema_version"] = 1
+        checkpoint["experiment_config"] = OmegaConf.to_container(
+            self.cfg,
+            resolve=True,
+        )
 
     def training_step(self, batch, batch_idx):
         return self._shared_step(batch, batch_idx, prefix="train")

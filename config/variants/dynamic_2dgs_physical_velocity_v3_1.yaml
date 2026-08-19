@@ -1,0 +1,83 @@
+# Current bbox-free Dynamic 2DGS baseline. Identical architecture to V3; the one
+# objective change is the STORM-style L2 velocity prior, which V3 ran without.
+# V3 diverged because nothing bounded the motion head: mean speed grew
+# 29 -> 281 m/s over five epochs (max 1874 m/s) as the model learned to throw
+# other-frame tokens out of the scene instead of reconstructing them. Once a
+# Gaussian leaves the frustum the rasterizer gradient is zero, so the escape is
+# irreversible and the middle-view render collapses. See
+# docs/dynamic_v3_divergence_diagnosis.md.
+model:
+  variant: dynamic_2dgs_physical_velocity_v3_1
+
+exp_name: ${model.variant}-bs-${train.batch_size}
+
+p2g:
+  anchor_mode: grid
+  # Preserve the 576 input channels (432D Utonia + 144D intensity) after the
+  # nonlinear fusion trunk instead of expanding every temporal token to 768D.
+  agg_mlp:
+    hidden_dim: 1024
+    hidden_layers: 2
+    out_dim: 576
+  joint_refiner:
+    # 576 / 12 = 48 channels/head; 48 satisfies xyz RoPE and FlashAttention.
+    num_heads: 12
+
+data:
+  # Keep the shared loader contract. Boxes are loaded but never consumed here.
+  mode: bbox
+
+dynamic_2dgs:
+  temporal:
+    implementation: flash_varlen
+    layers: 2
+    # Keep the proven 48D per-head width while reducing the token width:
+    # 576 / 12 = 48.
+    num_heads: 12
+    mlp_ratio: 4
+    time_embedding_dim: 64
+    time_frequencies: 8
+    # t_embed = (timestamp_sec - window_start_sec) / time_reference_sec.
+    # This is a fixed unit scale, never the sample-dependent endpoint gap.
+    time_reference_sec: 1.0
+    # Utonia feeds Point3DRoPE coord = metric_xyz * 0.2 with base=10. Using
+    # the same radians/metre makes this cross-frame RoPE numerically identical.
+    rope_base: 10.0
+    rope_position_scale: 0.2
+    layer_scale_init: 0.1
+
+  gaussian_head:
+    initial_opacity: 0.2
+    initial_scale_m: 0.3
+
+  motion:
+    # The final unbounded Linear is zero-initialized, so training starts static.
+    # It consumes the same 576D refined token as the Gaussian head; its three
+    # outputs are physical velocity components in metres/second.
+    zero_init: true
+
+  regularization:
+    # Charbonnier prior on window displacement. Its gradient saturates at a
+    # constant for large speeds, so it cannot damp a runaway; velocity_l2 is
+    # the divergence guard. Stacking both would mix two gradient shapes.
+    small_motion:
+      enabled: false
+      weight: 0.005
+      epsilon_m: 0.001
+      warmup_steps: 300
+      ramp_steps: 1700
+
+    # STORM (ICLR'25) mean-squared velocity prior, in metres/second so the term
+    # is independent of the sampled window length. The penalty is a mean over
+    # every Gaussian and component (||v||^2 / 3), which is what makes it
+    # selective: the escape shortcut needs roughly half of all tokens moving
+    # (V3 epoch 3 had a 143 m/s median), costing ~17 at this weight against a
+    # total loss near 1.7, while genuine traffic is 1-5% of tokens near 15 m/s
+    # and costs under 0.01. No warmup: the motion head is zero-initialized, so
+    # the prior's gradient already starts at zero, and the runaway begins
+    # inside epoch 0.
+    velocity_l2:
+      enabled: true
+      weight: 0.005
+      warmup_steps: 0
+      ramp_steps: 0

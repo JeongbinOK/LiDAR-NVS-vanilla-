@@ -1,0 +1,80 @@
+# Bbox-free Dynamic 2DGS V5 = V4 plus the two fixes its diagnosis called for
+# (docs/dynamic_v4_attention_velocity_diagnosis.md). V4's motion softmax collapsed
+# to a hard argmax -- logit max 2e6, 91 % of tokens with exactly zero gradient --
+# because (a) nothing bounded |q||k| and (b) the shared RoPE band resolves 31 m at
+# best while the correspondence lives at the 0.39 m anchor spacing. The amplitude
+# blow-up was the model *compensating* for (b), so both must be fixed together.
+model:
+  variant: dynamic_2dgs_attention_velocity_v5
+
+exp_name: ${model.variant}-bs-${train.batch_size}
+
+p2g:
+  anchor_mode: grid
+  agg_mlp:
+    hidden_dim: 1024
+    hidden_layers: 2
+    out_dim: 576
+  joint_refiner:
+    # 576 / 12 = 48 channels/head; 48 satisfies xyz RoPE and FlashAttention.
+    num_heads: 12
+
+data:
+  # Preserve the loader contract. V4 does not consume boxes.
+  mode: bbox
+
+dynamic_2dgs:
+  temporal:
+    implementation: flash_varlen
+    layers: 2
+    num_heads: 12
+    # Heads [0, 4) from the final layer share their Q/K probabilities with the
+    # feature path and additionally attend to opposite-frame ref-coordinate xyz.
+    motion_head_count: 4
+    mlp_ratio: 4
+    time_embedding_dim: 64
+    time_frequencies: 8
+    # Feature conditioning uses a fixed unit; velocity conversion below uses
+    # the exact signed endpoint interval in physical seconds.
+    time_reference_sec: 1.0
+    # Feature-head band, unchanged from V3.1/V4: 31.4 - 235.6 m wavelengths.
+    # V3.1's final layer stays healthy (ESS 1.2-42) on this band and posts the
+    # best render metrics of any run, so there is no evidence to widen it.
+    rope_base: 10.0
+    rope_position_scale: 0.2
+    # Motion-head band (heads [0, motion_head_count)): 1.57 - 162 m wavelengths.
+    # At the 0.39 m anchor spacing this lifts the positional margin
+    # 1 - K(d)/K(0) from 8.6e-4 to 1.8e-1, so the model no longer has to buy
+    # discrimination with logit amplitude.
+    motion_rope_base: 200.0
+    motion_rope_position_scale: 4.0
+    # Per-head RMSNorm on q and k. |q| becomes gamma*sqrt(head_dim), which caps
+    # the logit at gamma_q*gamma_k*sqrt(48) instead of leaving it to the
+    # projection gain. gamma stays learnable: a fixed gamma=1 bounds logits to
+    # +-6.93, too blunt to select decisively among ~7300 candidate keys.
+    qk_norm: true
+    layer_scale_init: 0.1
+
+  gaussian_head:
+    initial_opacity: 0.2
+    initial_scale_m: 0.3
+
+  motion:
+    # This V3-compatible head now predicts an additive velocity residual in m/s.
+    # Zero initialization makes the first V4 prediction exactly v_init.
+    zero_init: true
+
+  regularization:
+    small_motion:
+      enabled: false
+      weight: 0.005
+      epsilon_m: 0.001
+      warmup_steps: 300
+      ramp_steps: 1700
+
+    # Keep the V3.1 guard on the final velocity (v_init + residual).
+    velocity_l2:
+      enabled: true
+      weight: 0.005
+      warmup_steps: 0
+      ramp_steps: 0

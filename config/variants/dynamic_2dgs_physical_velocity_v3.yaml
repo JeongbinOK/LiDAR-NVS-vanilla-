@@ -1,0 +1,59 @@
+# Current bbox-free Dynamic 2DGS baseline. Source time is represented in a
+# fixed one-second coordinate, while the motion head directly predicts m/s.
+model:
+  variant: dynamic_2dgs_physical_velocity_v3
+
+exp_name: ${model.variant}-bs-${train.batch_size}
+
+p2g:
+  anchor_mode: grid
+  # Preserve the 576 input channels (432D Utonia + 144D intensity) after the
+  # nonlinear fusion trunk instead of expanding every temporal token to 768D.
+  agg_mlp:
+    hidden_dim: 1024
+    hidden_layers: 2
+    out_dim: 576
+  joint_refiner:
+    # 576 / 12 = 48 channels/head; 48 satisfies xyz RoPE and FlashAttention.
+    num_heads: 12
+
+data:
+  # Keep the shared loader contract. Boxes are loaded but never consumed here.
+  mode: bbox
+
+dynamic_2dgs:
+  temporal:
+    implementation: flash_varlen
+    layers: 2
+    # Keep the proven 48D per-head width while reducing the token width:
+    # 576 / 12 = 48.
+    num_heads: 12
+    mlp_ratio: 4
+    time_embedding_dim: 64
+    time_frequencies: 8
+    # t_embed = (timestamp_sec - window_start_sec) / time_reference_sec.
+    # This is a fixed unit scale, never the sample-dependent endpoint gap.
+    time_reference_sec: 1.0
+    # Utonia feeds Point3DRoPE coord = metric_xyz * 0.2 with base=10. Using
+    # the same radians/metre makes this cross-frame RoPE numerically identical.
+    rope_base: 10.0
+    rope_position_scale: 0.2
+    layer_scale_init: 0.1
+
+  gaussian_head:
+    initial_opacity: 0.2
+    initial_scale_m: 0.3
+
+  motion:
+    # The final unbounded Linear is zero-initialized, so training starts static.
+    # It consumes the same 576D refined token as the Gaussian head; its three
+    # outputs are physical velocity components in metres/second.
+    zero_init: true
+
+  regularization:
+    small_motion:
+      enabled: false
+      weight: 0.005
+      epsilon_m: 0.001
+      warmup_steps: 300
+      ramp_steps: 1700

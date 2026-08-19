@@ -1,9 +1,10 @@
-device: [4, 5, 6, 7]
+device: [8, 9]
 seed: 42
 
 project_name: 2dgs-utonia
 exp_name:  ${p2g.anchor_mode}-bs-${train.batch_size}-n-cd
 mode: train
+allow_legacy_wandb_fallback: false
 
 
 loss:
@@ -24,11 +25,11 @@ train:
   weight_decay: 1e-4
   grad_clip: 1.0
   max_epochs: 40
-  batch_size: 2
+  batch_size: 1
   val_check_interval: 1.0
   max_steps: 1000000
   ckpt_path: null   # train from scratch (scheduler + grad clipping stability fix)
-  grad_accum_steps: 2
+  grad_accum_steps: 4
 test:
   batch_size: 1
   ckpt_path: null
@@ -77,107 +78,6 @@ p2g:
   utonia_ckpt: null   # optional abs path override; null -> checkpoints/utonia/utonia.pth (config dump: config/utonia_pretrained.yaml)
   utonia_feature_stage: 3  # encoder stage index: 3 -> 0.4m/432D, 4 -> 0.8m/576D (default/final)
   anchor_mode: grid        # "spherical" | "grid"
-  squery:                       # spherical mode only: raw-point occupied cell = anchor
-                                # (temporal fusion은 grid_query 블록으로 양 모드 공유;
-                                # 이 head의 K/V는 own-frame token으로 한정)
-    count_mode: learned_gumbel  # legacy | learned_gumbel
-                                # legacy: unique(anchor, source-token)당 1 Gaussian
-                                # learned: (frame, cell, fg/bg label) anchor당 K=[1..4]
-    token_stride_m: 0.4       # query seed의 source-token 상대위치를 정규화하는 stage-3 물리 stride
-    dtheta_deg: 4.5
-    dphi_deg: 3.0
-    dlogr: 0.12               # legacy log radial bin; dr_m 설정 시 무시됨
-    dr_m: 0.8                 # linear radial bin (m). far 깊이혼합 제거:
-                              # spread p95 4.9->0.67m, 예산 1.06x 동일 (2026-07-20 sweep)
-    r_min: 2.0
-    r_max: 110.0
-    max_kv: 64                # anchor당 K/V 토큰 cap (cell 중심 기준 nearest)
-    # RoPE metric scale. "adaptive" = anchor별 pi/(실측 support) — 최저밴드
-    # (inv_freq[0]=1) 위상이 절대 pi를 넘지 않음. "fixed"는 예전 상수(bg 1.75/
-    # fg 1.35). fg 1.35는 instance-wide K/V 지원(max 7.8m)에서 최대 31% aliasing,
-    # bg 1.75는 dr_m 전환 후 pi 범위의 47~63%만 사용 (2026-07-21 실측).
-    # 두 스위치를 분리해 from-scratch A/B에서 원인 귀속이 가능하게 둠.
-    rope_scale_bg: adaptive   # adaptive | fixed
-    rope_scale_fg: adaptive   # adaptive | fixed
-    attn_chunk: 8192
-    n_layers: 2                # bg·fg 공유 cross-attn depth (query refinement 라운드 수)
-    cross_attn_backend: flash_varlen # real-batch: 118.5 -> 24.6 ms fwd+bwd
-    self_attn_layers: 1         # cross refinement 뒤 anchor별 query set block
-    self_attn_backend: flash_varlen  # real-batch: 21.8 -> 13.8 ms fwd+bwd
-    grad_balance: sqrt_k
-    learned_count:              # learned_gumbel only
-      K_max: 4
-      tau: 1.0
-      # Linear -> anchor-wise max -> LN -> GELU 뒤 같은 frame/label의
-      # 3x3x3 spherical local self-attention. 2층이면 유효 receptive field가
-      # 5x5x5이고, 3층(7x7x7)은 원거리에서 물리 범위가 지나치게 커 기본 2층.
-      local_attn_heads: 8
-      local_attn_layers: 2
-      local_ffn_ratio: 4
-      # statistic = [clip(n_raw/E[N_emitted_rays],0,1), mean raw-point range in
-      #              [2.5,110]m -> [0,1], physical-log-normalized LOO Q50,
-      #              Q90-Q50, Q50-Q10, valid(0/1)]. E[azimuth rays/cell]=1085/120.
-      stat_embedding_dim: 64    # two-layer 6 -> 64 -> 64 MLP
-      stat_min_raw: 6
-      stat_min_valid_loo: 3     # quantiles must have at least three defined members
-      stat_loo_eps: 0.001       # exact LOO Sherman-Morrison denominator gate
-      stat_range_min_m: 2.5
-      stat_range_max_m: 110.0
-      # LOO channel x -> log1p(min(x,cap)/knee) / log1p(cap/knee).
-      # 1cm preserves mm-cm resolution; the 0.8m radial-cell width is the cap.
-      stat_loo_knee_m: 0.01
-      stat_loo_cap_m: 0.8
-      ray_azimuth_count: 1085   # emitted panorama rays/revolution, not returned points
-      grad_balance_scope: token
-      budget:
-        enable: true
-        target_mean_k: 2.0
-        weight: 1.0
-        warmup_steps: 500
-        ramp_steps: 1000
-      logging:
-        enable: true
-        interval: 20
-  grid_query:                   # 공유 temporal fusion(bg_radius_m/bg_max_kv_per_frame/
-                                # num_heads/bg_layers/fg_layers는 양 모드 사용) +
-                                # grid mode 전용 K routing/head 설정
-    count_mode: learned_gumbel  # legacy | learned_gumbel | learned_gumbel_viewpt
-    K_max: 3                    # legacy only: occupied 0.4m cell당 최대 Gaussian 수
-    points_per_gaussian: 4      # legacy exp=null only: K_i=ceil(raw_count/this), capped by K_max
-    exp: 1                      # legacy only: null=raw-count range quantile;
-                                # 1=one raw-point medoid; 2=two token-coordinate seeds
-    learned_count:              # learned modes only; legacy K_max/points_per_gaussian/exp와 독립
-      K_max: 4                  # total K=[1..4]; viewpt는 Common 1 + Additional (K-1)
-      tau: 1.0                  # train: hard Gumbel-ST temperature; eval: deterministic argmax
-      seed_mode: range_quantile # learned: all quantile; viewpt: medoid Common + quantile Additional
-      viewpoint:                # learned_gumbel_viewpt only: gt.pose = T_(0<-t)
-        # router 입력 = token 위치를 target sensor frame으로 옮긴 R^T(p_ref - t)의
-        # Fourier 인코딩. token마다 값이 달라 pose 하나를 전 token에 동일 concat하던
-        # 이전 방식과 다르다. Gaussian parameter는 이 feature를 쓰지 않는다.
-        position_frequencies: 8     # 3 * 8 * sin/cos = 48D
-        position_scale_m: 110.0     # 최저 band 주기 220m -> 최대 관측거리 110m에서 wrap 없음
-                                    # (최고 band 주기 = 220/2^7 = 1.72m)
-      # selected K/Additional head 입력 gradient만 1/sqrt(K); router에는 적용하지 않음.
-      # learned_count 내부 옵션이므로 count_mode=legacy 전환 시 과거 output 방식 유지.
-      grad_balance_scope: token
-      budget:
-        enable: true
-        # DDP 전체 token의 noise-free policy E[K] 평균을 이 값에 맞춤.
-        target_mean_k: 2.0
-        weight: 1.0
-        warmup_steps: 500       # 이 optimizer step 전까지 budget gradient=0
-        ramp_steps: 1000        # 이후 weight를 0 -> 1.0으로 선형 증가
-      logging:
-        enable: true
-        interval: 20            # optimizer step 기준 train routing 통계 주기
-        # 각 값은 bin lower bound: [0,10), ... [80,110), [110,inf)
-        range_edges_m: [0, 10, 20, 30, 40, 60, 80, 110]
-    bg_radius_m: 0.8
-    bg_max_kv_per_frame: 8
-    num_heads: 8
-    bg_layers: 2
-    fg_layers: 2
-    grad_balance: sqrt_k
   head_offset_bound: 0.8    # gaussian pos = seed_pos + bound*tanh(offset), per-axis meters
 
 
@@ -232,7 +132,8 @@ p2g:
 
   agg_mlp:
     hidden_dim: 256
-    out_dim: 192       # trunk width; must be a multiple of 24 (8 heads x RoPE/6). head_dim = 192/8 = 24
+    hidden_layers: 2   # number of hidden Linear+SiLU stages; variants may override
+    out_dim: 192       # with 8 heads: head_dim=24; each head must be divisible by 6 for 3D RoPE
 
 
 

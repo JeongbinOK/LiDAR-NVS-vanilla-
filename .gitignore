@@ -9,6 +9,7 @@ __pycache__/
 *.pth
 
 logs/
+lightning_logs/
 .tmp/
 .cache/
 *.txt

@@ -1,0 +1,64 @@
+# Bbox-free Dynamic 2DGS V4. The full 12-head temporal attention still updates
+# the shared Gaussian/motion feature. The first four heads of the final temporal
+# layer additionally provide a soft source-to-opposite-frame token displacement;
+# signed physical delta-t converts it to a forward-time velocity initializer.
+model:
+  variant: dynamic_2dgs_attention_velocity_v4
+
+exp_name: ${model.variant}-bs-${train.batch_size}
+
+p2g:
+  anchor_mode: grid
+  agg_mlp:
+    hidden_dim: 1024
+    hidden_layers: 2
+    out_dim: 576
+  joint_refiner:
+    # 576 / 12 = 48 channels/head; 48 satisfies xyz RoPE and FlashAttention.
+    num_heads: 12
+
+data:
+  # Preserve the loader contract. V4 does not consume boxes.
+  mode: bbox
+
+dynamic_2dgs:
+  temporal:
+    implementation: flash_varlen
+    layers: 2
+    num_heads: 12
+    # Heads [0, 4) from the final layer share their Q/K probabilities with the
+    # feature path and additionally attend to opposite-frame ref-coordinate xyz.
+    motion_head_count: 4
+    mlp_ratio: 4
+    time_embedding_dim: 64
+    time_frequencies: 8
+    # Feature conditioning uses a fixed unit; velocity conversion below uses
+    # the exact signed endpoint interval in physical seconds.
+    time_reference_sec: 1.0
+    rope_base: 10.0
+    rope_position_scale: 0.2
+    layer_scale_init: 0.1
+
+  gaussian_head:
+    initial_opacity: 0.2
+    initial_scale_m: 0.3
+
+  motion:
+    # This V3-compatible head now predicts an additive velocity residual in m/s.
+    # Zero initialization makes the first V4 prediction exactly v_init.
+    zero_init: true
+
+  regularization:
+    small_motion:
+      enabled: false
+      weight: 0.005
+      epsilon_m: 0.001
+      warmup_steps: 300
+      ramp_steps: 1700
+
+    # Keep the V3.1 guard on the final velocity (v_init + residual).
+    velocity_l2:
+      enabled: true
+      weight: 0.005
+      warmup_steps: 0
+      ramp_steps: 0

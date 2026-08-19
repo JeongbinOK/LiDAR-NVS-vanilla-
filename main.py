@@ -27,10 +27,8 @@ from pytorch_lightning.strategies import DDPStrategy
 from src.model_wrapper import ModelWrapper
 from src.models_new.utils.model_utils import DataModule
 from src.dataloader import dataset_dict
+from src.config_loader import assert_model_variant_implemented, resolve_main_config
 
-import os
-# Enable only when debugging CUDA stack traces; it slows normal training.
-# os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 warnings.filterwarnings(
     "ignore",
     message=r"Found .* module\(s\) in eval mode at the start of training.*",
@@ -42,6 +40,7 @@ def print_run_summary(cfg):
     print(
         "Run: "
         f"mode={cfg.mode}, "
+        f"variant={cfg.model.variant}, "
         f"seed={cfg.seed}, "
         f"devices={list(cfg.device)}, "
         f"train_batch_size={cfg.train.batch_size}, "
@@ -51,12 +50,17 @@ def print_run_summary(cfg):
     )
 
 
-def main(cfg):
+def main(cfg, config_source="unspecified"):
     # Seed before logger, model, and DataModule construction so initialization,
     # Gumbel sampling, data shuffling, and DataLoader workers are reproducible.
     seed_everything(int(cfg.seed), workers=True)
     os.makedirs(cfg.logger.dir, exist_ok=True)
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    global_rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", 0)))
+    effective_config_path = os.path.join(cfg.logger.dir, "effective_config.yaml")
+    if global_rank == 0:
+        OmegaConf.save(config=cfg, f=effective_config_path, resolve=True)
+        print(f"[config] source={config_source}")
+        print(f"[config] effective={os.path.abspath(effective_config_path)}")
     callbacks = []
     if cfg.logger.enable:
         import wandb
@@ -71,7 +75,7 @@ def main(cfg):
             project=cfg.project_name,
             name=cfg.exp_name,
             save_dir=cfg.logger.dir,
-            config=OmegaConf.to_container(cfg),
+            config=OmegaConf.to_container(cfg, resolve=True),
             settings=wandb_settings,
         )
 
@@ -79,7 +83,9 @@ def main(cfg):
         # if wandb.run is not None:
         #     wandb.run.log_code("src")
     else:
-        logger = None
+        # Lightning interprets ``None`` as "construct the default logger".
+        # Use the explicit sentinel so smoke/debug runs do not create CSV logs.
+        logger = False
     checkpoint_callback = ModelCheckpoint(
         dirpath=cfg.logger.dir,        # Path where checkpoints will be saved
         filename='{epoch}',        # Filename for the checkpoints
@@ -118,13 +124,10 @@ def main(cfg):
 
 
 if __name__ == '__main__':
-    base_conf = OmegaConf.load(
-        os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                     'config', 'nuscene_train.yaml')
-    )
     cli_conf = OmegaConf.from_cli()
-    cfg = OmegaConf.merge(base_conf, cli_conf)
+    cfg, config_source = resolve_main_config(cli_conf)
+    assert_model_variant_implemented(cfg)
     if 'mode' not in cfg:
             cfg.mode = "eval"
     print_run_summary(cfg)
-    main(cfg)
+    main(cfg, config_source=config_source)
