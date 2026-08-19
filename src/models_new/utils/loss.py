@@ -386,39 +386,41 @@ class Loss(nn.Module):
             gt_raydrop
         )
 
-        chamfer_terms = []
-        pred_point_counts = []
-        gt_point_counts = []
-        for pred_list, gt_list in zip(all_renders["render_points"], all_renders["gt_points"]):
-            for pred_pts, gt_pts in zip(pred_list, gt_list):
-                pred_pts = pred_pts.reshape(-1, 3)
-                gt_pts = gt_pts.reshape(-1, 3)
-                pred_point_counts.append(pred_pts.shape[0])
-                gt_point_counts.append(gt_pts.shape[0])
-                if pred_pts.numel() == 0 or gt_pts.numel() == 0:
-                    continue
-                dist1, dist2, _, _ = self.chamfer(
-                    pred_pts.unsqueeze(0).contiguous(),
-                    gt_pts.unsqueeze(0).contiguous(),
-                )
-                chamfer_terms.append(dist1.mean() + dist2.mean())
-        if chamfer_terms:
-            losses["loss_chamfer"] = torch.stack(chamfer_terms).mean()
-        else:
-            losses["loss_chamfer"] = torch.tensor(0.0, device=gt_depth.device)
-        losses["chamfer_valid_pairs"] = torch.tensor(
-            len(chamfer_terms), device=gt_depth.device, dtype=gt_depth.dtype
-        )
-        losses["render_points_mean"] = torch.tensor(
-            sum(pred_point_counts) / max(len(pred_point_counts), 1),
-            device=gt_depth.device,
-            dtype=gt_depth.dtype,
-        )
-        losses["gt_points_mean"] = torch.tensor(
-            sum(gt_point_counts) / max(len(gt_point_counts), 1),
-            device=gt_depth.device,
-            dtype=gt_depth.dtype,
-        )
+        compute_chamfer = self.w_chamfer > 0.0 or metric_mode in {
+            "val", "test", "eval"
+        }
+        if compute_chamfer:
+            chamfer_terms = []
+            pred_point_counts = []
+            gt_point_counts = []
+            for pred_list, gt_list in zip(
+                all_renders["render_points"], all_renders["gt_points"]
+            ):
+                for pred_pts, gt_pts in zip(pred_list, gt_list):
+                    pred_pts = pred_pts.reshape(-1, 3)
+                    gt_pts = gt_pts.reshape(-1, 3)
+                    pred_point_counts.append(pred_pts.shape[0])
+                    gt_point_counts.append(gt_pts.shape[0])
+                    if pred_pts.numel() == 0 or gt_pts.numel() == 0:
+                        continue
+                    dist1, dist2, _, _ = self.chamfer(
+                        pred_pts.unsqueeze(0).contiguous(),
+                        gt_pts.unsqueeze(0).contiguous(),
+                    )
+                    chamfer_terms.append(dist1.mean() + dist2.mean())
+            losses["loss_chamfer"] = (
+                torch.stack(chamfer_terms).mean()
+                if chamfer_terms else gt_depth.new_zeros(())
+            )
+            losses["chamfer_valid_pairs"] = gt_depth.new_tensor(
+                len(chamfer_terms)
+            )
+            losses["render_points_mean"] = gt_depth.new_tensor(
+                sum(pred_point_counts) / max(len(pred_point_counts), 1)
+            )
+            losses["gt_points_mean"] = gt_depth.new_tensor(
+                sum(gt_point_counts) / max(len(gt_point_counts), 1)
+            )
         losses["loss_scale"] = self._scale_regularization(gaussians, gt_depth)
 
         # ----------------------------------------------------------
@@ -517,22 +519,16 @@ class Loss(nn.Module):
         # 3. 가중치 결합을 통한 최종 Total Loss 정의
         # ----------------------------------------------------------
         # median은 w_depth_median으로 토글: 0이면 학습 제외(detached metric), >0이면 학습 loss로 합산.
-        losses["total"] = (
+        total = (
             self.w_depth        * losses["loss_depth"]        +
             self.w_depth_median * losses["loss_depth_median"] +
             self.w_intensity    * losses["loss_intensity"]    +
             self.w_raydrop      * losses["loss_raydrop"]      +
-            self.w_chamfer      * losses["loss_chamfer"]      +
             self.w_scale        * losses["loss_scale"]
         )
-
-        # 항별 가중 기여(w·loss) 로깅 — 절대 loss가 아니라 이 값들을 보고 weight를 등화한다.
-        losses["wc_depth"]        = (self.w_depth        * losses["loss_depth"]).detach()
-        losses["wc_depth_median"] = (self.w_depth_median * losses["loss_depth_median"]).detach()
-        losses["wc_intensity"]    = (self.w_intensity    * losses["loss_intensity"]).detach()
-        losses["wc_raydrop"]      = (self.w_raydrop      * losses["loss_raydrop"]).detach()
-        losses["wc_chamfer"]      = (self.w_chamfer      * losses["loss_chamfer"]).detach()
-        losses["wc_scale"]        = (self.w_scale        * losses["loss_scale"]).detach()
+        if self.w_chamfer > 0.0:
+            total = total + self.w_chamfer * losses["loss_chamfer"]
+        losses["total"] = total
 
         # Optional learned-count regularization belongs to the same loss
         # assembly as the rendering terms. Existing callers omit this argument

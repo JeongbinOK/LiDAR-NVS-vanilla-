@@ -221,7 +221,12 @@ class ModelWrapper(LightningModule):
             )
         else:
             out = self.g2g_model(p2g_out, _input["timestamps"])
-        all_renders = self.g2p_model(out, gt)
+        compute_train_points = float(self.cfg.loss.w_chamfer) > 0.0
+        all_renders = self.g2p_model(
+            out,
+            gt,
+            compute_points=(prefix != "train" or compute_train_points),
+        )
 
         compute_valid_metrics, compute_official_metrics = self._metric_schedule(
             prefix, batch_idx

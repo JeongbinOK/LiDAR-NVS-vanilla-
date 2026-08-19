@@ -247,7 +247,13 @@ class GausRender(nn.Module):
         return rotations
 
 
-    def forward(self, gaussians, gt):
+    def forward(
+        self,
+        gaussians,
+        gt,
+        *,
+        compute_points=True,
+    ):
         if isinstance(gaussians, dict):
             gaussians = gaussians.get("batch_gaussians", gaussians.get("gaussians"))
         if isinstance(gt, dict):
@@ -305,24 +311,23 @@ class GausRender(nn.Module):
                     input_timestamp=t,
                     is_training=self.training,
                 )
-                
+
                 gt_depth = gt_cam.pts_depth.to(device=means3D.device, dtype=means3D.dtype)
                 gt_intensity_sh = gt_cam.pts_intensity.to(device=means3D.device, dtype=means3D.dtype)
                 gt_raydrop = 1.0 - (gt_depth > 0).float()
 
 
-                # Chamfer supervision: hard-mask predicted no-return rays at
-                # 0.5, discard target-sensor ranges >=80 m, and back-project
-                # the remaining median depths. The hard masks are detached
-                # inside the helper, while gradients still flow to retained
-                # depths.
-                render_points = lidar4d_range_image_to_points(
-                    render_pkg["depth_median"],
-                    gt_cam.vfov,
-                    gt_cam.hfov,
-                    row_to_theta=gt_cam.row_to_theta,
-                    raydrop=render_pkg["raydrop"],
-                )
+                if compute_points:
+                    # Chamfer/evaluation support is built only when a caller
+                    # consumes it. Normal training with w_chamfer=0 skips both
+                    # back-projections entirely.
+                    render_points = lidar4d_range_image_to_points(
+                        render_pkg["depth_median"],
+                        gt_cam.vfov,
+                        gt_cam.hfov,
+                        row_to_theta=gt_cam.row_to_theta,
+                        raydrop=render_pkg["raydrop"],
+                    )
 
                 # 픽셀 기반 맵 모으기
                 b_depths.append(render_pkg["depth"])
@@ -340,15 +345,16 @@ class GausRender(nn.Module):
                 # gt도 pred와 동일한 LiDAR4D range/mapping 규칙으로 복원한다.
                 # raw gt_cam.points(z-up 센서)는 pano(y-up view) pred와 프레임이 달라 chamfer 폭증 →
                 # round-trip 검증상 pano는 rasterizer를 정확히 역변환하므로 양쪽을 pano로 맞춘다.
-                b_render_points.append(render_points)
-                b_gt_points.append(
-                    lidar4d_range_image_to_points(
-                        gt_depth,
-                        gt_cam.vfov,
-                        gt_cam.hfov,
-                        row_to_theta=gt_cam.row_to_theta,
+                if compute_points:
+                    b_render_points.append(render_points)
+                    b_gt_points.append(
+                        lidar4d_range_image_to_points(
+                            gt_depth,
+                            gt_cam.vfov,
+                            gt_cam.hfov,
+                            row_to_theta=gt_cam.row_to_theta,
+                        )
                     )
-                )
 
             # 카메라 차원 stack
             all_depths.append(torch.stack(b_depths, dim=0))
