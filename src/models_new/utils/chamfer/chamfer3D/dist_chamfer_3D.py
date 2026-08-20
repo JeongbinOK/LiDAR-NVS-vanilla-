@@ -6,6 +6,15 @@ import os
 import sys
 from pathlib import Path
 
+# --compiler-bindir compiles the C++ host code nvcc generates from chamfer3D.cu
+# and needs cc1plus (the g++ package, not just gcc); only pin it when this
+# machine actually has a full g++-12 install, mirroring the rasterizer's
+# extension-loading check in gaussian_renderer/diff_gaussian_rasterization_2d.py.
+_host_compiler_flags = (
+    ["--compiler-bindir", "/usr/bin/gcc-12"]
+    if Path("/usr/bin/g++-12").is_file() else []
+)
+
 script_dir = Path(__file__).parent.absolute()
 object_dir = script_dir.parent / "tmp"
 sys.path.append(str(object_dir))
@@ -28,7 +37,7 @@ if not chamfer_found:
             "/".join(os.path.abspath(__file__).split("/")[:-1] + ["chamfer_cuda.cpp"]),
             "/".join(os.path.abspath(__file__).split("/")[:-1] + ["chamfer3D.cu"]),
         ],
-        extra_cuda_cflags=["--compiler-bindir", "/usr/bin/gcc-12"],
+        extra_cuda_cflags=_host_compiler_flags,
         build_directory=build_path,
     )
     print(f"Loaded jitted library {chamfer_3D.__file__}")

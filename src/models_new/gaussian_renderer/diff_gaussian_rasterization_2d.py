@@ -35,18 +35,26 @@ if _cuda_major is not None:
     ]
 else:
     _gencode_flags = []
+# torch.utils.cpp_extension feeds $CC to nvcc as -ccbin for every .cu source
+# in this extension, so CC needs the same complete C++ toolchain as CXX/
+# CUDAHOSTCXX (cc1plus, from the g++ package) even though it is nominally the
+# C compiler; gcc-12 alone (no g++-12) has the driver but not the backend nvcc
+# needs, and fails with "cannot execute 'cc1plus'".
 for compiler_variable, compiler_path in (
     ("CC", "/usr/bin/gcc-12"),
     ("CXX", "/usr/bin/g++-12"),
     ("CUDAHOSTCXX", "/usr/bin/g++-12"),
 ):
-    if Path(compiler_path).is_file():
+    if Path("/usr/bin/g++-12").is_file() and Path(compiler_path).is_file():
         os.environ[compiler_variable] = compiler_path
 # nvcc rejects a --compiler-bindir that does not exist, so only pin the host
-# compiler when this machine actually has it.
+# compiler when this machine actually has it. --compiler-bindir compiles the
+# C++ host code nvcc generates from these .cu files, which needs cc1plus (the
+# g++ package); a gcc-only install (gcc present, g++ absent) has the driver
+# but not the C++ backend, so check for g++-12 specifically.
 _host_compiler_flags = (
     ["--compiler-bindir", "/usr/bin/gcc-12"]
-    if Path("/usr/bin/gcc-12").is_file() else []
+    if Path("/usr/bin/g++-12").is_file() else []
 )
 
 from torch.utils.cpp_extension import load
