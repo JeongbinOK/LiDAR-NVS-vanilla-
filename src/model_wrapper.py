@@ -120,8 +120,16 @@ class ModelWrapper(LightningModule):
         # Set up the model.
         self.p2g_model = Point2Gaus(self.p2g_cfg)
         self.g2g_model = GausTemp(self.g2g_cfg)
-        self.g2p_model = GausRender(self.g2p_cfg)
-        self.loss = Loss(self.cfg.loss)
+        loss_module = Loss(self.cfg.loss)
+        self.g2p_model = GausRender(
+            self.g2p_cfg,
+            scale_clip_max_m=(
+                loss_module.scale_max_m
+                if loss_module.w_scale == 0.0
+                else None
+            ),
+        )
+        self.loss = loss_module
         self._eval_pair_summaries: dict[str, list[dict]] = {}
         self._metric_interval = int(self._cfg_get("metrics.interval", 50))
         if self._metric_interval <= 0:
