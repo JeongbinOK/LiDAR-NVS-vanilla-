@@ -19,7 +19,7 @@ import torch.multiprocessing as mp
 mp.set_sharing_strategy("file_system")
 from torch.utils.data import DataLoader
 from lightning.pytorch import Trainer, seed_everything
-from lightning.pytorch.callbacks import ModelCheckpoint
+from lightning.pytorch.callbacks import Callback, ModelCheckpoint
 from lightning.pytorch.loggers.wandb import WandbLogger
 from lightning.pytorch.plugins.environments import SLURMEnvironment
 from omegaconf import DictConfig, OmegaConf
@@ -36,6 +36,47 @@ warnings.filterwarnings(
     message=r"Found .* module\(s\) in eval mode at the start of training.*",
 )
 torch.set_float32_matmul_precision("high")
+
+
+class WandbHeartbeatCallback(Callback):
+    """Send a lightweight progress record while long epochs are running."""
+
+    def __init__(self, interval_sec: float = 60.0):
+        super().__init__()
+        self.interval_sec = float(interval_sec)
+        self._last_log_time = 0.0
+
+    def on_train_batch_end(
+        self,
+        trainer,
+        pl_module,
+        outputs,
+        batch,
+        batch_idx,
+    ) -> None:
+        # Only rank zero owns the W&B run under DDP.  The timer check is
+        # intentionally local and does not introduce a synchronization.
+        if not trainer.is_global_zero:
+            return
+        logger = trainer.logger
+        if not isinstance(logger, WandbLogger):
+            return
+
+        now = time.monotonic()
+        if now - self._last_log_time < self.interval_sec:
+            return
+        self._last_log_time = now
+
+        # Do not pass W&B's explicit ``step`` argument: Lightning's epoch
+        # metrics already use W&B's automatic history rows.  The optimizer
+        # step is recorded as a regular metric for charting instead.
+        logger.log_metrics(
+            {
+                "heartbeat/epoch": int(trainer.current_epoch),
+                "heartbeat/global_step": int(trainer.global_step),
+                "heartbeat/batch_idx": int(batch_idx),
+            }
+        )
 
 
 def print_run_summary(cfg):
@@ -76,6 +117,7 @@ def main(cfg):
             config=OmegaConf.to_container(cfg),
             settings=wandb_settings,
         )
+        callbacks.append(WandbHeartbeatCallback(interval_sec=60.0))
 
         # On rank != 0, wandb.run is None.
         # if wandb.run is not None:
