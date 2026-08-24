@@ -8,16 +8,21 @@ from .token_refiner import build_joint_refiner
 
 
 class UtoniaResidualAdapter(nn.Module):
-    """Dim-preserving residual adapter for frozen Utonia features."""
+    """Dim-preserving residual adapter for frozen Utonia features.
 
-    def __init__(self, dim: int, bottleneck: int | None = None):
+    ``in_norm`` is kept before the bottleneck MLP. ``out_norm`` is optional so
+    the adapter can be ablated without changing the residual MLP itself.
+    """
+
+    def __init__(self, dim: int, bottleneck: int | None = None,
+                 out_norm: bool = True):
         super().__init__()
         width = int(bottleneck) if bottleneck else max(8, dim // 4)
         self.in_norm = nn.LayerNorm(dim)
         self.down = nn.Linear(dim, width)
         self.act = nn.SiLU()
         self.up = nn.Linear(width, dim)
-        self.out_norm = nn.LayerNorm(dim)
+        self.out_norm = nn.LayerNorm(dim) if out_norm else nn.Identity()
         nn.init.zeros_(self.up.weight)
         nn.init.zeros_(self.up.bias)
 
@@ -36,8 +41,10 @@ def build_feature_fusion(cfg, *, utonia_dim: int, intensity_dim: int,
         int(getattr(adapter_cfg, "bottleneck", 0) or 0)
         if adapter_cfg is not None else 0
     )
+    out_norm = bool(getattr(adapter_cfg, "out_norm", True)) \
+        if adapter_cfg is not None else True
     adapter = UtoniaResidualAdapter(
-        utonia_dim, bottleneck=bottleneck or None
+        utonia_dim, bottleneck=bottleneck or None, out_norm=out_norm
     )
     agg_cfg = cfg.agg_mlp
     fusion_mlp = nn.Sequential(
