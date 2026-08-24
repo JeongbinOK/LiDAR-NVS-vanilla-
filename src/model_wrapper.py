@@ -155,7 +155,10 @@ class ModelWrapper(LightningModule):
         ))
         self._budget_enable = (
             budget_requested
-            and routing_count_mode in ("learned_gumbel", "learned_gumbel_viewpt")
+            and routing_count_mode in (
+                "learned_gumbel", "learned_decoupled_st",
+                "learned_gumbel_viewpt",
+            )
         )
         self._budget_target_mean_k = float(self._cfg_get(
             f"{learned_count_block}.budget.target_mean_k", 2.0

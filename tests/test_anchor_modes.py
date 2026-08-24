@@ -931,6 +931,7 @@ def test_learned_grid_head_st_selects_matching_k_seed_geometry():
         [[0.0, 1.0, 0.0, 0.0]], requires_grad=True
     )
     budget_logits = torch.zeros(1, 4, requires_grad=True)
+    policy_logits = budget_logits / 6.0
     anchor_metadata = {
         "box_assign": torch.tensor([-1]),
         "instance_id": torch.tensor([-1]),
@@ -963,6 +964,7 @@ def test_learned_grid_head_st_selects_matching_k_seed_geometry():
                 "anchor_k": torch.tensor([2]),
                 "gaussian_offset": torch.tensor([2]),
                 "k_logits": budget_logits,
+                "budget_logits": policy_logits,
                 "k_selection": selection,
                 "selected_only": True,
             }
@@ -1005,7 +1007,7 @@ def test_learned_grid_head_st_selects_matching_k_seed_geometry():
     assert all(
         not value.requires_grad for value in seeds.routing_stats.values()
     )
-    assert seeds.routing_budget_logits is budget_logits
+    assert seeds.routing_budget_logits is policy_logits
     assert seeds.routing_budget_logits.requires_grad
     (seeds.position.sum() + seeds.metadata["coord_ref"].sum()).backward()
     assert candidate_seed.grad is not None

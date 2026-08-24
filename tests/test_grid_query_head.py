@@ -116,6 +116,19 @@ def _learned_cfg(k_max=4, tau=1.0, **overrides):
     )
 
 
+def _decoupled_cfg(k_max=4, sample_tau=6.0, st_tau=4.0, **overrides):
+    return _cfg(
+        count_mode="learned_decoupled_st",
+        learned_count=SimpleNamespace(
+            K_max=k_max,
+            sample_tau=sample_tau,
+            st_tau=st_tau,
+            seed_mode="range_quantile",
+        ),
+        **overrides,
+    )
+
+
 def _viewpoint_cfg(k_max=4, tau=1.0, **overrides):
     return _cfg(
         count_mode="learned_gumbel_viewpt",
@@ -441,6 +454,17 @@ def test_grid_builder_exp_switches_only_grid_seed_construction():
     ))
     assert learned_builder.grid_seed_config == (
         "learned_gumbel", None, 4, None, "range_quantile",
+    )
+    decoupled_builder = OccupiedGridTokenBuilder(_builder_cfg(
+        "grid",
+        count_mode="learned_decoupled_st",
+        learned_count=SimpleNamespace(
+            K_max=4, sample_tau=6.0, st_tau=4.0,
+            seed_mode="range_quantile",
+        ),
+    ))
+    assert decoupled_builder.grid_seed_config == (
+        "learned_decoupled_st", None, 4, None, "range_quantile",
     )
     spherical_builder = OccupiedGridTokenBuilder(_builder_cfg("spherical", exp=2))
     assert spherical_builder.grid_seed_config is None
@@ -1005,6 +1029,69 @@ def test_learned_count_eval_argmax_routes_exactly_to_k2_joint_head():
     expected = torch.tensor([20.0, 21.0, 20.0, 21.0])
     torch.testing.assert_close(
         raw_params, expected[:, None].expand(-1, head.param_dim)
+    )
+
+
+def test_decoupled_st_reuses_learned_router_and_head_state_dict_contract():
+    learned = GridSlotHead(_learned_cfg(), _gs_params(), dim=8)
+    decoupled = GridSlotHead(_decoupled_cfg(), _gs_params(), dim=8)
+
+    assert learned.state_dict().keys() == decoupled.state_dict().keys()
+    for name, value in learned.state_dict().items():
+        assert value.shape == decoupled.state_dict()[name].shape
+    decoupled.load_state_dict(learned.state_dict(), strict=True)
+
+
+def test_decoupled_st_separates_forward_sampling_and_backward_temperature():
+    narrow = GridSlotHead(
+        _decoupled_cfg(sample_tau=1.0, st_tau=4.0),
+        _gs_params(),
+        dim=8,
+    )
+    exploratory = GridSlotHead(
+        _decoupled_cfg(sample_tau=6.0, st_tau=4.0),
+        _gs_params(),
+        dim=8,
+    )
+    logits_narrow = torch.tensor(
+        [[6.0, 0.0, -20.0, -20.0]], requires_grad=True
+    )
+    logits_exploratory = logits_narrow.detach().clone().requires_grad_()
+    # With the same Gumbel draw, z/T_sample + g selects K1 at tau=1 but K2 at
+    # tau=6. This directly checks that forward exploration has its own control.
+    noise = torch.tensor([[0.0, 2.0, 0.0, 0.0]])
+    selection_narrow = narrow._decoupled_st_selection(logits_narrow, noise)
+    selection_exploratory = exploratory._decoupled_st_selection(
+        logits_exploratory, noise
+    )
+    assert selection_narrow.argmax(dim=-1).tolist() == [0]
+    assert selection_exploratory.argmax(dim=-1).tolist() == [1]
+
+    # Backward ignores both the sampled category and Gumbel draw. It is exactly
+    # the noise-free softmax(logits / st_tau) surrogate in both cases.
+    upstream = torch.tensor([[0.3, -0.7, 0.2, 1.0]])
+    (selection_narrow * upstream).sum().backward()
+    (selection_exploratory * upstream).sum().backward()
+    reference_logits = logits_narrow.detach().clone().requires_grad_()
+    reference_soft = torch.softmax(reference_logits / 4.0, dim=-1)
+    (reference_soft * upstream).sum().backward()
+    torch.testing.assert_close(logits_narrow.grad, reference_logits.grad)
+    torch.testing.assert_close(logits_exploratory.grad, reference_logits.grad)
+
+    # The global K budget must describe the actual forward sampling policy.
+    torch.testing.assert_close(
+        exploratory._budget_policy_logits(logits_exploratory.detach()),
+        logits_exploratory.detach() / 6.0,
+    )
+
+
+def test_decoupled_st_eval_is_deterministic_raw_logit_argmax():
+    head = GridSlotHead(_decoupled_cfg(), _gs_params(), dim=8)
+    head.eval()
+    logits = torch.tensor([[1.0, 5.0, 3.0, 4.0]])
+    selection = head._gumbel_selection(logits)
+    torch.testing.assert_close(
+        selection, torch.tensor([[0.0, 1.0, 0.0, 0.0]])
     )
 
 

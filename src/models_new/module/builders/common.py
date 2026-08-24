@@ -19,10 +19,11 @@ class GridSeedData:
     ``(N, K_max, 3)`` and its deterministic ``anchor_k``. Learned Gumbel
     routing stores every K-specific candidate set with shape
     ``(N, K_max, K_max, 3)`` and ``anchor_k`` is ``None`` because K is
-    predicted only after temporal feature fusion. ``learned_gumbel`` fills a
-    candidate row with ``k`` range-quantile seeds. ``learned_gumbel_viewpt``
-    instead reserves slot zero for one observed medoid (the Common Gaussian)
-    and fills slots ``1..k-1`` with range-quantile Additional seeds.
+    predicted only after temporal feature fusion. ``learned_gumbel`` and
+    ``learned_decoupled_st`` fill a candidate row with ``k`` range-quantile
+    seeds. ``learned_gumbel_viewpt`` instead reserves slot zero for one observed
+    medoid (the Common Gaussian) and fills slots ``1..k-1`` with range-quantile
+    Additional seeds.
     """
 
     seed_sensor: torch.Tensor
@@ -371,7 +372,10 @@ def _aggregate_points_to_cells(points_xyz, intensity, grid_coord, voxel_feats,
         if seed_config is not None:
             count_mode, _points_per_gaussian, k_max, _exp, _seed_mode = seed_config
             k_max = int(k_max)
-            if count_mode in ("learned_gumbel", "learned_gumbel_viewpt"):
+            if count_mode in (
+                "learned_gumbel", "learned_decoupled_st",
+                "learned_gumbel_viewpt",
+            ):
                 empty_seed = points_xyz.new_zeros((0, k_max, k_max, 3))
                 empty_k = None
             else:
@@ -444,7 +448,7 @@ def _aggregate_points_to_cells(points_xyz, intensity, grid_coord, voxel_feats,
         ),)
     if seed_config is not None:
         count_mode, points_per_gaussian, k_max, exp, seed_mode = seed_config
-        if count_mode == "learned_gumbel":
+        if count_mode in ("learned_gumbel", "learned_decoupled_st"):
             if seed_mode != "range_quantile":
                 raise ValueError(
                     f"Unsupported learned grid seed_mode={seed_mode!r}"
@@ -506,19 +510,23 @@ def aggregate_points_to_cells_with_seeds(
     range-quantile slots, ``exp=1`` emits one raw-point medoid per token, and
     ``exp=2`` emits two identical token-coordinate seeds. In
     learned count modes, legacy ``exp`` and ``points_per_gaussian`` are ignored.
-    ``learned_gumbel`` builds the full range-quantile candidate bank;
+    ``learned_gumbel`` and ``learned_decoupled_st`` build the full
+    range-quantile candidate bank;
     ``learned_gumbel_viewpt`` builds Common-medoid plus Additional-range-quantile
     candidates.
     """
     count_mode = str(count_mode).lower()
     if count_mode not in (
-        "legacy", "learned_gumbel", "learned_gumbel_viewpt",
+        "legacy", "learned_gumbel", "learned_decoupled_st",
+        "learned_gumbel_viewpt",
     ):
         raise ValueError(
-            "grid count_mode must be 'legacy', 'learned_gumbel', or "
-            "'learned_gumbel_viewpt'"
+            "grid count_mode must be 'legacy', 'learned_gumbel', "
+            "'learned_decoupled_st', or 'learned_gumbel_viewpt'"
         )
-    if count_mode in ("learned_gumbel", "learned_gumbel_viewpt"):
+    if count_mode in (
+        "learned_gumbel", "learned_decoupled_st", "learned_gumbel_viewpt",
+    ):
         seed_mode = "range_quantile" if seed_mode is None else str(seed_mode).lower()
     return _aggregate_points_to_cells(
         points_xyz, intensity, grid_coord, voxel_feats,

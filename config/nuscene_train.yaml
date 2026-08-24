@@ -1,9 +1,9 @@
-# CUDA_VISIBLE_DEVICES=4,5로 실행하므로 Lightning에는 logical index를 전달한다.
-device: [2, 5, 6]
+# CUDA_VISIBLE_DEVICES=3,8,9로 실행하므로 Lightning에는 logical index를 전달한다.
+device: [0, 1, 2]
 seed: 42
 
 project_name: 2dgs-utonia
-exp_name:  ${p2g.anchor_mode}-bs-${train.batch_size}-pseudo-gt
+exp_name:  ${p2g.anchor_mode}-bs-${train.batch_size}-decoupled-st-no-outnorm-no-pseudo-gt
 mode: train
 
 
@@ -142,17 +142,20 @@ p2g:
   grid_query:                   # 공유 temporal fusion(bg_radius_m/bg_max_kv_per_frame/
                                 # num_heads/bg_layers/fg_layers는 양 모드 사용) +
                                 # grid mode 전용 K routing/head 설정
-    count_mode: learned_gumbel  # legacy | learned_gumbel | learned_gumbel_viewpt
+    count_mode: learned_decoupled_st  # legacy | learned_gumbel | learned_decoupled_st | learned_gumbel_viewpt
     K_max: 3                    # legacy only: occupied 0.4m cell당 최대 Gaussian 수
     points_per_gaussian: 4      # legacy exp=null only: K_i=ceil(raw_count/this), capped by K_max
     exp: 1                      # legacy only: null=raw-count range quantile;
                                 # 1=one raw-point medoid; 2=two token-coordinate seeds
     learned_count:              # learned modes only; legacy K_max/points_per_gaussian/exp와 독립
       K_max: 3                  # pseudo-GT가 지도하는 total K=[1..3]
-      tau: 1.0                  # train: hard Gumbel-ST temperature; eval: deterministic argmax
+      tau: 1.0                  # learned_gumbel/viewpt: backward relaxation tau; hard sample에는 영향 없음
+      # 저장된 logit 분석에서 고른 첫 ablation 값이며, 실제 학습으로 검증된 최적값은 아님.
+      sample_tau: 6.0           # learned_decoupled_st tau_f: softmax(logits / T_sample)에서 hard K sample
+      st_tau: 4.0               # learned_decoupled_st tau_b: noise-free softmax Jacobian의 온도
       seed_mode: range_quantile # learned: all quantile; viewpt: medoid Common + quantile Additional
       pseudo_gt:                # grid learned_gumbel only; 실제 occupied stage-3 token membership 사용
-        enable: true
+        enable: false            # this experiment intentionally uses no router pseudo-GT
         weight: 1.0
         train_fraction: 0.5     # epoch 0..19에서만 online 생성 + CE, 이후 계산 자체를 끔
         thresholds_m: [0.0085, 0.0355]  # train1000/val200 log-E1 3-means: 8.5mm / 35.5mm
@@ -253,6 +256,7 @@ p2g:
 
   utonia_adapter:
     bottleneck: null   # residual adapter bottleneck r (PEFT-style); null -> utonia_feature_dim // 4
+    out_norm: false     # keep in_norm; ablate only the residual output LayerNorm
 
   agg_mlp:
     hidden_dim: 256

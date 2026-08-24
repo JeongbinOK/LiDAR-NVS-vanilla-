@@ -25,6 +25,11 @@ from .gaussian_assembly import gradient_scale_identity, opacity_gate_st
 _GRID_ROPE_BASE = 10.0
 _GRID_BG_ROPE_POSITION_SCALE = 4.0
 _GRID_FG_ROPE_POSITION_SCALE = 1.0
+_GRID_SHARED_LEARNED_MODES = (
+    "learned_gumbel",
+    "learned_decoupled_st",
+)
+_GRID_LEARNED_MODES = (*_GRID_SHARED_LEARNED_MODES, "learned_gumbel_viewpt")
 
 
 def _radius_pairs(query_pos, source_pos, radius: float, max_neighbors: int):
@@ -632,6 +637,12 @@ class GridSlotHead(nn.Module):
     expert's K outputs: forward rendering is unchanged, while backward connects
     the rendering loss to all count logits through the softmax Jacobian.
 
+    ``count_mode="learned_decoupled_st"`` keeps the same router, candidate
+    geometry, and selected-only K heads, but uses Decoupled Straight-Through
+    routing: ``sample_tau`` controls the forward categorical sample and
+    ``st_tau`` independently controls the noise-free softmax Jacobian used in
+    backward.
+
     ``count_mode="learned_gumbel_viewpt"`` predicts one view-independent Common
     Gaussian from each fused token, then predicts total K separately for every
     target ``gt["pose"]``. The 192D view feature is a *router-only* input: it is
@@ -655,12 +666,14 @@ class GridSlotHead(nn.Module):
             raise ValueError("router_dim must be positive")
         self.count_mode = str(getattr(cfg, "count_mode", "legacy")).lower()
         learned_count = None
+        self.gumbel_tau = None
+        self.sample_tau = None
+        self.st_tau = None
         if self.count_mode == "legacy":
             k_max = getattr(cfg, "K_max", None)
             if k_max is None:
                 raise ValueError("p2g.grid_query.K_max is required")
-            self.gumbel_tau = None
-        elif self.count_mode in ("learned_gumbel", "learned_gumbel_viewpt"):
+        elif self.count_mode in _GRID_LEARNED_MODES:
             learned_count = getattr(cfg, "learned_count", None)
             if learned_count is None:
                 raise ValueError(
@@ -672,15 +685,30 @@ class GridSlotHead(nn.Module):
                 raise ValueError(
                     "p2g.grid_query.learned_count.K_max is required"
                 )
-            self.gumbel_tau = float(getattr(learned_count, "tau", 1.0))
-            if not self.gumbel_tau > 0.0:
-                raise ValueError(
-                    "p2g.grid_query.learned_count.tau must be positive"
+            if self.count_mode == "learned_decoupled_st":
+                self.sample_tau = float(
+                    getattr(learned_count, "sample_tau", 1.0)
                 )
+                self.st_tau = float(getattr(learned_count, "st_tau", 1.0))
+                if not self.sample_tau > 0.0:
+                    raise ValueError(
+                        "p2g.grid_query.learned_count.sample_tau must be positive"
+                    )
+                if not self.st_tau > 0.0:
+                    raise ValueError(
+                        "p2g.grid_query.learned_count.st_tau must be positive"
+                    )
+            else:
+                self.gumbel_tau = float(getattr(learned_count, "tau", 1.0))
+                if not self.gumbel_tau > 0.0:
+                    raise ValueError(
+                        "p2g.grid_query.learned_count.tau must be positive"
+                    )
         else:
             raise ValueError(
                 "p2g.grid_query.count_mode must be 'legacy', "
-                "'learned_gumbel', or 'learned_gumbel_viewpt'"
+                "'learned_gumbel', 'learned_decoupled_st', or "
+                "'learned_gumbel_viewpt'"
             )
         self.k_max = int(k_max)
         self.grad_balance = str(getattr(cfg, "grad_balance", "sqrt_k"))
@@ -731,7 +759,7 @@ class GridSlotHead(nn.Module):
                 for k in range(1, self.k_max + 1)
             ])
 
-        if self.count_mode == "learned_gumbel":
+        if self.count_mode in _GRID_SHARED_LEARNED_MODES:
             self.count_predictor = nn.Sequential(
                 nn.Linear(self.router_dim, self.dim),
                 nn.SiLU(),
@@ -906,9 +934,36 @@ class GridSlotHead(nn.Module):
             "gaussian_offset": gaussian_offset,
         }
 
+    def _decoupled_st_selection(self, logits, gumbel_noise=None):
+        """Categorical forward sample with an independent softmax-ST backward."""
+        work_logits = logits.float()
+        if gumbel_noise is None:
+            uniform = torch.rand_like(work_logits)
+            finfo = torch.finfo(work_logits.dtype)
+            uniform = uniform.clamp(min=finfo.tiny, max=1.0 - finfo.eps)
+            gumbel_noise = -torch.log(-torch.log(uniform))
+        else:
+            if tuple(gumbel_noise.shape) != tuple(work_logits.shape):
+                raise ValueError(
+                    "gumbel_noise must have the same shape as logits"
+                )
+            gumbel_noise = gumbel_noise.detach().to(
+                device=work_logits.device, dtype=work_logits.dtype
+            )
+
+        # Gumbel-Max on z / sample_tau samples exactly from
+        # Categorical(softmax(z / sample_tau)).  The backward surrogate is
+        # intentionally noise-free, matching Decoupled Straight-Through.
+        selected = (work_logits / self.sample_tau + gumbel_noise).argmax(dim=-1)
+        hard = F.one_hot(selected, num_classes=self.k_max).to(work_logits.dtype)
+        soft = torch.softmax(work_logits / self.st_tau, dim=-1)
+        return (hard - soft.detach() + soft).to(dtype=logits.dtype)
+
     def _gumbel_selection(self, logits):
-        """Hard one-hot forward; soft categorical derivative backward."""
+        """Hard one-hot forward; configured straight-through derivative backward."""
         if self.training:
+            if self.count_mode == "learned_decoupled_st":
+                return self._decoupled_st_selection(logits)
             return F.gumbel_softmax(
                 logits.float(),
                 tau=self.gumbel_tau,
@@ -918,13 +973,19 @@ class GridSlotHead(nn.Module):
         selected = logits.argmax(dim=-1)
         return F.one_hot(selected, num_classes=self.k_max).to(dtype=logits.dtype)
 
+    def _budget_policy_logits(self, logits):
+        """Return logits whose softmax matches the training sampling policy."""
+        if self.count_mode == "learned_decoupled_st":
+            return logits / self.sample_tau
+        return logits
+
     def _forward_learned(
         self, anchor_feature, anchor_k, delta_p, anchor_offset,
         router_feature=None,
     ):
         if anchor_k is not None:
             raise ValueError(
-                "learned_gumbel predicts anchor_k after temporal fusion; "
+                "learned count routing predicts anchor_k after temporal fusion; "
                 "external anchor_k must be None"
             )
         expected_delta_shape = (
@@ -932,7 +993,7 @@ class GridSlotHead(nn.Module):
         )
         if tuple(delta_p.shape) != expected_delta_shape:
             raise ValueError(
-                "learned_gumbel delta_p must have shape "
+                "learned count delta_p must have shape "
                 f"{expected_delta_shape}, got {tuple(delta_p.shape)}"
             )
 
@@ -1015,6 +1076,7 @@ class GridSlotHead(nn.Module):
             "anchor_k": selected_k,
             "gaussian_offset": gaussian_offset,
             "k_logits": logits,
+            "budget_logits": self._budget_policy_logits(logits),
             "k_selection": selection,
             "packed_selected_gate": packed_gate,
             "selected_only": True,
@@ -1342,7 +1404,7 @@ class GridSlotHead(nn.Module):
                 anchor_feature, anchor_k, delta_p, anchor_offset,
                 target_pose, anchor_batch, anchor_position_ref,
             )
-        if self.count_mode == "learned_gumbel":
+        if self.count_mode in _GRID_SHARED_LEARNED_MODES:
             return self._forward_learned(
                 anchor_feature, anchor_k, delta_p, anchor_offset,
                 router_feature=router_feature,

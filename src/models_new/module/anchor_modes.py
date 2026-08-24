@@ -429,7 +429,7 @@ def build_grid_gaussian_seeds(
             ].detach()
         # Loss-only side output. Unlike routing_stats, this tensor intentionally
         # retains autograd and is removed before the temporal model/renderer.
-        routing_budget_logits = packing["k_logits"]
+        routing_budget_logits = packing.get("budget_logits", packing["k_logits"])
     else:
         seed_ref = anchor_metadata["seed_ref"]
         anchor_index = packing["anchor_index"]

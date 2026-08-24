@@ -110,7 +110,10 @@ class OccupiedGridTokenBuilder(nn.Module):
                 self.grid_seed_config = (
                     "legacy", points_per_gaussian, k_max, exp, None,
                 )
-            elif count_mode in ("learned_gumbel", "learned_gumbel_viewpt"):
+            elif count_mode in (
+                "learned_gumbel", "learned_decoupled_st",
+                "learned_gumbel_viewpt",
+            ):
                 learned_count = getattr(grid_query, "learned_count", None)
                 if learned_count is None:
                     raise ValueError(
@@ -174,7 +177,8 @@ class OccupiedGridTokenBuilder(nn.Module):
             else:
                 raise ValueError(
                     "p2g.grid_query.count_mode must be 'legacy', "
-                    "'learned_gumbel', or 'learned_gumbel_viewpt'"
+                    "'learned_gumbel', 'learned_decoupled_st', or "
+                    "'learned_gumbel_viewpt'"
                 )
         (
             self.intensity_mode,
