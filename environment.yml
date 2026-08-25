@@ -1,8 +1,8 @@
 name: 2dgs
 channels:
   - conda-forge
-  - defaults
   - nvidia
+  - defaults
   - pytorch
 dependencies:
   - _openmp_mutex=4.5
@@ -11,7 +11,7 @@ dependencies:
   - aiohappyeyeballs=2.6.2
   - aiohttp=3.14.1
   - aiosignal=1.4.0
-  - alsa-lib=1.2.16
+  - alsa-lib=1.2.16.1
   - annotated-doc=0.0.4
   - anyio=4.13.0
   - assimp=6.0.5
@@ -419,7 +419,3 @@ dependencies:
       - typing-inspection==0.4.2
       - wadler-lindig==0.1.7
       - wandb==0.27.2
-variables:
-  CC: /usr/bin/gcc-12
-  CXX: /usr/bin/g++-12
-  CUDAHOSTCXX: /usr/bin/g++-12
