@@ -123,11 +123,9 @@ class ModelWrapper(LightningModule):
         loss_module = Loss(self.cfg.loss)
         self.g2p_model = GausRender(
             self.g2p_cfg,
-            scale_clip_max_m=(
-                loss_module.scale_max_m
-                if loss_module.w_scale == 0.0
-                else None
-            ),
+            # w_scale=0 disables scale regularization only.  Do not replace
+            # that loss switch with a renderer-side hard scale clamp.
+            scale_clip_max_m=None,
         )
         self.loss = loss_module
         self._eval_pair_summaries: dict[str, list[dict]] = {}

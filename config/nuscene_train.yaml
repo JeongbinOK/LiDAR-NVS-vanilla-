@@ -1,19 +1,19 @@
 # CUDA_VISIBLE_DEVICES=3,8,9로 실행하므로 Lightning에는 logical index를 전달한다.
-device: [0, 1, 2]
+device: [3, 8, 9]
 seed: 42
 
 project_name: 2dgs-utonia
-exp_name:  ${p2g.anchor_mode}-bs-${train.batch_size}-decoupled-st-no-outnorm-no-pseudo-gt
+exp_name:  ${p2g.anchor_mode}-bs-${train.batch_size}-n-scale
 mode: train
 
 
 loss:
-  w_chamfer: 0
+  w_chamfer: 0.02
   w_depth: 0.5          # depth supervision = 0.5 * mean-depth L1
   w_depth_median: 0.5   #                   + 0.5 * median-depth L1
   w_intensity: 0.2
   w_raydrop: 0.5
-  w_scale: 0.0           # 0.0이면 scale loss 대신 renderer에서 hard upper clip 적용
+  w_scale: 0.0           # 0.0이면 scale regularization만 비활성화하고 scale은 clamp하지 않음
   scale_max_m: 2.5       # softplus 뒤 tangent scale 축별 상한; w_scale>0이면 regularization 기준
   enable_lpips: false
 
@@ -143,13 +143,13 @@ p2g:
   grid_query:                   # 공유 temporal fusion(bg_radius_m/bg_max_kv_per_frame/
                                 # num_heads/bg_layers/fg_layers는 양 모드 사용) +
                                 # grid mode 전용 K routing/head 설정
-    count_mode: learned_decoupled_st  # legacy | learned_gumbel | learned_decoupled_st | learned_gumbel_viewpt
+    count_mode: learned_gumbel  # legacy | learned_gumbel | learned_decoupled_st | learned_gumbel_viewpt
     K_max: 3                    # legacy only: occupied 0.4m cell당 최대 Gaussian 수
     points_per_gaussian: 4      # legacy exp=null only: K_i=ceil(raw_count/this), capped by K_max
     exp: 1                      # legacy only: null=raw-count range quantile;
                                 # 1=one raw-point medoid; 2=two token-coordinate seeds
     learned_count:              # learned modes only; legacy K_max/points_per_gaussian/exp와 독립
-      K_max: 3                  # pseudo-GT가 지도하는 total K=[1..3]
+      K_max: 4                  # pseudo-GT가 지도하는 total K=[1..3]
       tau: 1.0                  # learned_gumbel/viewpt: backward relaxation tau; hard sample에는 영향 없음
       # 저장된 logit 분석에서 고른 첫 ablation 값이며, 실제 학습으로 검증된 최적값은 아님.
       sample_tau: 6.0           # learned_decoupled_st tau_f: softmax(logits / T_sample)에서 hard K sample
