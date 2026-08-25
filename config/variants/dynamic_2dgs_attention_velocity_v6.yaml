@@ -1,0 +1,102 @@
+# Bbox-free Dynamic 2DGS V6.
+#
+# Motion correspondence is independent from temporal feature attention. It
+# reads frozen Utonia tokens before any trainable fusion or time embedding,
+# applies one shared endpoint projection, and keeps at most K candidates from
+# the global content + soft-distance score. Soft reciprocal reweighting and one
+# in-softmax dustbin confidence-weight the proposal velocity; an
+# init-conditioned head then predicts an additive residual.
+model:
+  variant: dynamic_2dgs_attention_velocity_v6
+
+# Keep a fresh V6 run valid on the current 0-6 GPU host. Multi-GPU experiments
+# can still override this explicitly with e.g. device=[0,1].
+device: [0]
+
+exp_name: ${model.variant}-bs-${train.batch_size}
+
+p2g:
+  anchor_mode: grid
+  agg_mlp:
+    hidden_dim: 1024
+    hidden_layers: 2
+    out_dim: 576
+  joint_refiner:
+    # Same-frame context is used by the GS/offset trunk. Stage-3 cells are 0.4 m
+    # and window_size=3 reaches only +/-0.4 m per axis, so one cell advances the
+    # highest-frequency RoPE band by about 1.6 rad rather than 0.08 rad.
+    num_heads: 12
+    rope_base: 10.0
+    rope_position_scale: 4.0
+
+data:
+  # Preserve the loader contract and expose native GT boxes for diagnostics,
+  # without requiring optional predicted-tracking JSON that V6 never consumes.
+  mode: bbox
+  bbox_json_path: null
+
+dynamic_2dgs:
+  temporal:
+    implementation: flash_varlen
+    layers: 4
+    num_heads: 12
+    mlp_ratio: 4
+    # 8 Fourier frequencies produce 17 scalars; one MLP maps 17 -> 64 -> 576.
+    # The 64D value is a hidden bottleneck, not a separately projected embedding.
+    time_hidden_dim: 64
+    time_frequencies: 8
+    time_reference_sec: 1.0
+    rope_base: 10.0
+    rope_position_scale: 0.2
+    layer_scale_init: 0.1
+
+  motion_proposal:
+    # h = LN_no_affine(f_utonia); h' = h + zero-init MLP(h);
+    # z = L2Norm(W h'). The adapter and W are shared by both endpoints.
+    # The dustbin is part of the same directional row softmax.
+    adapter_hidden_dim: 96
+    descriptor_dim: 96
+    candidate_count: 16
+    # Candidate recall uses K=16; only the reciprocal re-ranked best M=4
+    # coordinates are allowed to form the actual displacement cluster.
+    match_count: 4
+    temperature: 0.07
+    score_chunk_size: 512
+    dustbin_similarity_init: 0.70
+
+    # The soft prior is -||p_i-p_j||^2 / (r_i^2+r_j^2), with
+    # r_i = predicted_search_speed_i * endpoint_duration. It never removes a
+    # far token; top-K is selected only after content and geometry are combined.
+    search_speed_min_mps: 2.0
+    search_speed_init_mps: 8.0
+    search_speed_max_mps: 30.0
+
+  gaussian_head:
+    initial_opacity: 0.2
+    initial_scale_m: 0.3
+
+  motion:
+    # v_offset = Head(LN(refined_feature), v_init / scale). The conditioning
+    # copy is detached, while the additive v_init path still trains the motion
+    # proposal. Zero initialization starts a fresh model at v_final = v_init.
+    zero_init: true
+    init_conditioned_residual: true
+    init_condition_scale_mps: 10.0
+    detach_init_condition: true
+
+  regularization:
+    small_motion:
+      enabled: false
+      weight: 0.005
+      epsilon_m: 0.001
+      warmup_steps: 300
+      ramp_steps: 1700
+
+    velocity_l2:
+      enabled: true
+      # Backward-compatible block name; this mode is mean ||v_final||_2 (group
+      # L1 over velocity vectors), not squared component L2.
+      mode: final_group_l1
+      weight: 0.05
+      warmup_steps: 0
+      ramp_steps: 500

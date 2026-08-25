@@ -12,7 +12,11 @@ from src.models_new.module import (
     DynamicGausRender,
 )
 from lightning.pytorch import LightningModule
-from src.models_new.utils.loss import Loss, budget_weight_at_step
+from src.models_new.utils.loss import (
+    Loss,
+    budget_weight_at_step,
+    distributed_token_mean,
+)
 from src.models_new.utils.routing_logging import (
     distributed_sum_statistics,
     range_bin_labels,
@@ -46,6 +50,7 @@ GLOBAL_REDUCED_LOSS_KEYS = {
     "loss_budget",
     "budget_expected_mean_k",
     "budget_violation",
+    "loss_velocity_l2",
 }
 
 ADAPTIVE_BUDGET_LOG_KEYS = {
@@ -180,6 +185,13 @@ class ModelWrapper(LightningModule):
         if self._velocity_l2_cfg is not None:
             if float(getattr(self._velocity_l2_cfg, "weight", 0.0)) < 0.0:
                 raise ValueError("velocity_l2.weight must be non-negative")
+            mode = str(getattr(self._velocity_l2_cfg, "mode", "final_l2")).lower()
+            if mode not in ("final_l2", "final_group_l1"):
+                raise ValueError(
+                    "velocity_l2.mode must be 'final_l2' or 'final_group_l1'; "
+                    f"got {mode!r}"
+                )
+            self._velocity_l2_mode = mode
             self._wandb_loss_keys.add("loss_velocity_l2")
 
     def on_save_checkpoint(self, checkpoint) -> None:
@@ -291,14 +303,12 @@ class ModelWrapper(LightningModule):
         ]
 
     def _add_velocity_l2_prior(self, losses, gaussians, *, prefix):
-        """STORM-style mean-squared velocity prior, in metres/second.
+        """Final-velocity magnitude prior, selected by ``velocity_l2.mode``.
 
-        The penalty is a mean over every Gaussian *and* component (``|v|^2/3``),
-        matching the normalization the reference weight 0.005 was tuned for.
-        That normalization is what makes it selective rather than a blanket
-        freeze: the escape shortcut only pays off when a large fraction of
-        tokens leave the scene, which the mean punishes hard, while genuine
-        traffic is a small fraction of tokens and stays affordable.
+        ``final_l2`` preserves the historical mean over squared components.
+        ``final_group_l1`` is ``mean(||v||_2)``: an L1 penalty over velocity
+        vectors that keeps a non-vanishing restoring force near zero. Both act
+        on the rendered final velocity, never on proposal/fallback components.
 
         The raw term is logged in every mode, but only train adds it to the
         optimized total, so validation totals stay a pure reconstruction score.
@@ -307,14 +317,24 @@ class ModelWrapper(LightningModule):
         if cfg is None:
             return
 
+        mode = getattr(self, "_velocity_l2_mode", "final_l2")
         active = self._active_motion_items(gaussians)
-        if not active:
-            # Keep the term attached to the graph so DDP sees identical
-            # parameter usage on every rank.
-            raw_loss = losses["total"] * 0.0
-        else:
+        if active:
             velocity = torch.cat([item["velocity"] for item in active], dim=0)
-            raw_loss = velocity.square().mean()
+            if mode == "final_l2":
+                local_sum = velocity.square().sum()
+                local_count = velocity.numel()
+            else:
+                local_sum = velocity.norm(dim=-1).sum()
+                local_count = velocity.shape[0]
+        else:
+            # Keep a local graph edge while still entering the same all-reduce
+            # as ranks that happened to receive occupied tokens.
+            local_sum = losses["total"] * 0.0
+            local_count = 0
+        raw_loss, _global_count = distributed_token_mean(
+            local_sum, local_count
+        )
         losses["loss_velocity_l2"] = raw_loss
 
         if prefix != "train":
@@ -351,6 +371,7 @@ class ModelWrapper(LightningModule):
             # is motion the scene cannot physically contain.
             "velocity_frac_over_30mps": (speed > 30.0).to(speed.dtype).mean(),
         }
+        statistics.update(self._motion_proposal_statistics(active))
         for name, value in statistics.items():
             self.log(
                 f"{prefix}/dynamic/{name}",
@@ -360,6 +381,45 @@ class ModelWrapper(LightningModule):
                 sync_dist=True,
                 batch_size=int(speed.numel()),
             )
+
+    @staticmethod
+    def _motion_proposal_statistics(active):
+        """Compact diagnostics for V6; older variants return an empty dict."""
+        stats = {}
+
+        def _cat(name):
+            if any(name not in item for item in active):
+                return None
+            return torch.cat([item[name] for item in active], dim=0).float()
+
+        for field, label in (
+            ("p_unmatched", "p_unmatched_mean"),
+            ("match_probability", "match_probability_mean"),
+            ("motion_top1_probability", "motion_top1_probability_mean"),
+            ("motion_effective_support", "motion_effective_support_mean"),
+            (
+                "motion_reciprocal_probability",
+                "motion_reciprocal_probability_mean",
+            ),
+            (
+                "motion_dustbin_similarity",
+                "motion_dustbin_similarity_mean",
+            ),
+            ("motion_search_speed_mps", "motion_search_speed_mps_mean"),
+        ):
+            value = _cat(field)
+            if value is not None:
+                stats[label] = value.mean()
+
+        for field, label in (
+            ("velocity_match", "velocity_match_norm_mean"),
+            ("velocity_init", "velocity_init_norm_mean"),
+            ("velocity_offset", "velocity_offset_norm_mean"),
+        ):
+            value = _cat(field)
+            if value is not None:
+                stats[label] = value.norm(dim=-1).mean()
+        return stats
 
     def _add_small_motion_prior(self, losses, gaussians, *, prefix):
         """Optional robust prior on physical displacement over each window."""

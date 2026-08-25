@@ -23,24 +23,27 @@ DYNAMIC_VARIANT_V1 = "dynamic_2dgs_direct_velocity_v1"
 DYNAMIC_VARIANT_V3 = "dynamic_2dgs_physical_velocity_v3"
 DYNAMIC_VARIANT_V3_1 = "dynamic_2dgs_physical_velocity_v3_1"
 DYNAMIC_VARIANT_V4 = "dynamic_2dgs_attention_velocity_v4"
-DYNAMIC_VARIANT = "dynamic_2dgs_attention_velocity_v5"
+DYNAMIC_VARIANT_V5 = "dynamic_2dgs_attention_velocity_v5"
+DYNAMIC_VARIANT = "dynamic_2dgs_attention_velocity_v6"
 # V4 and V5 share the attention-initialized velocity backend; V5 only adds
 # QK-Norm and a finer motion-head RoPE band on top of the same parameters.
-ATTENTION_VELOCITY_VARIANTS = (DYNAMIC_VARIANT_V4, DYNAMIC_VARIANT)
+ATTENTION_VELOCITY_VARIANTS = (DYNAMIC_VARIANT_V4, DYNAMIC_VARIANT_V5)
 DYNAMIC_VARIANTS = (
     DYNAMIC_VARIANT_V1,
     DYNAMIC_VARIANT_V3,
     DYNAMIC_VARIANT_V3_1,
     DYNAMIC_VARIANT_V4,
+    DYNAMIC_VARIANT_V5,
     DYNAMIC_VARIANT,
 )
 
-# V3 and V3.1 share one architecture. V4 keeps their physical-time contract and
-# adds attention-derived velocity initialization.
+# V3 and later share the physical-time contract. V4/V5 add attention-derived
+# initialization; V6 uses an independent proposal branch.
 PHYSICAL_VELOCITY_VARIANTS = (
     DYNAMIC_VARIANT_V3,
     DYNAMIC_VARIANT_V3_1,
     DYNAMIC_VARIANT_V4,
+    DYNAMIC_VARIANT_V5,
     DYNAMIC_VARIANT,
 )
 
@@ -57,6 +60,9 @@ VARIANT_CONFIG_PATHS = {
     ),
     DYNAMIC_VARIANT_V4: (
         REPO_ROOT / "config" / "variants" / f"{DYNAMIC_VARIANT_V4}.yaml"
+    ),
+    DYNAMIC_VARIANT_V5: (
+        REPO_ROOT / "config" / "variants" / f"{DYNAMIC_VARIANT_V5}.yaml"
     ),
     DYNAMIC_VARIANT: REPO_ROOT / "config" / "variants" / f"{DYNAMIC_VARIANT}.yaml",
 }
@@ -209,22 +215,33 @@ def validate_experiment_config(config) -> None:
                 trunk_dim, joint_heads, "post-fusion joint attention"
             )
         if variant in PHYSICAL_VELOCITY_VARIANTS:
+            dynamic_keys = {
+                "temporal", "gaussian_head", "motion", "regularization",
+            }
+            if variant == DYNAMIC_VARIANT:
+                dynamic_keys.add("motion_proposal")
             _reject_unknown_keys(
                 config,
                 "dynamic_2dgs",
-                {"temporal", "gaussian_head", "motion", "regularization"},
+                dynamic_keys,
             )
             temporal_keys = {
                 "implementation", "layers", "num_heads", "mlp_ratio",
-                "time_embedding_dim", "time_frequencies", "rope_base",
-                "rope_position_scale", "time_reference_sec",
-                "layer_scale_init",
+                "time_frequencies", "rope_base", "rope_position_scale",
+                "time_reference_sec", "layer_scale_init",
             }
+            if variant == DYNAMIC_VARIANT:
+                temporal_keys.add("time_hidden_dim")
+            else:
+                # V3-V5 checkpoints keep the historical two-stage time path.
+                temporal_keys.add("time_embedding_dim")
             if variant in ATTENTION_VELOCITY_VARIANTS:
                 temporal_keys.add("motion_head_count")
-            if variant == DYNAMIC_VARIANT:
+            if variant == DYNAMIC_VARIANT_V5:
+                temporal_keys.add("qk_norm")
+            if variant == DYNAMIC_VARIANT_V5:
                 temporal_keys.update({
-                    "qk_norm", "motion_rope_base", "motion_rope_position_scale",
+                    "motion_rope_base", "motion_rope_position_scale",
                 })
             _reject_unknown_keys(
                 config,
@@ -240,16 +257,98 @@ def validate_experiment_config(config) -> None:
                         "dynamic_2dgs.temporal.motion_head_count must be in "
                         f"[1, {temporal_heads}]"
                     )
+            if variant == DYNAMIC_VARIANT:
+                time_hidden_dim = int(OmegaConf.select(
+                    config, "dynamic_2dgs.temporal.time_hidden_dim"
+                ))
+                if time_hidden_dim <= 0:
+                    raise ValueError(
+                        "dynamic_2dgs.temporal.time_hidden_dim must be positive"
+                    )
+                _reject_unknown_keys(
+                    config,
+                    "dynamic_2dgs.motion_proposal",
+                    {
+                        "adapter_hidden_dim", "descriptor_dim",
+                        "candidate_count", "match_count", "temperature",
+                        "dustbin_similarity_init", "score_chunk_size",
+                        "search_speed_min_mps", "search_speed_init_mps",
+                        "search_speed_max_mps",
+                    },
+                )
+                proposal_path = "dynamic_2dgs.motion_proposal"
+                for name in (
+                    "adapter_hidden_dim", "descriptor_dim", "candidate_count",
+                    "match_count", "score_chunk_size",
+                ):
+                    value = int(OmegaConf.select(config, f"{proposal_path}.{name}"))
+                    if value <= 0:
+                        raise ValueError(f"{proposal_path}.{name} must be positive")
+                match_count = int(OmegaConf.select(
+                    config, f"{proposal_path}.match_count"
+                ))
+                candidate_count = int(OmegaConf.select(
+                    config, f"{proposal_path}.candidate_count"
+                ))
+                if match_count > candidate_count:
+                    raise ValueError(
+                        "motion_proposal.match_count must not exceed candidate_count"
+                    )
+                for name in ("temperature",):
+                    value = float(OmegaConf.select(config, f"{proposal_path}.{name}"))
+                    if value <= 0.0:
+                        raise ValueError(f"{proposal_path}.{name} must be positive")
+                dustbin_similarity = float(OmegaConf.select(
+                    config, f"{proposal_path}.dustbin_similarity_init"
+                ))
+                if not -1.0 < dustbin_similarity < 1.0:
+                    raise ValueError(
+                        "motion_proposal.dustbin_similarity_init must be in (-1, 1)"
+                    )
+                speed_min = float(OmegaConf.select(
+                    config, f"{proposal_path}.search_speed_min_mps"
+                ))
+                speed_init = float(OmegaConf.select(
+                    config, f"{proposal_path}.search_speed_init_mps"
+                ))
+                speed_max = float(OmegaConf.select(
+                    config, f"{proposal_path}.search_speed_max_mps"
+                ))
+                if not 0.0 < speed_min < speed_init < speed_max:
+                    raise ValueError(
+                        "motion_proposal search speeds must satisfy "
+                        "0 < min < init < max"
+                    )
             _reject_unknown_keys(
                 config,
                 "dynamic_2dgs.gaussian_head",
                 {"initial_opacity", "initial_scale_m"},
             )
+            motion_keys = {"zero_init"}
+            if variant == DYNAMIC_VARIANT:
+                motion_keys.update({
+                    "init_conditioned_residual",
+                    "init_condition_scale_mps",
+                    "detach_init_condition",
+                })
             _reject_unknown_keys(
                 config,
                 "dynamic_2dgs.motion",
-                {"zero_init"},
+                motion_keys,
             )
+            if (
+                variant == DYNAMIC_VARIANT
+                and _has_path(
+                    config, "dynamic_2dgs.motion.init_condition_scale_mps"
+                )
+                and float(OmegaConf.select(
+                    config,
+                    "dynamic_2dgs.motion.init_condition_scale_mps",
+                )) <= 0.0
+            ):
+                raise ValueError(
+                    "dynamic_2dgs.motion.init_condition_scale_mps must be positive"
+                )
             _reject_unknown_keys(
                 config,
                 "dynamic_2dgs.regularization",
@@ -267,8 +366,20 @@ def validate_experiment_config(config) -> None:
                 _reject_unknown_keys(
                     config,
                     "dynamic_2dgs.regularization.velocity_l2",
-                    {"enabled", "weight", "warmup_steps", "ramp_steps"},
+                    {"enabled", "weight", "warmup_steps", "ramp_steps", "mode"},
                 )
+                mode = OmegaConf.select(
+                    config, "dynamic_2dgs.regularization.velocity_l2.mode"
+                )
+                if mode is not None and str(mode) not in (
+                    "final_l2", "final_group_l1",
+                ):
+                    raise ValueError(
+                        "dynamic_2dgs.regularization.velocity_l2.mode must be "
+                        "'final_l2' or 'final_group_l1'"
+                    )
+
+
 def assert_model_variant_implemented(config) -> None:
     """Fail before logger/output side effects for design-only variants."""
 
@@ -493,6 +604,7 @@ __all__ = [
     "DYNAMIC_VARIANT_V3",
     "DYNAMIC_VARIANT_V3_1",
     "DYNAMIC_VARIANT_V4",
+    "DYNAMIC_VARIANT_V5",
     "DYNAMIC_VARIANTS",
     "LEGACY_VARIANT",
     "PHYSICAL_VELOCITY_VARIANTS",

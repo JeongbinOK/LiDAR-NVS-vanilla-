@@ -171,7 +171,7 @@ class SparseLocalSelfAttention(nn.Module):
 
     def __init__(self, dim: int, num_heads: int, max_neighbors: int,
                  attn_drop: float = 0.0, proj_drop: float = 0.0,
-                 chunk_size: int = 4096):
+                 chunk_size: int = 4096, rope_base: float = 10.0):
         super().__init__()
         if dim % num_heads != 0 or (dim // num_heads) % 6 != 0:
             raise ValueError(
@@ -189,7 +189,7 @@ class SparseLocalSelfAttention(nn.Module):
         self.attn_drop = float(attn_drop)
 
         self.qkv = nn.Linear(dim, dim * 3)
-        self.rope = Point3DRoPE(self.head_dim, base=10)
+        self.rope = Point3DRoPE(self.head_dim, base=float(rope_base))
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
@@ -265,7 +265,8 @@ class SparseLocalBlock(nn.Module):
     """Pre-norm sparse-local attention/MLP residual block without xCPE."""
 
     def __init__(self, dim: int, num_heads: int, max_neighbors: int,
-                 mlp_ratio: float, layer_scale: float, chunk_size: int):
+                 mlp_ratio: float, layer_scale: float, chunk_size: int,
+                 rope_base: float):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
         self.attn = SparseLocalSelfAttention(
@@ -273,6 +274,7 @@ class SparseLocalBlock(nn.Module):
             num_heads=num_heads,
             max_neighbors=max_neighbors,
             chunk_size=chunk_size,
+            rope_base=rope_base,
         )
         self.ls1 = LayerScale(dim, init_values=layer_scale)
         self.norm2 = nn.LayerNorm(dim)
@@ -297,9 +299,19 @@ class SparseLocalTokenRefiner(nn.Module):
     def __init__(self, dim: int, depth: int = 2, num_heads: int = 8,
                  window_size=3, mlp_ratio: float = 2.0,
                  layer_scale: float = 1e-5, coord_scale: float = 0.2,
-                 attn_chunk_size: int = 4096):
+                 attn_chunk_size: int = 4096, rope_base: float = 10.0,
+                 rope_position_scale: float | None = None):
         super().__init__()
         self.coord_scale = float(coord_scale)
+        self.rope_position_scale = float(
+            self.coord_scale
+            if rope_position_scale is None
+            else rope_position_scale
+        )
+        if self.rope_position_scale <= 0.0:
+            raise ValueError(
+                "joint_refiner.rope_position_scale must be positive"
+            )
         self.window_size = _window_shape(window_size)
         radius = tuple((value - 1) // 2 for value in self.window_size)
         neighbor_offsets = torch.tensor(
@@ -322,6 +334,7 @@ class SparseLocalTokenRefiner(nn.Module):
                 mlp_ratio=mlp_ratio,
                 layer_scale=layer_scale,
                 chunk_size=attn_chunk_size,
+                rope_base=float(rope_base),
             )
             for _ in range(int(depth))
         ])
@@ -332,7 +345,10 @@ class SparseLocalTokenRefiner(nn.Module):
         neighbors = _sparse_window_neighbors(
             grid_coord, offset, self.neighbor_offsets
         )
-        coord = pos * self.coord_scale
+        # ``coord_scale`` belongs to Utonia's input preprocessing. Sparse local
+        # attention has a much smaller metric receptive field and therefore
+        # owns an independent radians/metre scale for its RoPE phase.
+        coord = pos * self.rope_position_scale
         for block in self.blocks:
             feat = block(feat, coord, neighbors)
         return feat
@@ -362,6 +378,8 @@ def build_joint_refiner(cfg, *, dim: int, coord_scale: float):
             **common,
             window_size=getattr(cfg, "window_size", 3),
             attn_chunk_size=int(getattr(cfg, "attn_chunk_size", 4096)),
+            rope_base=float(getattr(cfg, "rope_base", 10.0)),
+            rope_position_scale=getattr(cfg, "rope_position_scale", None),
         )
     raise ValueError(
         "joint_refiner.type must be 'serial' or 'sparse', "

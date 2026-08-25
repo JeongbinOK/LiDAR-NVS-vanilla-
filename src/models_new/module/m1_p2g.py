@@ -109,33 +109,42 @@ class Point2Gaus(nn.Module):
                 DYNAMIC_VARIANT_V3,
                 DYNAMIC_VARIANT_V3_1,
                 DYNAMIC_VARIANT_V4,
+                DYNAMIC_VARIANT_V5,
             )
             from .dynamic_gaussian import (
                 AttentionInitializedVelocityGaussianBackend,
                 DynamicGaussianBackend,
                 PhysicalVelocityGaussianBackend,
+                ProposalInitializedVelocityGaussianBackend,
             )
 
             # V3.1 differs from V3 only by its objective. V4 preserves the same
             # parameter structure but activates attention-derived initialization.
-            # V5 shares V4's backend and differs only by temporal config keys
-            # (QK-Norm and a finer motion-head RoPE band).
+            # V5 shares V4's backend and differs only by temporal config keys.
+            # V6 has an independent frozen-Utonia Siamese motion proposal and
+            # keeps temporal attention exclusively on feature refinement.
             backend_cls = {
                 DYNAMIC_VARIANT_V1: DynamicGaussianBackend,
                 DYNAMIC_VARIANT_V3: PhysicalVelocityGaussianBackend,
                 DYNAMIC_VARIANT_V3_1: PhysicalVelocityGaussianBackend,
                 DYNAMIC_VARIANT_V4: AttentionInitializedVelocityGaussianBackend,
-                DYNAMIC_VARIANT: AttentionInitializedVelocityGaussianBackend,
+                DYNAMIC_VARIANT_V5: AttentionInitializedVelocityGaussianBackend,
+                DYNAMIC_VARIANT: ProposalInitializedVelocityGaussianBackend,
             }.get(self.dynamic_variant)
             if backend_cls is None:
                 raise ValueError(
                     f"Unsupported dynamic model variant={self.dynamic_variant!r}"
                 )
+            self._uses_motion_proposal = self.dynamic_variant == DYNAMIC_VARIANT
+            backend_kwargs = {}
+            if self._uses_motion_proposal:
+                backend_kwargs["proposal_dim"] = self.utonia_feature_dim
             self.dynamic_backend = backend_cls(
                 self.dynamic_cfg,
                 cfg.gs_params,
                 dim=trunk_dim,
                 offset_bound=self.offset_bound,
+                **backend_kwargs,
             )
             return
 
@@ -405,6 +414,13 @@ class Point2Gaus(nn.Module):
                     "Dynamic 2DGS requires timestamps_sec and "
                     "window_duration_sec from the dataloader"
                 )
+            dynamic_kwargs = {}
+            if self._uses_motion_proposal:
+                # Utonia is frozen, but the shared descriptor projection below
+                # remains trainable. This preserves pretrained cross-frame
+                # semantic consistency instead of making correspondence depend
+                # on the jointly changing intensity/fusion/GS trunk.
+                dynamic_kwargs["motion_proposal_feature"] = all_ufeat
             dynamic_out = self.dynamic_backend(
                 agg_feat_i,
                 all_pos,
@@ -415,6 +431,7 @@ class Point2Gaus(nn.Module):
                 _input["timestamps"],
                 timestamps_sec,
                 window_duration_sec,
+                **dynamic_kwargs,
             )
             return {
                 **dynamic_out,

@@ -9,11 +9,15 @@ from omegaconf import OmegaConf
 from src.dataloader.nuscene import relative_time_coordinates
 from src.models_new.module.dynamic_gaussian import (
     AttentionInitializedVelocityGaussianBackend,
+    InitConditionedVelocityHead,
     PhysicalVelocityGaussianBackend,
+    ProposalInitializedVelocityGaussianBackend,
+    SparseMotionProposal,
     TimeConditionedParallelCrossAttention,
 )
 from src.models_new.module.feature_fusion import build_feature_fusion
 from src.models_new.module.m3_g2p import DynamicGausRender
+from src.models_new.module.token_refiner import SparseLocalTokenRefiner
 from src.models_new.utils.attention import Rotary3D
 from src.models_new.utils.loss import Loss
 from src.models_new.utonia.model import Point3DRoPE
@@ -50,6 +54,14 @@ def v5_temporal_cfg(dim=24, heads=4, layers=2, motion_head_count=2,
     return cfg
 
 
+def v6_temporal_cfg(dim=24, heads=4, layers=2):
+    values = OmegaConf.to_container(
+        temporal_cfg(dim=dim, heads=heads, layers=layers), resolve=True
+    )
+    values["time_hidden_dim"] = values.pop("time_embedding_dim")
+    return OmegaConf.create(values)
+
+
 def backend_cfg(dim=24):
     return OmegaConf.create({
         "temporal": OmegaConf.to_container(temporal_cfg(dim=dim), resolve=True),
@@ -67,6 +79,33 @@ def attention_backend_cfg(dim=24, heads=4, motion_head_count=4):
     cfg = backend_cfg(dim=dim)
     cfg.temporal.num_heads = heads
     cfg.temporal.motion_head_count = motion_head_count
+    return cfg
+
+
+def proposal_cfg(**overrides):
+    values = {
+        "adapter_hidden_dim": 4,
+        "descriptor_dim": 8,
+        "candidate_count": 4,
+        "match_count": 2,
+        "temperature": 0.1,
+        "score_chunk_size": 2,
+        "dustbin_similarity_init": 0.70,
+        "search_speed_min_mps": 1.0,
+        "search_speed_init_mps": 5.0,
+        "search_speed_max_mps": 20.0,
+    }
+    values.update(overrides)
+    return OmegaConf.create(values)
+
+
+def proposal_backend_cfg(dim=24):
+    cfg = backend_cfg(dim=dim)
+    cfg.temporal = v6_temporal_cfg(dim=dim)
+    cfg.motion_proposal = proposal_cfg()
+    cfg.motion.init_conditioned_residual = True
+    cfg.motion.init_condition_scale_mps = 10.0
+    cfg.motion.detach_init_condition = True
     return cfg
 
 
@@ -104,7 +143,9 @@ class DynamicGaussianTest(unittest.TestCase):
         })
 
     @staticmethod
-    def _apply_velocity_l2(velocities, *, prefix="train", weight=0.005, step=0):
+    def _apply_velocity_l2(
+        velocities, *, prefix="train", weight=0.005, step=0, mode="final_l2"
+    ):
         wrapper = SimpleNamespace(
             _velocity_l2_cfg=OmegaConf.create({
                 "enabled": True,
@@ -112,6 +153,7 @@ class DynamicGaussianTest(unittest.TestCase):
                 "warmup_steps": 0,
                 "ramp_steps": 0,
             }),
+            _velocity_l2_mode=mode,
             global_step=step,
             _active_motion_items=ModelWrapper._active_motion_items,
         )
@@ -160,6 +202,19 @@ class DynamicGaussianTest(unittest.TestCase):
             float(velocity.grad[0, 0]), 2.0 * 0.005 * 6.0 / 3.0, places=7
         )
 
+    def test_velocity_group_l1_uses_vector_norm_and_constant_slope(self):
+        velocity = torch.tensor([[3.0, 4.0, 0.0]], requires_grad=True)
+        losses = self._apply_velocity_l2(
+            [velocity], weight=0.05, mode="final_group_l1"
+        )
+        self.assertAlmostEqual(float(losses["loss_velocity_l2"]), 5.0, places=6)
+        losses["total"].backward()
+        self.assertTrue(torch.allclose(
+            velocity.grad,
+            torch.tensor([[0.03, 0.04, 0.0]]),
+            atol=1.0e-7,
+        ))
+
     def test_irregular_pair_keeps_normalized_and_physical_time(self):
         normalized, seconds, duration = relative_time_coordinates(
             [1_000_000, 1_400_000, 1_870_000],
@@ -193,6 +248,9 @@ class DynamicGaussianTest(unittest.TestCase):
         module = TimeConditionedParallelCrossAttention(
             temporal_cfg(), dim=24
         ).eval()
+        self.assertEqual(module.time_encoder.out_dim, 16)
+        self.assertEqual(module.time_to_feature.in_features, 16)
+        self.assertEqual(module.time_to_feature.out_features, 24)
         feat0 = torch.randn(3, 24)
         feat1 = torch.randn(2, 24)
         pos0 = torch.randn(3, 3)
@@ -213,6 +271,20 @@ class DynamicGaussianTest(unittest.TestCase):
         )
         restored = torch.cat([swapped[2:], swapped[:2]])
         self.assertTrue(torch.allclose(out, restored, atol=2.0e-5, rtol=2.0e-5))
+
+    def test_v6_time_mlp_maps_fourier_features_directly_to_token_width(self):
+        module = TimeConditionedParallelCrossAttention(
+            v6_temporal_cfg(), dim=24
+        ).eval()
+        self.assertEqual(module.time_encoder.num_frequencies, 4)
+        self.assertEqual(module.time_encoder.hidden_dim, 16)
+        self.assertEqual(module.time_encoder.mlp[0].in_features, 9)
+        self.assertEqual(module.time_encoder.mlp[0].out_features, 16)
+        self.assertEqual(module.time_encoder.mlp[2].in_features, 16)
+        self.assertEqual(module.time_encoder.mlp[2].out_features, 24)
+        self.assertIsInstance(module.time_to_feature, torch.nn.Identity)
+        encoded = module.time_encoder(torch.tensor([0.0, 0.8]))
+        self.assertEqual(encoded.shape, (2, 24))
 
     def test_motion_heads_compute_soft_opposite_frame_displacement(self):
         module = TimeConditionedParallelCrossAttention(
@@ -479,6 +551,354 @@ class DynamicGaussianTest(unittest.TestCase):
         self.assertEqual(fusion[4].out_features, 576)
         output = fusion(torch.randn(2, 576))
         self.assertEqual(output.shape, (2, 576))
+
+
+class SparseMotionProposalTest(unittest.TestCase):
+    def test_shared_score_is_endpoint_swap_symmetric(self):
+        torch.manual_seed(3)
+        module = SparseMotionProposal(proposal_cfg(), dim=8)
+        descriptor0 = torch.nn.functional.normalize(torch.randn(3, 8), dim=-1)
+        descriptor1 = torch.nn.functional.normalize(torch.randn(5, 8), dim=-1)
+        position0 = torch.randn(3, 3)
+        position1 = torch.randn(5, 3)
+        radius0 = torch.rand(3) + 1.0
+        radius1 = torch.rand(5) + 1.0
+        score01 = module._pair_score(
+            descriptor0, descriptor1, position0, position1, radius0, radius1
+        )
+        score10 = module._pair_score(
+            descriptor1, descriptor0, position1, position0, radius1, radius0
+        )
+        self.assertTrue(torch.allclose(score01, score10.t(), atol=1.0e-6))
+        self.assertFalse(module.input_norm.elementwise_affine)
+        self.assertTrue(torch.count_nonzero(
+            module.descriptor_adapter[-1].weight
+        ).item() == 0)
+
+        feature = torch.randn(4, 8)
+        normalized = module.input_norm(feature)
+        descriptor, _speed, _radius = module._encode(
+            feature, torch.ones(4)
+        )
+        expected = torch.nn.functional.normalize(
+            module.descriptor(normalized).float(), dim=-1, eps=1.0e-6
+        )
+        self.assertTrue(torch.equal(descriptor, expected))
+
+    def test_joint_topk_is_sparse_without_a_distance_cutoff(self):
+        module = SparseMotionProposal(
+            proposal_cfg(candidate_count=2, temperature=0.1), dim=8
+        )
+        query_descriptor = torch.tensor([[1.0, 0.0]])
+        key_descriptor = torch.tensor([
+            [0.0, 1.0],
+            [1.0, 0.0],
+            [-1.0, 0.0],
+        ])
+        query_position = torch.zeros(1, 3)
+        key_position = torch.tensor([
+            [0.1, 0.0, 0.0],
+            [10.0, 0.0, 0.0],
+            [20.0, 0.0, 0.0],
+        ])
+        result = module._topk_direction(
+            query_descriptor,
+            key_descriptor,
+            query_position,
+            key_position,
+            torch.tensor([30.0]),
+            torch.full((3,), 30.0),
+        )
+        self.assertEqual(result["candidate_index"].shape, (1, 2))
+        # The 10 m semantic match survives because geometry is a bias, not a cut.
+        self.assertEqual(int(result["candidate_index"][0, 0]), 1)
+
+    def test_zero_init_adapter_preserves_then_learns_bottleneck(self):
+        torch.manual_seed(29)
+        module = SparseMotionProposal(proposal_cfg(), dim=8)
+        feature = torch.randn(6, 8)
+        target = torch.randn(6, module.descriptor_dim)
+        optimizer = torch.optim.SGD(
+            module.descriptor_adapter.parameters(), lr=0.1
+        )
+
+        descriptor, _speed, _radius = module._encode(feature, torch.ones(6))
+        (descriptor * target).sum().backward()
+        down_grad = module.descriptor_adapter[0].weight.grad
+        up_grad = module.descriptor_adapter[-1].weight.grad
+        self.assertEqual(float(down_grad.abs().sum()), 0.0)
+        self.assertGreater(float(up_grad.abs().sum()), 0.0)
+        optimizer.step()
+
+        optimizer.zero_grad(set_to_none=True)
+        descriptor, _speed, _radius = module._encode(feature, torch.ones(6))
+        (descriptor * target).sum().backward()
+        down_grad = module.descriptor_adapter[0].weight.grad
+        self.assertIsNotNone(down_grad)
+        self.assertGreater(float(down_grad.abs().sum()), 0.0)
+
+    def test_dustbin_uses_absolute_cosine_evidence(self):
+        module = SparseMotionProposal(
+            proposal_cfg(
+                candidate_count=1, match_count=1, temperature=0.1
+            ), dim=8
+        )
+        result, _reverse = module._match_pair(
+            torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+            torch.tensor([[1.0, 0.0]]),
+            torch.zeros(2, 3),
+            torch.zeros(1, 3),
+            torch.full((2,), 100.0),
+            torch.full((1,), 100.0),
+        )
+        self.assertLess(float(result["p_unmatched"][0]), 0.1)
+        self.assertGreater(float(result["p_unmatched"][1]), 0.99)
+
+    def test_soft_reciprocal_evidence_reweights_many_to_one_winner(self):
+        direction = {
+            "candidate_index": torch.tensor([[0, 1], [0, 1]]),
+            "score": torch.tensor([[0.9, 0.1], [0.9, 0.1]]).log() + 12.0,
+            "conditional_probability": torch.tensor([[0.9, 0.1], [0.9, 0.1]]),
+            "support": 2,
+        }
+        reverse = {
+            "candidate_index": torch.tensor([[0, 1], [1, 0]]),
+            "score": (
+                torch.tensor([[1.0, 1.0e-6], [1.0, 1.0e-6]]).log()
+                + 12.0
+            ),
+            "conditional_probability": torch.tensor([[1.0, 0.0], [1.0, 0.0]]),
+            "support": 2,
+        }
+        position0 = torch.zeros(2, 3)
+        position1 = torch.tensor([[10.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+        module = SparseMotionProposal(proposal_cfg(match_count=2), dim=8)
+        result = module._finish_direction(
+            direction, reverse, position0, position1
+        )
+        # Query 1's non-reciprocal key-0 winner drops from 0.9 to 0.75 and the
+        # reciprocal alternative rises from 0.1 to 0.25. It is not hard-cut.
+        self.assertAlmostEqual(float(result["delta_p_match"][1, 0]), 7.75, places=5)
+        self.assertTrue(torch.all((result["p_unmatched"] >= 0.0)
+                                  & (result["p_unmatched"] <= 1.0)))
+
+    def test_forward_is_differentiable_through_selected_candidates(self):
+        torch.manual_seed(17)
+        module = SparseMotionProposal(proposal_cfg(), dim=8)
+        feature = torch.randn(7, 8, requires_grad=True)
+        position = torch.randn(7, 3)
+        result = module(
+            feature,
+            position,
+            torch.tensor([3, 7]),
+            torch.tensor([0, 0]),
+            torch.full((7,), 0.8),
+        )
+        self.assertTrue(torch.all(
+            result["motion_effective_support"] <= module.match_count + 1.0e-5
+        ))
+        objective = (
+            result["delta_p_init"].square().sum()
+            + result["p_unmatched"].sum()
+        )
+        objective.backward()
+        self.assertTrue(torch.isfinite(feature.grad).all())
+        self.assertGreater(float(feature.grad.abs().sum()), 0.0)
+        self.assertTrue(torch.isfinite(module.descriptor.weight.grad).all())
+        adapter_grad = module.descriptor_adapter[-1].weight.grad
+        self.assertIsNotNone(adapter_grad)
+        self.assertTrue(torch.isfinite(adapter_grad).all())
+        self.assertGreater(float(adapter_grad.abs().sum()), 0.0)
+
+    def test_init_conditioned_head_receives_only_feature_and_scaled_init(self):
+        head = InitConditionedVelocityHead(
+            OmegaConf.create({
+                "zero_init": True,
+                "init_condition_scale_mps": 10.0,
+                "detach_init_condition": True,
+            }),
+            dim=24,
+        )
+        captured = []
+        handle = head.motion_refiner[0].register_forward_pre_hook(
+            lambda _module, args: captured.append(args[0])
+        )
+        velocity_init = torch.tensor(
+            [[10.0, -5.0, 0.0], [0.0, 0.0, 20.0]],
+            requires_grad=True,
+        )
+        try:
+            output = head(torch.zeros(2, 24), velocity_init)
+        finally:
+            handle.remove()
+
+        self.assertEqual(head.motion_refiner[0].in_features, 27)
+        self.assertEqual(output.shape, (2, 3))
+        self.assertTrue(torch.equal(
+            captured[0][:, -3:],
+            torch.tensor([[1.0, -0.5, 0.0], [0.0, 0.0, 2.0]]),
+        ))
+        condition_grad = torch.autograd.grad(
+            output.sum(), velocity_init, allow_unused=True
+        )[0]
+        self.assertIsNone(condition_grad)
+
+    def test_backend_adds_init_conditioned_residual_without_dustbin_gate(self):
+        gs_params = OmegaConf.create({
+            "shs": 32, "opacity": 1, "scaling": 2, "rotation": 4, "offset": 3,
+        })
+        backend = ProposalInitializedVelocityGaussianBackend(
+            proposal_backend_cfg(), gs_params, dim=24, offset_bound=0.8
+        )
+        with torch.no_grad():
+            backend.velocity_head.velocity.bias.fill_(0.5)
+        temporal_fields = {
+            "delta_p_match": torch.tensor([
+                [2.0, 0.0, 0.0],
+                [-2.0, 0.0, 0.0],
+            ]),
+            "delta_p_init": torch.tensor([
+                [2.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+            ]),
+            "match_probability": torch.tensor([1.0, 0.0]),
+            "p_unmatched": torch.tensor([0.0, 1.0]),
+            "matched_position": torch.zeros(2, 3),
+            "motion_top1_probability": torch.ones(2),
+            "motion_effective_support": torch.ones(2),
+            "motion_reciprocal_probability": torch.ones(2),
+            "motion_dustbin_similarity": torch.full((2,), 0.5),
+            "motion_search_speed_mps": torch.full((2,), 5.0),
+        }
+        velocity, fields = backend._predict_motion(
+            torch.zeros(2, 24),
+            {
+                "local_frame": torch.tensor([0, 1]),
+                "duration_sec": torch.ones(2),
+            },
+            torch.zeros(2, 3),
+            temporal_fields,
+        )
+        self.assertTrue(torch.equal(
+            velocity,
+            torch.tensor([[2.5, 0.5, 0.5], [0.5, 0.5, 0.5]]),
+        ))
+        self.assertTrue(backend.init_conditioned_residual)
+        self.assertIsInstance(backend.velocity_head, InitConditionedVelocityHead)
+        self.assertIn("velocity_offset", fields)
+        self.assertTrue(torch.equal(
+            fields["velocity_init"],
+            torch.tensor([[2.0, 0.0, 0.0], [0.0, 0.0, 0.0]]),
+        ))
+        self.assertIn("velocity_match", fields)
+        self.assertNotIn("velocity_residual", fields)
+
+    def test_legacy_v6_config_keeps_feature_only_dustbin_gated_fallback(self):
+        cfg = proposal_backend_cfg()
+        del cfg.motion.init_conditioned_residual
+        del cfg.motion.init_condition_scale_mps
+        del cfg.motion.detach_init_condition
+        gs_params = OmegaConf.create({
+            "shs": 32, "opacity": 1, "scaling": 2, "rotation": 4, "offset": 3,
+        })
+        backend = ProposalInitializedVelocityGaussianBackend(
+            cfg, gs_params, dim=24, offset_bound=0.8
+        )
+        with torch.no_grad():
+            backend.velocity_head.velocity.bias.fill_(0.5)
+        velocity, _fields = backend._predict_motion(
+            torch.zeros(2, 24),
+            {
+                "local_frame": torch.tensor([0, 1]),
+                "duration_sec": torch.ones(2),
+            },
+            torch.zeros(2, 3),
+            {
+                "delta_p_match": torch.tensor([
+                    [2.0, 0.0, 0.0],
+                    [-2.0, 0.0, 0.0],
+                ]),
+                "delta_p_init": torch.tensor([
+                    [2.0, 0.0, 0.0],
+                    [0.0, 0.0, 0.0],
+                ]),
+                "p_unmatched": torch.tensor([0.0, 1.0]),
+                "matched_position": torch.zeros(2, 3),
+                "motion_top1_probability": torch.ones(2),
+                "motion_effective_support": torch.ones(2),
+                "motion_reciprocal_probability": torch.ones(2),
+                "motion_dustbin_similarity": torch.full((2,), 0.5),
+                "motion_search_speed_mps": torch.full((2,), 5.0),
+                "match_probability": torch.tensor([1.0, 0.0]),
+            },
+        )
+        self.assertFalse(backend.init_conditioned_residual)
+        self.assertEqual(backend.velocity_head.motion_refiner[0].in_features, 24)
+        self.assertTrue(torch.equal(
+            velocity,
+            torch.tensor([[2.0, 0.0, 0.0], [0.5, 0.5, 0.5]]),
+        ))
+
+    def test_v6_backend_uses_independent_raw_utonia_feature_and_dustbin(self):
+        torch.manual_seed(23)
+        gs_params = OmegaConf.create({
+            "shs": 32, "opacity": 1, "scaling": 2, "rotation": 4, "offset": 3,
+        })
+        backend = ProposalInitializedVelocityGaussianBackend(
+            proposal_backend_cfg(), gs_params, dim=24, offset_bound=0.8,
+            proposal_dim=10,
+        )
+        feature = torch.randn(5, 24, requires_grad=True)
+        utonia_feature = torch.randn(5, 10, requires_grad=True)
+        token = torch.tensor([
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [0.2, 0.0, 0.0],
+            [1.2, 0.0, 0.0],
+        ])
+        output = backend(
+            feature,
+            token,
+            token.unsqueeze(1),
+            torch.tensor([3, 5]),
+            torch.tensor([0, 0]),
+            [torch.eye(4).repeat(2, 1, 1)],
+            [torch.tensor([0.0, 1.0])],
+            [torch.tensor([0.0, 0.8])],
+            torch.tensor([0.8]),
+            motion_proposal_feature=utonia_feature,
+        )
+        item = output["batch_gaussians"][0]
+        expected = item["velocity_init"] + item["velocity_offset"]
+        self.assertTrue(torch.allclose(item["velocity"], expected))
+        self.assertTrue(torch.allclose(
+            item["p_unmatched"], 1.0 - item["match_probability"]
+        ))
+        item["velocity"].square().sum().backward()
+        self.assertIsNotNone(utonia_feature.grad)
+        self.assertEqual(backend.motion_proposal.descriptor.in_features, 10)
+        self.assertEqual(
+            backend.motion_proposal.descriptor_adapter[0].in_features, 10
+        )
+        self.assertIsNotNone(backend.motion_proposal.descriptor.weight.grad)
+        self.assertGreater(
+            float(backend.motion_proposal.descriptor.weight.grad.abs().sum()), 0.0
+        )
+
+    def test_sparse_local_rope_has_an_independent_metric_scale(self):
+        refiner = SparseLocalTokenRefiner(
+            dim=24,
+            depth=1,
+            num_heads=4,
+            window_size=3,
+            coord_scale=0.2,
+            rope_base=10.0,
+            rope_position_scale=4.0,
+        )
+        self.assertEqual(refiner.coord_scale, 0.2)
+        self.assertEqual(refiner.rope_position_scale, 4.0)
+        self.assertEqual(refiner.blocks[0].attn.rope.base, 10.0)
 
 
 

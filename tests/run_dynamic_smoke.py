@@ -170,6 +170,10 @@ def main():
         f"train.batch_size={args.batch_size}",
         "data.num_workers=0",
         "data.eval_num_workers=0",
+        # Dynamic V6 never consumes boxes. Null also makes the smoke portable to
+        # machines without the optional predicted-tracking JSON; the loader may
+        # still expose native GT boxes for diagnostics.
+        "data.bbox_json_path=null",
         "logger.enable=false",
         f"dynamic_2dgs.temporal.layers={args.attention_layers}",
     ])
@@ -192,6 +196,13 @@ def main():
         weight_decay=float(cfg.train.weight_decay),
     )
     temporal_weight = model.p2g_model.dynamic_backend.temporal.q_proj[0].weight
+    proposal_weight = (
+        model.p2g_model.dynamic_backend.motion_proposal.descriptor.weight
+    )
+    proposal_adapter_weight = (
+        model.p2g_model.dynamic_backend.motion_proposal
+        .descriptor_adapter[-1].weight
+    )
     velocity_weight = (
         model.p2g_model.dynamic_backend.velocity_head.velocity.weight
     )
@@ -207,6 +218,8 @@ def main():
         total = losses["total"]
         total.backward()
         temporal_grad = grad_norm(temporal_weight)
+        proposal_grad = grad_norm(proposal_weight)
+        proposal_adapter_grad = grad_norm(proposal_adapter_weight)
         velocity_grad = grad_norm(velocity_weight)
         torch.nn.utils.clip_grad_norm_(parameters, float(cfg.train.grad_clip))
         optimizer.step()
@@ -220,6 +233,18 @@ def main():
             displacement = (
                 moved - gaussians[0]["position"]
             ).norm(dim=-1).mean()
+            proposal_stats = {}
+            for field in (
+                "p_unmatched",
+                "match_probability",
+                "motion_top1_probability",
+                "motion_effective_support",
+                "motion_reciprocal_probability",
+                "motion_search_speed_mps",
+            ):
+                if all(field in item for item in gaussians):
+                    value = torch.cat([item[field] for item in gaussians]).float()
+                    proposal_stats[f"{field}_mean"] = float(value.mean())
             record = {
                 "step": step,
                 "total": float(total.detach()),
@@ -229,11 +254,14 @@ def main():
                 "raydrop": float(losses["loss_raydrop"].detach()),
                 "scale": float(losses["loss_scale"].detach()),
                 "temporal_grad_norm": temporal_grad,
+                "proposal_grad_norm": proposal_grad,
+                "proposal_adapter_grad_norm": proposal_adapter_grad,
                 "velocity_grad_norm": velocity_grad,
                 "velocity_speed_mean_mps": float(speeds.mean()),
                 "velocity_speed_max_mps": float(speeds.max()),
                 "middle_displacement_mean_m": float(displacement),
                 "gaussians": int(sum(item["position"].shape[0] for item in gaussians)),
+                **proposal_stats,
             }
             records.append(record)
         print(json.dumps(record, sort_keys=True), flush=True)
@@ -249,6 +277,10 @@ def main():
             "peak_memory_allocated_gib": peak_gib,
             "peak_memory_reserved_gib": peak_reserved_gib,
             "temporal_grad_norm": records[-1]["temporal_grad_norm"],
+            "proposal_grad_norm": records[-1]["proposal_grad_norm"],
+            "proposal_adapter_grad_norm": (
+                records[-1]["proposal_adapter_grad_norm"]
+            ),
             "velocity_grad_norm": records[-1]["velocity_grad_norm"],
         }, sort_keys=True), flush=True)
         return
@@ -317,6 +349,10 @@ def main():
     }
     if not all(item["temporal_grad_norm"] > 0.0 for item in records):
         raise RuntimeError("render loss did not reach temporal cross-attention")
+    if not all(item["proposal_grad_norm"] > 0.0 for item in records):
+        raise RuntimeError("render loss did not reach the motion proposal")
+    if not all(item["proposal_adapter_grad_norm"] > 0.0 for item in records):
+        raise RuntimeError("render loss did not reach the proposal adapter")
     if not all(item["velocity_grad_norm"] > 0.0 for item in records):
         raise RuntimeError("render loss did not reach the velocity output head")
     if records[-1]["velocity_speed_mean_mps"] <= 1.0e-5:
