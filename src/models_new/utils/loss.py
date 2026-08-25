@@ -12,7 +12,7 @@ try:
 except ImportError:
     lpips = None
 
-SCALE_REG_MAX_M = 2.5
+DEFAULT_SCALE_MAX_M = 2.5
 
 
 def budget_weight_at_step(
@@ -158,6 +158,11 @@ class Loss(nn.Module):
         self.w_intensity    = cfg.w_intensity
         self.w_raydrop      = cfg.w_raydrop
         self.w_scale        = float(getattr(cfg, "w_scale", 0.0))
+        self.scale_max_m    = float(
+            getattr(cfg, "scale_max_m", DEFAULT_SCALE_MAX_M)
+        )
+        if not self.scale_max_m > 0.0:
+            raise ValueError("loss.scale_max_m must be positive")
         self.chamfer = chamfer_3DDist()
         self.enable_lpips = bool(getattr(cfg, "enable_lpips", False))
         # LPIPS is an expensive logging metric, not part of the training loss.
@@ -271,7 +276,7 @@ class Loss(nn.Module):
         return score
 
     def _scale_regularization(self, gaussians, reference):
-        """Penalize only Gaussians exceeding ``SCALE_REG_MAX_M``.
+        """Penalize only Gaussians exceeding ``self.scale_max_m``.
 
         The squared log-ratio is averaged over violating Gaussians in each
         violating sample, then over only those samples. Non-violating Gaussians
@@ -306,7 +311,7 @@ class Loss(nn.Module):
             max_scale = scales.amax(dim=-1)
             excess = F.relu(
                 torch.log(max_scale.clamp_min(1e-6))
-                - max_scale.new_tensor(SCALE_REG_MAX_M).log()
+                - max_scale.new_tensor(self.scale_max_m).log()
             )
             multiplicity = torch.ones_like(excess)
             gaussian_view = batch_item.get("view_index")

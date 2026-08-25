@@ -105,11 +105,27 @@ class Gaussianutil:
         self.intensity_activation = torch.sigmoid
 
     
-    def get_scaling(self, scale):
-        return self.scaling_activation(scale)
-    
-    def get_covariance(self, scale, scaling_modifier, rotation):
-        return self.covariance_activation(self.get_scaling(scale), scaling_modifier, self.get_rotation(rotation))
+    def get_scaling(self, scale, max_scale_m=None):
+        """Apply softplus, then optionally hard-clip each scale axis in metres.
+
+        Values above the cap receive zero direct gradient through this output,
+        matching the intended emergency-bound behavior of a regular clamp.
+        """
+        scaling = self.scaling_activation(scale)
+        if max_scale_m is None:
+            return scaling
+        max_scale_m = float(max_scale_m)
+        if not max_scale_m > 0.0:
+            raise ValueError("max_scale_m must be positive")
+        return scaling.clamp_max(max_scale_m)
+
+    def get_covariance(self, scale, scaling_modifier, rotation,
+                       max_scale_m=None):
+        return self.covariance_activation(
+            self.get_scaling(scale, max_scale_m=max_scale_m),
+            scaling_modifier,
+            self.get_rotation(rotation),
+        )
     
     def get_opacity(self, opacity):
         return self.opacity_activation(opacity)
