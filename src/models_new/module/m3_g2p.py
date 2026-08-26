@@ -7,6 +7,12 @@ from ..utils.graphics_utils import lidar4d_range_image_to_points
 
 
 class GausRender(nn.Module):
+    # Evaluation tools use this explicit rendering contract instead of
+    # ``data.mode``.  Dynamic models still load bbox-mode data for historical
+    # dataloader compatibility even though their renderer never transports a
+    # Gaussian with a box trajectory.
+    transport_mode = "bbox"
+
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
@@ -392,6 +398,8 @@ class GausRender(nn.Module):
 
 class DynamicGausRender(GausRender):
     """Render linearly transported Dynamic 2D Gaussians in physical seconds."""
+
+    transport_mode = "velocity"
 
     @staticmethod
     def render_timestamp(camera):

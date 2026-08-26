@@ -45,6 +45,7 @@ from src.eval.gslidar_metrics import (
 from src.eval.gaussian_viz import (
     gaussians_from_output, save_sequence_html,
     surfels_from_output, save_sequence_surfel_html,
+    velocity_transport_from_output,
 )
 from src.eval.gaussian_stats import collect_window_stats, analyze_gaussian_sizes
 from src.models_new.utils.graphics_utils import lidar4d_range_image_to_points
@@ -203,6 +204,20 @@ def main(cfg, config_source="unspecified"):
         device,
         allow_checkpoint_mismatch=bool(cfg.get("allow_checkpoint_mismatch", False)),
     )
+    transport_mode = getattr(model.g2p_model, "transport_mode", None)
+    if transport_mode not in {"bbox", "velocity"}:
+        raise RuntimeError(
+            "Gaussian renderer must declare transport_mode as bbox or velocity"
+        )
+    show_velocity_vectors = transport_mode == "velocity"
+    print(
+        f"[setup] gaussian_transport={transport_mode} "
+        f"velocity_arrows={'on' if show_velocity_vectors else 'off'}"
+        + (
+            " (source + velocity * actual signed delta_t -> target)"
+            if show_velocity_vectors else ""
+        )
+    )
     backends = MetricBackends(lpips_net="alex")
 
     dataset = LiDAR4DNuScenesTestDataset(cfg.data, split=cfg.data.test_split)
@@ -212,7 +227,7 @@ def main(cfg, config_source="unspecified"):
 
     vfov = tuple(cfg.data.vfov)
     window_metrics = []  # list of dicts (with seq_name / target_s)
-    seq_gauss = defaultdict(list)   # seq_name -> [{label, static, dynamic}] center-point HTML
+    seq_gauss = defaultdict(list)   # seq_name -> center-point HTML frames
     seq_surfel = defaultdict(list)  # seq_name -> [{label, static, dynamic, boxes}] 1σ-surfel HTML
     gauss_dir = viz_dir / "gaussians"
     gauss_dir.mkdir(parents=True, exist_ok=True)
@@ -304,11 +319,44 @@ def main(cfg, config_source="unspecified"):
         # diagnostics must build the same transient union as the renderer.
         target_gaussians = model.g2p_model.select_target_view(out[b], target_cam)
         render_t = float(model.g2p_model.render_timestamp(gt_cam))
-        static_xyz, dynamic_xyz = gaussians_from_output(
-            model.g2p_model, target_gaussians, render_t)
-        seq_gauss[seq_name].append({
-            "label": f"T={target_s}s", "static": static_xyz, "dynamic": dynamic_xyz,
-            "input_points": in_pts, "gt_points": gt_pts})
+        if show_velocity_vectors:
+            transport = velocity_transport_from_output(
+                model.g2p_model, target_gaussians, render_t
+            )
+            source_times = transport["source_times_sec"]
+            source_delta_t = render_t - source_times
+            delta_label = ", ".join(
+                f"{float(value):+.6f}" for value in source_delta_t
+            )
+            center_frame = {
+                "label": (
+                    f"T={target_s}s | target={render_t:.6f}s | "
+                    f"source→target Δt=[{delta_label}]s"
+                ),
+                "source_frame_centers": transport[
+                    "target_centers_by_source_frame"
+                ],
+                "velocity_origins": transport["source_centers"],
+                "velocity_mps": transport["velocity_mps"],
+                "velocity_delta_t_sec": transport["delta_t_sec"],
+                "velocity_source_frame_index": transport[
+                    "source_frame_index"
+                ],
+                "input_points": in_pts,
+                "gt_points": gt_pts,
+            }
+        else:
+            static_xyz, dynamic_xyz = gaussians_from_output(
+                model.g2p_model, target_gaussians, render_t
+            )
+            center_frame = {
+                "label": f"T={target_s}s",
+                "static": static_xyz,
+                "dynamic": dynamic_xyz,
+                "input_points": in_pts,
+                "gt_points": gt_pts,
+            }
+        seq_gauss[seq_name].append(center_frame)
         surf = surfels_from_output(
             model.g2p_model, target_gaussians, render_t
         )

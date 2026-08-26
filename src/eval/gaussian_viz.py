@@ -3,9 +3,10 @@
 One self-contained HTML per sequence (Plotly.js from CDN, no python dep). The
 1/2/3/4 buttons toggle the Gaussian point cloud of each target second
 (T=1,2,3,4s). Points are Gaussian *centers* (means3D) at that window's target
-time, in the window's ref frame (frame-0 sensor frame, z-up). Static Gaussians
-are height-colored; dynamic Gaussians (from bbox trajectories) are red so moving
-objects stand out as you switch frames.
+time, in the window's ref frame (frame-0 sensor frame, z-up). Bbox-transport
+models show static/dynamic centers. Velocity-transport models color target-time
+centers by their source endpoint frame and draw each actual source-to-target
+transport as an arrow.
 """
 from __future__ import annotations
 
@@ -37,6 +38,67 @@ def gaussians_from_output(g2p_model, b_gs, t_target: float, max_static=None):
     else:
         is_dyn = np.zeros((means.shape[0],), dtype=bool)
     return extract_frame(means, is_dyn, max_static=max_static)
+
+
+def velocity_transport_from_output(g2p_model, b_gs, t_target: float):
+    """Return the exact source-to-target transport used by DynamicGausRender.
+
+    For every Gaussian, ``delta_t_sec = target_time - source_time_sec`` and the
+    rendered target center is ``source_center + velocity * delta_t_sec``. The
+    sign matters: when the target lies between two endpoint frames, Gaussians
+    from the later endpoint travel backward to the target with a negative delta.
+    All positions and velocities are already in the window reference frame.
+    """
+    position = b_gs.get("position")
+    velocity = b_gs.get("velocity")
+    source_time = b_gs.get("source_time_sec")
+    if not all(torch.is_tensor(value) for value in (
+        position, velocity, source_time,
+    )):
+        raise KeyError(
+            "Velocity visualization requires position, velocity, and source_time_sec"
+        )
+    means = g2p_model.get_means3D(b_gs, t_target).detach()
+    position = position.detach().to(device=means.device, dtype=means.dtype)
+    velocity = velocity.detach().to(device=means.device, dtype=means.dtype)
+    source_time = source_time.detach().to(device=means.device, dtype=means.dtype)
+    if position.shape != means.shape or velocity.shape != means.shape:
+        raise ValueError(
+            "Positions and velocity vectors must align with rendered centers"
+        )
+    if source_time.shape != (means.shape[0],):
+        raise ValueError("source_time_sec must provide one value per Gaussian")
+    target_time = torch.as_tensor(
+        float(t_target), device=means.device, dtype=means.dtype
+    )
+    delta_t = target_time - source_time
+    expected_means = position + velocity * delta_t.unsqueeze(-1)
+    if not torch.allclose(means, expected_means, rtol=1.0e-5, atol=1.0e-5):
+        raise RuntimeError(
+            "Velocity visualization does not match renderer target centers"
+        )
+    if not bool(all(torch.isfinite(value).all() for value in (
+        position, means, velocity, source_time, delta_t,
+    ))):
+        raise ValueError("Velocity visualization received non-finite transport data")
+
+    source_times, source_frame_index = torch.unique(
+        source_time, sorted=True, return_inverse=True
+    )
+    target_centers_by_source_frame = [
+        means[source_frame_index == frame].cpu().numpy()
+        for frame in range(int(source_times.numel()))
+    ]
+    return {
+        "source_centers": position.cpu().numpy(),
+        "target_centers": means.cpu().numpy(),
+        "target_centers_by_source_frame": target_centers_by_source_frame,
+        "velocity_mps": velocity.cpu().numpy(),
+        "source_time_sec": source_time.cpu().numpy(),
+        "source_times_sec": source_times.cpu().numpy(),
+        "source_frame_index": source_frame_index.cpu().numpy(),
+        "delta_t_sec": delta_t.cpu().numpy(),
+    }
 
 
 _HTML = """<!DOCTYPE html>
@@ -94,6 +156,20 @@ L_BOX = "bbox"
 L_INPUT = "input LiDAR (2 endpoints)"
 L_GT = "GT LiDAR @ target t"
 L_PRED = "predicted LiDAR (raydrop kept)"
+SOURCE_FRAME_COLORS = (
+    "#00cc96", "#ab63fa", "#ffa15a", "#19d3f3", "#ff6692", "#b6e880",
+)
+
+
+def _source_frame_layer(frame_index: int) -> str:
+    return f"gaussians from source frame {int(frame_index)}"
+
+
+def _source_frame_velocity_layer(frame_index: int) -> str:
+    return (
+        f"velocity from source frame {int(frame_index)} "
+        "× actual Δt (source → target)"
+    )
 
 
 def _point_trace(xyz, color, size, name, sub=120000, seed=0):
@@ -106,6 +182,61 @@ def _point_trace(xyz, color, size, name, sub=120000, seed=0):
             "x": xyz[:, 0].tolist(), "y": xyz[:, 1].tolist(), "z": xyz[:, 2].tolist(),
             "marker": {"size": size, "color": color, "opacity": 0.75},
             "name": name, "visible": False, "hoverinfo": "skip"}
+
+
+def _velocity_arrow_trace(origins, velocity_mps, delta_t_sec, name, color):
+    """Build exact source-to-target 3D transport arrows as one line trace."""
+    origins = np.asarray(origins, np.float32).reshape(-1, 3)
+    velocity_mps = np.asarray(velocity_mps, np.float32).reshape(-1, 3)
+    if origins.shape != velocity_mps.shape:
+        raise ValueError("velocity origins and vectors must have matching (N,3) shape")
+    delta_t_sec = np.asarray(delta_t_sec, np.float32).reshape(-1)
+    if delta_t_sec.shape != (origins.shape[0],):
+        raise ValueError("delta_t_sec must provide one value per velocity vector")
+
+    displacement = velocity_mps * delta_t_sec[:, None]
+    length = np.linalg.norm(displacement, axis=1)
+    keep = np.isfinite(origins).all(axis=1) & np.isfinite(velocity_mps).all(axis=1)
+    keep &= np.isfinite(delta_t_sec) & (length > 1.0e-6)
+    origins = origins[keep]
+    displacement = displacement[keep]
+    length = length[keep]
+
+    if origins.shape[0] == 0:
+        xyz = np.zeros((0, 3), np.float32)
+    else:
+        direction = displacement / length[:, None]
+        tips = origins + displacement
+
+        # Choose a stable vector that is not parallel to the arrow direction,
+        # then form one camera-independent 3D side direction with a cross product.
+        reference = np.zeros_like(direction)
+        reference[:, 2] = 1.0
+        near_vertical = np.abs(direction[:, 2]) > 0.9
+        reference[near_vertical] = np.array([0.0, 1.0, 0.0], np.float32)
+        side = np.cross(direction, reference)
+        side /= np.linalg.norm(side, axis=1, keepdims=True).clip(min=1.0e-12)
+
+        head_length = 0.22 * length
+        head_width = 0.45 * head_length
+        head_base = tips - head_length[:, None] * direction
+        left = head_base + head_width[:, None] * side
+        right = head_base - head_width[:, None] * side
+
+        # shaft, left fin, right fin; NaNs separate independent line segments.
+        nan = np.full_like(origins, np.nan)
+        xyz = np.stack(
+            [origins, tips, nan, tips, left, nan, tips, right, nan], axis=1
+        ).reshape(-1, 3)
+
+    xyz = np.round(xyz, 3)
+    return {
+        "type": "scatter3d", "mode": "lines",
+        "x": xyz[:, 0].tolist(), "y": xyz[:, 1].tolist(),
+        "z": xyz[:, 2].tolist(),
+        "line": {"color": color, "width": 2},
+        "name": name, "visible": False, "hoverinfo": "skip",
+    }
 
 
 def _render(path, title, labels, traces, tags, layers, off):
@@ -121,29 +252,116 @@ def _render(path, title, labels, traces, tags, layers, off):
 
 
 def save_sequence_html(path, title: str, frames: list, point_size: float = 1.6):
-    """frames: list of {"label", "static" [N,3], "dynamic" [M,3],
-    optional "input_points" [P,3] and "gt_points" [Q,3]} (numpy, ref frame).
+    """Write bbox-mode or velocity-mode Gaussian center frames.
+
+    Bbox frames contain ``static`` / ``dynamic`` centers. Velocity frames contain
+    ``source_frame_centers`` plus aligned ``velocity_origins``, ``velocity_mps``,
+    ``velocity_delta_t_sec``, and ``velocity_source_frame_index``. All positions
+    use the window reference frame.
 
     The raw-LiDAR layers are what make the Gaussian centres readable: without
     them you cannot tell a misplaced centre from a correctly placed one.
     """
+    source_frame_flags = [
+        "source_frame_centers" in fr for fr in frames
+    ]
+    velocity_mode = any(source_frame_flags)
+    if velocity_mode and not all(source_frame_flags):
+        raise ValueError("All sequence frames must use the same center color mode")
+    if velocity_mode and not all(
+        all(key in fr for key in (
+            "velocity_origins", "velocity_mps", "velocity_delta_t_sec",
+            "velocity_source_frame_index",
+        ))
+        for fr in frames
+    ):
+        raise ValueError(
+            "Velocity frames require origins, vectors, actual delta_t_sec, "
+            "and source frame indices"
+        )
+    source_frame_count = (
+        len(frames[0]["source_frame_centers"]) if velocity_mode and frames else 0
+    )
+    if velocity_mode and any(
+        len(fr["source_frame_centers"]) != source_frame_count for fr in frames
+    ):
+        raise ValueError("Source frame count must stay constant across a sequence")
+
     traces, tags = [], []
     for fi, fr in enumerate(frames):
-        s = np.round(np.asarray(fr["static"], np.float32), 2)
-        d = np.round(np.asarray(fr["dynamic"], np.float32), 2)
-        traces.append({
-            "type": "scatter3d", "mode": "markers",
-            "x": s[:, 0].tolist(), "y": s[:, 1].tolist(), "z": s[:, 2].tolist(),
-            "marker": {"size": point_size, "color": s[:, 2].tolist(),
-                       "colorscale": "Viridis", "opacity": 0.8},
-            "name": L_STATIC, "visible": False, "hoverinfo": "skip"})
-        tags.append([fi, L_STATIC])
-        traces.append({
-            "type": "scatter3d", "mode": "markers",
-            "x": d[:, 0].tolist(), "y": d[:, 1].tolist(), "z": d[:, 2].tolist(),
-            "marker": {"size": point_size + 1.8, "color": "#e63946", "opacity": 0.95},
-            "name": L_DYN, "visible": False, "hoverinfo": "skip"})
-        tags.append([fi, L_DYN])
+        if velocity_mode:
+            origins = np.asarray(fr["velocity_origins"], np.float32).reshape(-1, 3)
+            velocity = np.asarray(fr["velocity_mps"], np.float32).reshape(-1, 3)
+            delta_t = np.asarray(
+                fr["velocity_delta_t_sec"], np.float32
+            ).reshape(-1)
+            source_frame_index = np.asarray(
+                fr["velocity_source_frame_index"]
+            ).reshape(-1)
+            if (
+                velocity.shape != origins.shape
+                or delta_t.shape != (origins.shape[0],)
+                or source_frame_index.shape != (origins.shape[0],)
+            ):
+                raise ValueError(
+                    "Velocity vectors, times, and source frame indices must "
+                    "align with origins"
+                )
+            if not np.issubdtype(source_frame_index.dtype, np.integer):
+                raise ValueError("Velocity source frame indices must be integers")
+            if source_frame_index.size and (
+                source_frame_index.min() < 0
+                or source_frame_index.max() >= source_frame_count
+            ):
+                raise ValueError("Velocity source frame index is out of range")
+
+            for source_frame, centers in enumerate(fr["source_frame_centers"]):
+                centers = np.round(np.asarray(centers, np.float32), 2)
+                layer = _source_frame_layer(source_frame)
+                velocity_layer = _source_frame_velocity_layer(source_frame)
+                color = SOURCE_FRAME_COLORS[
+                    source_frame % len(SOURCE_FRAME_COLORS)
+                ]
+                source_mask = source_frame_index == source_frame
+                if int(source_mask.sum()) != centers.shape[0]:
+                    raise ValueError(
+                        "Source-frame centers must align with velocity source "
+                        "frame indices"
+                    )
+                traces.append({
+                    "type": "scatter3d", "mode": "markers",
+                    "x": centers[:, 0].tolist(),
+                    "y": centers[:, 1].tolist(),
+                    "z": centers[:, 2].tolist(),
+                    "marker": {
+                        "size": point_size + 1.0,
+                        "color": color,
+                        "opacity": 0.9,
+                    },
+                    "name": layer, "visible": False, "hoverinfo": "skip",
+                })
+                tags.append([fi, layer])
+                traces.append(_velocity_arrow_trace(
+                    origins[source_mask], velocity[source_mask],
+                    delta_t[source_mask], velocity_layer, color,
+                ))
+                tags.append([fi, velocity_layer])
+        else:
+            s = np.round(np.asarray(fr["static"], np.float32), 2)
+            d = np.round(np.asarray(fr["dynamic"], np.float32), 2)
+            traces.append({
+                "type": "scatter3d", "mode": "markers",
+                "x": s[:, 0].tolist(), "y": s[:, 1].tolist(), "z": s[:, 2].tolist(),
+                "marker": {"size": point_size, "color": s[:, 2].tolist(),
+                           "colorscale": "Viridis", "opacity": 0.8},
+                "name": L_STATIC, "visible": False, "hoverinfo": "skip"})
+            tags.append([fi, L_STATIC])
+            traces.append({
+                "type": "scatter3d", "mode": "markers",
+                "x": d[:, 0].tolist(), "y": d[:, 1].tolist(), "z": d[:, 2].tolist(),
+                "marker": {"size": point_size + 1.8, "color": "#e63946", "opacity": 0.95},
+                "name": L_DYN, "visible": False, "hoverinfo": "skip"})
+            tags.append([fi, L_DYN])
         traces.append(_point_trace(fr.get("input_points", np.zeros((0, 3))),
                                    "#9aa0a6", 1.2, L_INPUT))
         tags.append([fi, L_INPUT])
@@ -151,8 +369,19 @@ def save_sequence_html(path, title: str, frames: list, point_size: float = 1.6):
                                    "#f4a261", 1.3, L_GT))
         tags.append([fi, L_GT])
 
+    layers = (
+        [
+            layer
+            for i in range(source_frame_count)
+            for layer in (
+                _source_frame_layer(i), _source_frame_velocity_layer(i),
+            )
+        ]
+        if velocity_mode else [L_STATIC, L_DYN]
+    )
+    layers.extend([L_INPUT, L_GT])
     return _render(path, title, [fr["label"] for fr in frames], traces, tags,
-                   [L_STATIC, L_DYN, L_INPUT, L_GT], off=[L_INPUT])
+                   layers, off=[L_INPUT])
 
 
 # ===========================================================================

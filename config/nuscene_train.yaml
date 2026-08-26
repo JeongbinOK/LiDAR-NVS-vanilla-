@@ -13,7 +13,7 @@ allow_legacy_wandb_fallback: false
 
 
 loss:
-  w_chamfer: 0 #0.02
+  w_chamfer: 0.02 #0.02
   w_depth: 0.5          # depth supervision = 0.5 * mean-depth L1
   w_depth_median: 0.5   #                   + 0.5 * median-depth L1
   w_intensity: 0.2

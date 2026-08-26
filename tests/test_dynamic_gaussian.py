@@ -1,12 +1,23 @@
 from __future__ import annotations
 
+import json
 import unittest
+import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import torch
 from omegaconf import OmegaConf
 
 from src.dataloader.nuscene import relative_time_coordinates
+from src.eval.gaussian_viz import (
+    SOURCE_FRAME_COLORS,
+    _source_frame_velocity_layer,
+    _velocity_arrow_trace,
+    save_sequence_html,
+    velocity_transport_from_output,
+)
 from src.models_new.module.dynamic_gaussian import (
     AttentionInitializedVelocityGaussianBackend,
     InitConditionedVelocityHead,
@@ -16,7 +27,7 @@ from src.models_new.module.dynamic_gaussian import (
     TimeConditionedParallelCrossAttention,
 )
 from src.models_new.module.feature_fusion import build_feature_fusion
-from src.models_new.module.m3_g2p import DynamicGausRender
+from src.models_new.module.m3_g2p import DynamicGausRender, GausRender
 from src.models_new.module.token_refiner import SparseLocalTokenRefiner
 from src.models_new.utils.attention import Rotary3D
 from src.models_new.utils.loss import Loss
@@ -518,6 +529,104 @@ class DynamicGaussianTest(unittest.TestCase):
         grad = backend.velocity_head.velocity.weight.grad
         self.assertIsNotNone(grad)
         self.assertGreater(float(grad.abs().sum()), 0.0)
+
+    def test_renderers_declare_transport_contract(self):
+        self.assertEqual(GausRender.transport_mode, "bbox")
+        self.assertEqual(DynamicGausRender.transport_mode, "velocity")
+
+    def test_velocity_viz_uses_actual_signed_source_to_target_time(self):
+        renderer = DynamicGausRender(OmegaConf.create({}))
+        item = {
+            "position": torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]),
+            "velocity": torch.tensor([[2.0, 0.0, 0.0], [0.0, -1.0, 0.5]]),
+            "source_time_sec": torch.tensor([0.0, 1.0]),
+        }
+        transport = velocity_transport_from_output(renderer, item, 0.5)
+        np.testing.assert_allclose(
+            transport["target_centers"],
+            np.array([[2.0, 2.0, 3.0], [4.0, 5.5, 5.75]], np.float32),
+        )
+        np.testing.assert_allclose(
+            transport["source_centers"], item["position"].numpy()
+        )
+        np.testing.assert_allclose(
+            transport["velocity_mps"], item["velocity"].numpy()
+        )
+        np.testing.assert_allclose(transport["delta_t_sec"], [0.5, -0.5])
+        np.testing.assert_allclose(transport["source_times_sec"], [0.0, 1.0])
+        self.assertEqual(len(transport["target_centers_by_source_frame"]), 2)
+
+    def test_velocity_viz_arrow_encodes_actual_signed_travel_time(self):
+        trace = _velocity_arrow_trace(
+            np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], np.float32),
+            np.array([[4.0, -2.0, 0.0], [0.0, -1.0, 0.5]], np.float32),
+            delta_t_sec=np.array([0.5, -0.5], np.float32),
+            name="velocity",
+            color="#123456",
+        )
+        # Each arrow occupies nine vertices; indices 0/1 and 9/10 are shafts.
+        np.testing.assert_allclose(
+            np.array([trace[axis][0] for axis in "xyz"]), [1.0, 2.0, 3.0]
+        )
+        np.testing.assert_allclose(
+            np.array([trace[axis][1] for axis in "xyz"]), [3.0, 1.0, 3.0]
+        )
+        np.testing.assert_allclose(
+            np.array([trace[axis][9] for axis in "xyz"]), [4.0, 5.0, 6.0]
+        )
+        np.testing.assert_allclose(
+            np.array([trace[axis][10] for axis in "xyz"]), [4.0, 5.5, 5.75]
+        )
+
+    def test_center_html_adds_velocity_layer_only_when_vectors_exist(self):
+        base = {
+            "label": "T=1s",
+            "static": np.zeros((0, 3), np.float32),
+            "dynamic": np.array([[1.0, 2.0, 3.0]], np.float32),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            without_path = Path(tmp) / "without.html"
+            with_path = Path(tmp) / "with.html"
+            save_sequence_html(without_path, "bbox", [base])
+            save_sequence_html(with_path, "velocity", [{
+                "label": "T=1s",
+                "source_frame_centers": [
+                    np.array([[1.5, 2.0, 3.0]], np.float32),
+                    np.array([[4.0, 5.5, 5.75]], np.float32),
+                ],
+                "velocity_origins": np.array(
+                    [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], np.float32
+                ),
+                "velocity_mps": np.array(
+                    [[1.0, 0.0, 0.0], [0.0, -1.0, 0.5]], np.float32
+                ),
+                "velocity_delta_t_sec": np.array([0.5, -0.5], np.float32),
+                "velocity_source_frame_index": np.array([0, 1]),
+            }])
+
+            without = without_path.read_text()
+            with_velocity = with_path.read_text()
+            self.assertNotIn("gaussians from source frame", without)
+            self.assertIn('"gaussians from source frame 0"', with_velocity)
+            self.assertIn('"gaussians from source frame 1"', with_velocity)
+            self.assertIn(
+                json.dumps(_source_frame_velocity_layer(0)), with_velocity
+            )
+            self.assertIn(
+                json.dumps(_source_frame_velocity_layer(1)), with_velocity
+            )
+            for color in SOURCE_FRAME_COLORS[:2]:
+                self.assertIn(
+                    json.dumps({"color": color, "width": 2}), with_velocity
+                )
+                self.assertIn(
+                    json.dumps({
+                        "size": 2.6, "color": color, "opacity": 0.9,
+                    }),
+                    with_velocity,
+                )
+            self.assertNotIn('"gaussians (static)"', with_velocity)
+            self.assertNotIn('"gaussians (dynamic)"', with_velocity)
 
     def test_direct_velocity_does_not_depend_on_sample_duration(self):
         backend, _output = self._backend_output()
