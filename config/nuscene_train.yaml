@@ -75,9 +75,20 @@ logger:
 
 p2g:
   # Backbone
-  freeze_utonia: true
+  freeze_utonia: true   # LoRA 사용 시 pretrained base/norm은 frozen, LoRA만 trainable
   utonia_ckpt: null   # optional abs path override; null -> checkpoints/utonia/utonia.pth (config dump: config/utonia_pretrained.yaml)
   utonia_feature_stage: 3  # encoder stage index: 3 -> 0.4m/432D, 4 -> 0.8m/576D (default/final)
+  # true: checkpoint의 functional XYZ 입력([xyz, zero_rgb, zero_normal])을 XYZI로
+  # 바꾸고 Utonia의 모든 Linear/SubMConv3d에 LoRA를 설치한다. 실제 forward가
+  # 지나는 stage까지만 trainable로 두어 DDP unused parameter를 피한다. Conv branch는
+  # 3x3x3 C_in->rank 뒤 1x1x1 rank->C_out 순서다. false면 아래 별도 intensity
+  # encoder -> adapter/concat MLP -> joint_refiner legacy 경로로 즉시 복귀한다.
+  utonia_lora:
+    enable: true
+    input_mode: xyzi
+    rank: 16              # Linear와 sparse Conv 공통 rank; 필요 시 linear_rank/conv_rank로 override
+    alpha: 16          # 공통 scaling alpha/rank; linear_alpha/conv_alpha override 지원
+    dropout: 0.0
   anchor_mode: grid        # "spherical" | "grid"
   squery:                       # spherical mode only: raw-point occupied cell = anchor
                                 # (temporal fusion은 grid_query 블록으로 양 모드 공유;
@@ -211,7 +222,8 @@ p2g:
 
 
 
-  # Intensity encoder selection. type=ptv3 -> mini PointTransformerV3 mirroring the
+  # Legacy path only (utonia_lora.enable=false). Intensity encoder selection.
+  # type=ptv3 -> mini PointTransformerV3 mirroring the
   # frozen Utonia backbone (serialization -> RoPE patch attn + xCPE -> GridPooling);
   # output dim = last channel (no projection head), fused end-to-end with the Utonia
   # stream. type=sparse|mlp fall back to the encoders below. Omitting this block
@@ -227,7 +239,8 @@ p2g:
       mlp_ratio: 2.0
       order: [z, hilbert]          # or [z, z-trans, hilbert, hilbert-trans] to mirror Utonia
 
-  # Post-fusion joint token refiner over the fused 192D trunk tokens. type=serial
+  # Legacy path only (utonia_lora.enable=false). Post-fusion joint token refiner
+  # over the fused 192D trunk tokens. type=serial
   # preserves serialized RoPE blocks with xCPE; sparse uses exact occupied-cell
   # local attention without xCPE.
   # At stage3 each cell is 0.4m, so window_size=3 attends to at most 3x3x3=27 cells.
@@ -255,6 +268,7 @@ p2g:
     channels: [16, 32, 48, 64, 96]   # uses first (utonia_feature_stage + 1)
     depth: 1                          # SubMConv context blocks per stage
 
+  # Legacy separate-stream fusion modules; not constructed in XYZI LoRA mode.
   utonia_adapter:
     bottleneck: null   # residual adapter bottleneck r (PEFT-style); null -> utonia_feature_dim // 4
     out_norm: false     # keep in_norm; ablate only the residual output LayerNorm
