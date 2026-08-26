@@ -15,8 +15,7 @@ gu = Gaussianutil(None)
 
 
 def render(viewpoint_camera, pc, cfg, bg_color, input_timestamp, scaling_modifier=1.0,
-           override_color=None, env_map=None, other=[], mask=None, is_training=False,
-           scale_clip_max_m=None):
+           override_color=None, env_map=None, other=[], mask=None, is_training=False):
     """
     Render the scene. 
     
@@ -70,9 +69,7 @@ def render(viewpoint_camera, pc, cfg, bg_color, input_timestamp, scaling_modifie
     #params
     means3D = pc["position"]
     opacity = gu.get_opacity(pc["opacity"])
-    scales = gu.get_scaling(
-        pc["scales"], max_scale_m=scale_clip_max_m
-    )
+    scales = gu.get_scaling(pc["scales"])
     rotations = gu.get_rotation(pc["rotations"])
     cov3D_precomp = None
     shs = pc["shs"]

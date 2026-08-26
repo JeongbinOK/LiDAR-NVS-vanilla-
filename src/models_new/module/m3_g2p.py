@@ -7,17 +7,9 @@ from ..utils.graphics_utils import lidar4d_range_image_to_points
 
 
 class GausRender(nn.Module):
-    def __init__(self, cfg, scale_clip_max_m=None):
+    def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
-        self.scale_clip_max_m = (
-            None if scale_clip_max_m is None else float(scale_clip_max_m)
-        )
-        if (
-            self.scale_clip_max_m is not None
-            and not self.scale_clip_max_m > 0.0
-        ):
-            raise ValueError("scale_clip_max_m must be positive")
         # Channels are [unused, unused, intensity, raydrop]. No-return background
         # should carry zero intensity/depth support and raydrop probability 1.
         self.background = torch.tensor([0, 0, 0, 1], dtype=torch.float32)
@@ -318,7 +310,6 @@ class GausRender(nn.Module):
                     bg_color=self.background.to(means3D.device),
                     input_timestamp=t,
                     is_training=self.training,
-                    scale_clip_max_m=self.scale_clip_max_m,
                 )
 
                 gt_depth = gt_cam.pts_depth.to(device=means3D.device, dtype=means3D.dtype)

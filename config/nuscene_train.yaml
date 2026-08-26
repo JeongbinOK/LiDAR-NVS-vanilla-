@@ -18,8 +18,8 @@ loss:
   w_depth_median: 0.5   #                   + 0.5 * median-depth L1
   w_intensity: 0.2
   w_raydrop: 0.5
-  w_scale: 0.0           # 0.0이면 scale loss 대신 renderer에서 hard upper clip 적용
-  scale_max_m: 2.5       # softplus 뒤 tangent scale 축별 상한; w_scale>0이면 regularization 기준
+  w_scale: 0.0           # scale loss는 계산/기록하지만 0.0이면 total에는 반영하지 않음
+  scale_max_m: 2.5       # softplus scale regularization threshold
   enable_lpips: false
 
 metrics:

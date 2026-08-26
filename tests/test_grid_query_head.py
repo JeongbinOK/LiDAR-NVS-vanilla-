@@ -3,7 +3,6 @@ from types import SimpleNamespace
 import unittest
 
 import torch
-import torch.nn.functional as F
 
 from src.models_new.module.builders.common import (
     _aggregate_points_to_cells,
@@ -24,7 +23,6 @@ from src.models_new.module.grid_query_head import (
 )
 from src.models_new.module.m3_g2p import GausRender
 from src.models_new.utils.loss import Loss
-from src.models_new.utils.render import Gaussianutil
 
 
 ATTN_DIM = 12  # 2 heads -> head_dim 6, matching Utonia 3D RoPE's %6 contract.
@@ -916,24 +914,26 @@ def test_shared_common_scale_regularization_matches_physical_view_repetition():
     torch.testing.assert_close(additional_shared.grad, additional_expanded.grad)
 
 
-def test_scale_activation_softplus_then_optional_hard_clip():
-    raw_scale = torch.tensor([[-2.0, 0.0, 4.0]], requires_grad=True)
-    gaussian_util = Gaussianutil(None)
+def test_scale_loss_is_computed_but_not_added_when_weight_is_zero():
+    loss_fn = Loss(SimpleNamespace(
+        w_chamfer=0.0,
+        w_depth=0.0,
+        w_depth_median=0.0,
+        w_intensity=0.0,
+        w_raydrop=0.0,
+        w_scale=0.0,
+        scale_max_m=2.5,
+        enable_lpips=False,
+    ))
+    raw_scaling = torch.tensor([[4.0, 4.0]], requires_grad=True)
+    raw_loss = loss_fn._scale_regularization(
+        [{"scaling": raw_scaling}], torch.zeros(())
+    )
+    assert float(raw_loss) > 0.0
 
-    unclipped = gaussian_util.get_scaling(raw_scale)
-    clipped = gaussian_util.get_scaling(raw_scale, max_scale_m=2.5)
-
-    torch.testing.assert_close(unclipped, F.softplus(raw_scale))
-    torch.testing.assert_close(clipped, F.softplus(raw_scale).clamp_max(2.5))
-    clipped.sum().backward()
-    assert raw_scale.grad[0, 0] > 0.0
-    assert raw_scale.grad[0, 1] > 0.0
-    assert raw_scale.grad[0, 2] == 0.0
-
-
-def test_gaussian_renderer_keeps_configured_scale_clip():
-    renderer = GausRender(SimpleNamespace(), scale_clip_max_m=2.5)
-    assert renderer.scale_clip_max_m == 2.5
+    total = loss_fn.w_scale * raw_loss
+    total.backward()
+    torch.testing.assert_close(raw_scaling.grad, torch.zeros_like(raw_scaling))
 
 
 def test_learned_count_eval_argmax_routes_exactly_to_k2_joint_head():

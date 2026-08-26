@@ -284,16 +284,21 @@ class Loss(nn.Module):
         denominator. Viewpoint mode stores Common once even though it appears in
         every render union, so a violating Common row is weighted by its number
         of valid target views; this is exactly equivalent to the old physical
-        repetition without retaining V copies. ``w_scale=0`` is a true off
-        switch and does not require Gaussian tensors to be passed.
+        repetition without retaining V copies. ``w_scale=0`` still computes
+        this raw diagnostic term, but its zero weight keeps it out of ``total``.
         """
-        if self.w_scale == 0.0:
-            return reference.new_zeros(())
         if gaussians is None:
+            if self.w_scale == 0.0:
+                # Compatibility for metric-only callers that do not have model
+                # outputs. Normal training/evaluation passes ``gaussians`` and
+                # therefore computes the raw scale diagnostic even at weight 0.
+                return reference.new_zeros(())
             raise ValueError("loss.w_scale > 0 requires Gaussian outputs")
         if isinstance(gaussians, dict):
             gaussians = gaussians.get("batch_gaussians", gaussians.get("gaussians"))
         if gaussians is None:
+            if self.w_scale == 0.0:
+                return reference.new_zeros(())
             raise ValueError("Could not find batch Gaussian outputs for scale regularization")
 
         sample_losses = []

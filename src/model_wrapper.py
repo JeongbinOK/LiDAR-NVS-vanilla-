@@ -79,11 +79,6 @@ class ModelWrapper(LightningModule):
         self.g2g_cfg = cfg.g2g
         self.g2p_cfg = cfg.g2p
         loss_module = Loss(self.cfg.loss)
-        scale_clip_max_m = (
-            loss_module.scale_max_m
-            if loss_module.w_scale == 0.0
-            else None
-        )
 
         # Set up the model.
         if self.model_variant in DYNAMIC_VARIANTS:
@@ -94,18 +89,12 @@ class ModelWrapper(LightningModule):
                 dynamic_variant=self.model_variant,
             )
             self.g2g_model = DynamicGausTemp(self.g2g_cfg)
-            self.g2p_model = DynamicGausRender(
-                self.g2p_cfg,
-                scale_clip_max_m=scale_clip_max_m,
-            )
+            self.g2p_model = DynamicGausRender(self.g2p_cfg)
         else:
             self.dynamic_cfg = None
             self.p2g_model = Point2Gaus(self.p2g_cfg)
             self.g2g_model = GausTemp(self.g2g_cfg)
-            self.g2p_model = GausRender(
-                self.g2p_cfg,
-                scale_clip_max_m=scale_clip_max_m,
-            )
+            self.g2p_model = GausRender(self.g2p_cfg)
         self.loss = loss_module
         self._eval_pair_summaries: dict[str, list[dict]] = {}
         self._metric_interval = int(self._cfg_get("metrics.interval", 50))
