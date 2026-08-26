@@ -1,7 +1,7 @@
-device: [4, 5, 6, 7]
+device: [7,8,9]
 seed: 42
 
-project_name: 2dgs-utonia
+project_name: 2dgs-utonia-lora
 exp_name:  ${p2g.anchor_mode}-bs-${train.batch_size}-n-cd
 mode: train
 
@@ -24,7 +24,7 @@ train:
   weight_decay: 1e-4
   grad_clip: 1.0
   max_epochs: 40
-  batch_size: 2
+  batch_size: 1
   val_check_interval: 1.0
   max_steps: 1000000
   ckpt_path: null   # train from scratch (scheduler + grad clipping stability fix)
@@ -227,8 +227,10 @@ p2g:
     channels: [16, 32, 48, 64, 96]   # uses first (utonia_feature_stage + 1)
     depth: 1                          # SubMConv context blocks per stage
 
-  utonia_adapter:
-    bottleneck: null   # residual adapter bottleneck r (PEFT-style); null -> utonia_feature_dim // 4
+  utonia_lora:
+    enabled: true
+    rank: 8
+    alpha: null   # null -> alpha=rank (scale=1.0)
 
   agg_mlp:
     hidden_dim: 256

@@ -49,6 +49,21 @@ class Point2Gaus(nn.Module):
             getattr(cfg, "utonia_feature_stage", len(self.feature_extractor.enc) - 1)
         )
         self._validate_utonia_feature_stage()
+
+        lora_cfg = getattr(cfg, "utonia_lora", None)
+        self.utonia_lora_enabled = bool(
+            lora_cfg is not None and getattr(lora_cfg, "enabled", False)
+        )
+        if self.utonia_lora_enabled:
+            lora_rank = int(getattr(lora_cfg, "rank", 16))
+            n_lora = utonia.lora.inject_lora(
+                self.feature_extractor,
+                max_stage=self.utonia_feature_stage,
+                rank=lora_rank,
+                alpha=getattr(lora_cfg, "alpha", None),
+            )
+            print(f"Injected Utonia LoRA into {n_lora} layers (rank={lora_rank})")
+
         self.utonia_stride_factor = self._infer_utonia_stride_factor()
         self.utonia_feature_grid_size = self._infer_utonia_feature_grid_size()
         self.utonia_feature_dim = self._infer_utonia_feature_dim()
@@ -66,7 +81,6 @@ class Point2Gaus(nn.Module):
             raise RuntimeError("the shared token builder must expose intensity_out_dim")
         self.agg_in_dim = self.utonia_feature_dim + int(intensity_out_dim)
         (
-            self.utonia_adapter,
             self.intensity_agg_mlp,
             self.joint_refiner,
         ) = build_feature_fusion(
@@ -329,7 +343,6 @@ class Point2Gaus(nn.Module):
             )
 
         agg_feat_i = fuse_features(
-            self.utonia_adapter,
             self.intensity_agg_mlp,
             self.joint_refiner,
             utonia_feature=all_ufeat,

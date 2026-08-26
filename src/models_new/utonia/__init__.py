@@ -22,6 +22,7 @@ from . import data
 from . import transform
 from . import utils
 from . import registry
+from . import lora
 
-__all__ = ["load", "model", "module", "structure", "transform", "registry", "utils"]
+__all__ = ["load", "model", "module", "structure", "transform", "registry", "utils", "lora"]
 
