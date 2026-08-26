@@ -99,7 +99,11 @@ def main(cfg):
     # Gumbel sampling, data shuffling, and DataLoader workers are reproducible.
     seed_everything(int(cfg.seed), workers=True)
     os.makedirs(cfg.logger.dir, exist_ok=True)
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    global_rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", 0)))
+    effective_config_path = os.path.join(cfg.logger.dir, "effective_config.yaml")
+    if global_rank == 0:
+        OmegaConf.save(config=cfg, f=effective_config_path, resolve=True)
+        print(f"[config] effective={os.path.abspath(effective_config_path)}")
     callbacks = []
     if cfg.logger.enable:
         import wandb
