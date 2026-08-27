@@ -59,6 +59,16 @@ data:
   bbox_json_path: "/data1/nuScenes/bbox/tracking_{split}.json"
   num_workers: 4
   eval_num_workers: 0
+  # Per-epoch validation over the full val split is ~5.7k heavily-overlapping
+  # windows, and the metric is dominated by geometry the velocity head cannot
+  # change. compact_val swaps in a fixed 200-window subset weighted toward
+  # motion: 180 dynamic (GT-bbox labelled, stratified over four difficulty
+  # tiers) + 20 static held back as a no-motion control. Built by
+  # tools/build_compact_val_windows.py; the manifest records the sampling
+  # contract it was built under and refuses to load against another.
+  compact_val:
+    enable: true
+    path: config/compact_val_windows.json
   verbose: false
   vfov: [-30.67, 10.67] 
   hfov: [-180, 180]  

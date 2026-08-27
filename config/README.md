@@ -99,6 +99,59 @@ with `allow_legacy_wandb_fallback=true`. Ray geometry and temporal-window fields
 under `data` are protected as structural semantics; dataset paths, splits, and
 worker counts remain runtime-overridable.
 
+## Compact validation (`data.compact_val`)
+
+Validation after every epoch runs the whole `val` split by default: 5,719
+windows in the shipped `pair_mode=keyframe` contract. Consecutive flat-index
+entries step one keyframe at a time, so they overlap heavily, and GT-bbox
+labelling shows the split is 85% dynamic / 6% static — the aggregate metric is
+therefore both slow and dominated by geometry the velocity head cannot change.
+
+`data.compact_val` replaces the val dataloader's index with a fixed subset:
+
+```yaml
+data:
+  compact_val:
+    enable: true
+    path: config/compact_val_windows.json
+```
+
+The shipped manifest holds 200 windows weighted toward motion: **180 dynamic + 20
+static**. The static 20 are a no-motion control, not a representative sample —
+they exist to catch a regression in plain geometry, while the metric that moves
+when the velocity head changes comes from the dynamic 180.
+`tools/build_compact_val_windows.py` builds it from **nuScenes GT annotations**
+(never the tracking JSON): for each window it measures every annotated
+instance's global-frame motion between the keyframes the window spans, keeping
+only instances with `>= 10` LiDAR returns within 80 m of the ego. A window is
+`dynamic` at a peak instance speed `>= 1.0 m/s`, `static` below `0.2 m/s`
+(including windows with no qualifying box), and excluded in between. The 180
+dynamic windows are stratified over four difficulty quartiles — scored by peak
+displacement, moving-point count, mover count, and proximity of the nearest
+mover — so the pool spans easy single-distant-car windows through dense
+close-range traffic rather than only the easy tail. The 20 static windows are
+stratified by box count so they are not all empty streets. Both pools cap
+per-scene picks and forbid overlapping windows within a scene; the dynamic 180
+lands on 119 of the 148 scenes that contain any motion at all.
+
+Note the population this is drawn from: GT-bbox labelling puts the val split at
+85% dynamic, 6% static and 9% borderline, and all 348 static windows live in
+just 40 scenes. Nothing-moving-within-80m is the rare case on nuScenes, which is
+why the static side is a small control rather than half the subset.
+
+A window is addressed by its two endpoint LIDAR_TOP `sample_data` tokens, which
+is a function of the sampling contract. The manifest records that contract
+(`version`, `split`, `window_us`, `sample_gap_us`, `pair_mode`,
+`pair_kf_stride`) and loading re-checks it, so a manifest cannot be silently
+applied to windows it does not address; change any of those keys and rebuild:
+
+```bash
+python tools/build_compact_val_windows.py --n-static 20 --n-dynamic 180
+```
+
+`enable: false` restores full-split validation. `train`/`test` dataloaders are
+untouched.
+
 The Dynamic overlays deliberately keep `data.mode=bbox`; boxes are still loaded
 and collated for dataset compatibility, but the dynamic backend never consumes
 them. The dataloader exposes both normalized `timestamps` for attention and

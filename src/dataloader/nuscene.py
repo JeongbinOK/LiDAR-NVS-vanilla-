@@ -7,6 +7,7 @@ from nuscenes.nuscenes import NuScenes
 from nuscenes.utils.splits import create_splits_scenes
 from pyquaternion import Quaternion
 
+from . import compact_val
 from ..models_new import utonia 
 from ..models_new.utils.camera import Camera
 # ────────────────────────────────────────────────────────────────────────────
@@ -279,7 +280,7 @@ class NuScenesNVSDataset(Dataset):
     window_duration_sec: Tensor(())  actual endpoint interval in seconds
     """
     #n_input = 2 + max_input_extra
-    def __init__(self, cfg, split: str):
+    def __init__(self, cfg, split: str, window_subset: str = None):
         self.cfg           = cfg
         self.dataroot      = cfg.dataroot
         self.split         = split
@@ -335,6 +336,7 @@ class NuScenesNVSDataset(Dataset):
         # For each scene, follow the LIDAR_TOP sample_data chain.  This includes
         # non-keyframe sweeps, unlike sample['next'] which only visits keyframes.
         self.scene_frames = []    # List[List[(lidar_token, sample_token, timestamp_us, is_key_frame)]]
+        self.scene_names  = []    # parallel to scene_frames
         for scene in filtered:
             frames = []
             first_sample = self.nusc.get('sample', scene['first_sample_token'])
@@ -345,6 +347,7 @@ class NuScenesNVSDataset(Dataset):
                 curr = sd['next']
             if len(frames) >= self.window_frame_count:
                 self.scene_frames.append(frames)
+                self.scene_names.append(scene['name'])
  
         # Phase-align off-grid frames to predicted tracking. val/test tracking is
         # keyed by lidar_token on a 0.1s even-sweep grid aligned to the scene
@@ -375,8 +378,35 @@ class NuScenesNVSDataset(Dataset):
         if self.verbose:
             print(f"[{split}] {len(self.index)} anchors")
 
+        # Compact validation: keep only the windows named by the manifest.
+        # Applied last so the manifest is checked against the full index.
+        self.window_labels = None
+        self.window_subset = window_subset
+        if window_subset:
+            compact_val.apply_manifest(self, window_subset, verbose=True)
+
         
  
+    # ── Window addressing ────────────────────────────────────────────────────
+
+    def window_span(self, idx: int):
+        """(scene_idx, start_chain_idx, end_chain_idx) for flat index entry `idx`.
+
+        Normalizes the two `self.index` entry shapes: sweep mode stores only the
+        anchor and derives the end from the fixed hop schedule; keyframe mode
+        stores both endpoints explicitly.
+        """
+        scene_idx, *span = self.index[idx]
+        if len(span) == 1:
+            return scene_idx, span[0], span[0] + self.window_sample_hops[-1]
+        return scene_idx, span[0], span[1]
+
+    def window_key(self, idx: int) -> str:
+        """Run-stable id of window `idx`: its two endpoint LIDAR_TOP tokens."""
+        scene_idx, start_idx, end_idx = self.window_span(idx)
+        frames = self.scene_frames[scene_idx]
+        return compact_val.window_key(frames[start_idx][0], frames[end_idx][0])
+
     # ── Core sampling ────────────────────────────────────────────────────────
     
 
