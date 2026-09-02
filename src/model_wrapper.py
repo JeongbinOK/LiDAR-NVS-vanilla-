@@ -187,9 +187,12 @@ class ModelWrapper(LightningModule):
             if float(getattr(self._velocity_l2_cfg, "weight", 0.0)) < 0.0:
                 raise ValueError("velocity_l2.weight must be non-negative")
             mode = str(getattr(self._velocity_l2_cfg, "mode", "final_l2")).lower()
-            if mode not in ("final_l2", "final_group_l1"):
+            if mode not in (
+                "final_l2", "final_group_l2", "final_group_l1", "offset_l2",
+            ):
                 raise ValueError(
-                    "velocity_l2.mode must be 'final_l2' or 'final_group_l1'; "
+                    "velocity_l2.mode must be 'final_l2', 'final_group_l2', "
+                    "'final_group_l1', or 'offset_l2'; "
                     f"got {mode!r}"
                 )
             self._velocity_l2_mode = mode
@@ -218,6 +221,14 @@ class ModelWrapper(LightningModule):
 
     def _shared_step(self, batch, batch_idx, *, prefix: str):
         _input, gt = batch["input"], batch["gt"]
+        # Resolved before the forward: the correspondence matcher's diagnostics
+        # are computed inside p2g, so the switch has to be set first. This is
+        # the schedule's single call site, and it is order-independent -- it
+        # reads global_step/batch_idx only.
+        compute_valid_metrics, compute_official_metrics = self._metric_schedule(
+            prefix, batch_idx
+        )
+        self._set_proposal_diagnostics(compute_valid_metrics)
         p2g_out = self.p2g_model(
             _input,
             target_pose=gt.get("pose"),
@@ -241,9 +252,6 @@ class ModelWrapper(LightningModule):
             compute_points=(prefix != "train" or compute_train_points),
         )
 
-        compute_valid_metrics, compute_official_metrics = self._metric_schedule(
-            prefix, batch_idx
-        )
         loss_dict = self.loss(
             all_renders,
             gaussians=out,
@@ -264,6 +272,20 @@ class ModelWrapper(LightningModule):
             self._record_eval_summary(loss_dict, batch_idx=batch_idx, prefix=prefix)
 
         return loss_dict["total"]
+
+    def _set_proposal_diagnostics(self, enabled: bool) -> None:
+        """Gate the matcher's O(N) concentration diagnostics to the interval.
+
+        Only a matcher that opts in by exposing ``collect_diagnostics`` is
+        touched, so every pre-V9 proposal keeps computing its statistics on
+        every step exactly as its checkpoints did. The switch follows
+        ``metrics.interval``, which advances identically on every rank, so no
+        rank can reach a ``sync_dist`` log that another rank skips.
+        """
+        backend = getattr(self.p2g_model, "dynamic_backend", None)
+        proposal = getattr(backend, "motion_proposal", None)
+        if proposal is not None and hasattr(proposal, "collect_diagnostics"):
+            proposal.collect_diagnostics = bool(enabled)
 
     def _add_dynamic_motion_regularization(self, losses, gaussians, *, prefix):
         """Apply the configured motion priors and log runaway diagnostics."""
@@ -304,12 +326,18 @@ class ModelWrapper(LightningModule):
         ]
 
     def _add_velocity_l2_prior(self, losses, gaussians, *, prefix):
-        """Final-velocity magnitude prior, selected by ``velocity_l2.mode``.
+        """Velocity magnitude prior selected by ``velocity_l2.mode``.
 
-        ``final_l2`` preserves the historical mean over squared components.
-        ``final_group_l1`` is ``mean(||v||_2)``: an L1 penalty over velocity
-        vectors that keeps a non-vanishing restoring force near zero. Both act
-        on the rendered final velocity, never on proposal/fallback components.
+        ``final_l2`` preserves the historical mean over squared components,
+        which is ``mean(||v||^2) / 3`` and therefore three times weaker than a
+        squared-norm prior at the same weight. ``final_group_l2`` is that
+        squared-norm form, ``mean(||v||_2^2)``: the same numerator over one
+        count per Gaussian rather than per component. ``final_group_l1`` is
+        ``mean(||v||_2)``: an L1 penalty over velocity vectors that keeps a
+        non-vanishing restoring force near zero. All three act on the rendered
+        final velocity. ``offset_l2`` instead computes the mean squared
+        components of the learned V6 residual, leaving the
+        correspondence-derived initialization unregularized.
 
         The raw term is logged in every mode, but only train adds it to the
         optimized total, so validation totals stay a pure reconstruction score.
@@ -321,10 +349,33 @@ class ModelWrapper(LightningModule):
         mode = getattr(self, "_velocity_l2_mode", "final_l2")
         active = self._active_motion_items(gaussians)
         if active:
-            velocity = torch.cat([item["velocity"] for item in active], dim=0)
-            if mode == "final_l2":
+            if mode == "offset_l2":
+                missing = [
+                    index for index, item in enumerate(active)
+                    if "velocity_offset" not in item
+                ]
+                if missing:
+                    raise ValueError(
+                        "velocity_l2.mode='offset_l2' requires every active "
+                        "Gaussian item to provide velocity_offset; missing at "
+                        f"active item indices {missing}"
+                    )
+                velocity = torch.cat([
+                    item["velocity_offset"] for item in active
+                ], dim=0)
+            else:
+                velocity = torch.cat([
+                    item["velocity"] for item in active
+                ], dim=0)
+            if mode in ("final_l2", "offset_l2"):
                 local_sum = velocity.square().sum()
                 local_count = velocity.numel()
+            elif mode == "final_group_l2":
+                # Same squared numerator as final_l2 over one count per
+                # Gaussian: exactly mean(||v||^2), i.e. 3x final_l2 for a
+                # three-component velocity.
+                local_sum = velocity.square().sum()
+                local_count = velocity.shape[0]
             else:
                 local_sum = velocity.norm(dim=-1).sum()
                 local_count = velocity.shape[0]
@@ -385,7 +436,7 @@ class ModelWrapper(LightningModule):
 
     @staticmethod
     def _motion_proposal_statistics(active):
-        """Compact diagnostics for V6; older variants return an empty dict."""
+        """Compact correspondence diagnostics; unsupported variants are empty."""
         stats = {}
 
         def _cat(name):
@@ -403,14 +454,101 @@ class ModelWrapper(LightningModule):
                 "motion_reciprocal_probability_mean",
             ),
             (
+                "motion_selected_forward_probability",
+                "motion_selected_forward_probability_mean",
+            ),
+            ("motion_consensus_entropy", "motion_consensus_entropy_mean"),
+            (
+                "motion_head_js_divergence",
+                "motion_head_js_divergence_mean",
+            ),
+            (
+                "motion_candidate_probability_mass",
+                "motion_candidate_probability_mass_mean",
+            ),
+            (
+                "motion_selection_log_margin",
+                "motion_selection_log_margin_mean",
+            ),
+            (
+                "motion_hard_soft_displacement_cosine",
+                "motion_hard_soft_displacement_cosine_mean",
+            ),
+            (
+                "motion_hard_soft_displacement_norm_ratio",
+                "motion_hard_soft_displacement_norm_ratio_mean",
+            ),
+            (
+                "motion_selected_distance_prior_penalty",
+                "motion_selected_distance_prior_penalty_mean",
+            ),
+            ("motion_match_support", "motion_match_support_mean"),
+            (
                 "motion_dustbin_similarity",
                 "motion_dustbin_similarity_mean",
             ),
+            ("motion_candidate_entropy", "motion_candidate_entropy_mean"),
+            (
+                "motion_candidate_spread_m",
+                "motion_candidate_spread_m_mean",
+            ),
+            (
+                "motion_normalized_mean_displacement",
+                "motion_normalized_mean_displacement_mean",
+            ),
+            (
+                "motion_normalized_candidate_spread",
+                "motion_normalized_candidate_spread_mean",
+            ),
+            (
+                "motion_reciprocal_probability_sum",
+                "motion_reciprocal_probability_sum_mean",
+            ),
+            ("motion_dustbin_logit", "motion_dustbin_logit_mean"),
+            (
+                "motion_soft_match_probability",
+                "motion_soft_match_probability_mean",
+            ),
+            ("motion_hard_reject", "motion_hard_reject_fraction"),
             ("motion_search_speed_mps", "motion_search_speed_mps_mean"),
         ):
             value = _cat(field)
             if value is not None:
                 stats[label] = value.mean()
+
+        best_displacement = _cat("motion_best_candidate_displacement_m")
+        if best_displacement is not None:
+            stats["motion_best_candidate_displacement_magnitude_mean"] = (
+                best_displacement.norm(dim=-1).mean()
+            )
+
+        mean_displacement = _cat("motion_mean_displacement_m")
+        if mean_displacement is not None:
+            stats["motion_mean_displacement_magnitude_mean"] = (
+                mean_displacement.norm(dim=-1).mean()
+            )
+
+        p_unmatched = _cat("p_unmatched")
+        if p_unmatched is not None:
+            stats["p_unmatched_std"] = p_unmatched.std(unbiased=False)
+            stats["p_unmatched_p95"] = torch.quantile(p_unmatched, 0.95)
+            stats["p_unmatched_max"] = p_unmatched.max()
+
+        # Mean alone would hide whether the token-conditioned threshold has
+        # started differentiating easy matches from likely unmatched tokens.
+        dustbin_similarity = _cat("motion_dustbin_similarity")
+        if dustbin_similarity is not None:
+            stats["motion_dustbin_similarity_std"] = (
+                dustbin_similarity.std(unbiased=False)
+            )
+            stats["motion_dustbin_similarity_min"] = dustbin_similarity.min()
+            stats["motion_dustbin_similarity_max"] = dustbin_similarity.max()
+
+        dustbin_logit = _cat("motion_dustbin_logit")
+        if dustbin_logit is not None:
+            stats["motion_dustbin_logit_std"] = dustbin_logit.std(
+                unbiased=False
+            )
 
         for field, label in (
             ("velocity_match", "velocity_match_norm_mean"),
@@ -420,6 +558,26 @@ class ModelWrapper(LightningModule):
             value = _cat(field)
             if value is not None:
                 stats[label] = value.norm(dim=-1).mean()
+
+        layer_weight = _cat("motion_layer_weights")
+        if layer_weight is not None:
+            if layer_weight.ndim != 2:
+                raise ValueError(
+                    "motion_layer_weights must have shape (tokens, layers)"
+                )
+            normalized = layer_weight / layer_weight.sum(
+                dim=-1, keepdim=True
+            ).clamp_min(1.0e-12)
+            stats["motion_layer_weight_entropy_mean"] = -(
+                normalized * normalized.clamp_min(1.0e-12).log()
+            ).sum(dim=-1).mean()
+            stats["motion_layer_weight_max_mean"] = normalized.max(
+                dim=-1
+            ).values.mean()
+            for layer in range(normalized.shape[1]):
+                stats[f"motion_layer_weight_l{layer}_mean"] = normalized[
+                    :, layer
+                ].mean()
         return stats
 
     def _add_small_motion_prior(self, losses, gaussians, *, prefix):
