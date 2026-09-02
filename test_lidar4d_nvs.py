@@ -15,7 +15,8 @@ Our depth is already in meters (g2p.scale_factor == 1.0), so GS-LiDAR's
 
 Usage:
   python test_lidar4d_nvs.py test.ckpt_path=/path/to/epoch=XX.ckpt \
-      [data.mode=bbox] [out_dir=outputs/lidar4d_eval] [device='[4]']
+      [data.mode=bbox] [out_dir=outputs/lidar4d_eval] [device='[4]'] \
+      [test.velocity_source=total|init|match|zero]
 """
 from __future__ import annotations
 
@@ -162,6 +163,62 @@ def summarize(window_metrics):
     return out
 
 
+def select_render_velocity(batch_gaussians, velocity_source: str):
+    """Select the checkpoint velocity component used by the renderer.
+
+    ``total`` preserves the trained model output. ``init`` uses the dustbin-aware
+    proposal, while ``match`` uses its conditional matched velocity before the
+    dustbin probability scale. Both are inference-only component ablations.
+    ``zero`` freezes every Gaussian at its source position, measuring how much
+    the velocity field contributes to reconstruction at all.
+    """
+    velocity_source = str(velocity_source).lower()
+    if velocity_source not in {"total", "init", "match", "zero"}:
+        raise ValueError(
+            "test.velocity_source must be one of "
+            "{'total', 'init', 'match', 'zero'}, got "
+            f"{velocity_source!r}"
+        )
+    if velocity_source == "total":
+        return batch_gaussians
+
+    if velocity_source == "zero":
+        selected = []
+        for item in batch_gaussians:
+            if item is None:
+                selected.append(None)
+                continue
+            velocity = item.get("velocity")
+            if not torch.is_tensor(velocity):
+                raise KeyError("test.velocity_source=zero requires velocity")
+            selected.append({**item, "velocity": torch.zeros_like(velocity)})
+        return selected
+
+    selected = []
+    for batch_index, item in enumerate(batch_gaussians):
+        if item is None:
+            selected.append(None)
+            continue
+        velocity = item.get("velocity")
+        source_key = f"velocity_{velocity_source}"
+        selected_velocity = item.get(source_key)
+        if not torch.is_tensor(selected_velocity):
+            raise KeyError(
+                f"test.velocity_source={velocity_source} requires {source_key} "
+                "in every "
+                f"Gaussian batch item; missing at batch index {batch_index}"
+            )
+        if (
+            not torch.is_tensor(velocity)
+            or selected_velocity.shape != velocity.shape
+        ):
+            raise ValueError(
+                f"{source_key} must be a tensor aligned one-to-one with velocity"
+            )
+        selected.append({**item, "velocity": selected_velocity})
+    return selected
+
+
 # ---------------------------------------------------------------------------
 @torch.no_grad()
 def main(cfg, config_source="unspecified"):
@@ -197,6 +254,15 @@ def main(cfg, config_source="unspecified"):
         f"[setup] depth_statistic={depth_statistic} "
         f"metric_clamp=[1e-6,{EVAL_MAX_DEPTH_M:g}]m"
     )
+    velocity_source = str(
+        OmegaConf.select(cfg, "test.velocity_source", default="total")
+    ).lower()
+    if velocity_source not in {"total", "init", "match", "zero"}:
+        raise ValueError(
+            "test.velocity_source must be one of "
+            "{'total', 'init', 'match', 'zero'}, got "
+            f"{velocity_source!r}"
+        )
 
     model = load_model(
         cfg,
@@ -210,12 +276,24 @@ def main(cfg, config_source="unspecified"):
             "Gaussian renderer must declare transport_mode as bbox or velocity"
         )
     show_velocity_vectors = transport_mode == "velocity"
+    if velocity_source != "total" and not show_velocity_vectors:
+        raise ValueError(
+            "Non-total test.velocity_source ablations are only available for "
+            "velocity-transport models"
+        )
     print(
         f"[setup] gaussian_transport={transport_mode} "
         f"velocity_arrows={'on' if show_velocity_vectors else 'off'}"
         + (
             " (source + velocity * actual signed delta_t -> target)"
             if show_velocity_vectors else ""
+        )
+    )
+    print(
+        f"[setup] render_velocity={velocity_source}"
+        + (
+            " (inference-only velocity ablation; weights unchanged)"
+            if velocity_source != "total" else ""
         )
     )
     backends = MetricBackends(lpips_net="alex")
@@ -257,6 +335,7 @@ def main(cfg, config_source="unspecified"):
             )
         else:
             out = model.g2g_model(out, _input["timestamps"])
+        out = select_render_velocity(out, velocity_source)
         renders = model.g2p_model(out, gt)
 
         b = 0
@@ -383,7 +462,10 @@ def main(cfg, config_source="unspecified"):
         sp = next((w["nuscenes_split"] for w in window_metrics
                    if w["seq_name"] == seq_name), "")
         save_sequence_html(gauss_dir / f"{seq_name}.html",
-                           title=f"{seq_name}  ({sp})  — Gaussian centers", frames=frames)
+                           title=(
+                               f"{seq_name}  ({sp})  — Gaussian centers "
+                               f"[velocity={velocity_source}]"
+                           ), frames=frames)
         save_sequence_surfel_html(gauss_dir / f"{seq_name}_surfel.html",
                                   title=f"{seq_name}  ({sp})", frames=seq_surfel[seq_name])
     print(f"[gaussians] wrote {len(seq_gauss)} center + {len(seq_surfel)} surfel HTML -> {gauss_dir}")
@@ -423,6 +505,7 @@ def main(cfg, config_source="unspecified"):
                    "depth_statistic": depth_statistic,
                    "max_depth_m": EVAL_MAX_DEPTH_M,
                    "gt_range_policy": "clamp_positive_returns",
+                   "velocity_source": velocity_source,
                    "vfov": list(vfov), "target_seconds": [1, 2, 3, 4]},
         "overall": overall,
         "per_nuscenes_split": per_split,

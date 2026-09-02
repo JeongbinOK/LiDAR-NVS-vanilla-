@@ -140,6 +140,11 @@ def render_objective_by_time(model, renders):
 
 def parse_args():
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--variant",
+        default=DYNAMIC_VARIANT,
+        help="model.variant to smoke; defaults to the fresh-run baseline",
+    )
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--steps", type=int, default=12)
@@ -165,12 +170,12 @@ def main():
     torch.manual_seed(42)
 
     cli = OmegaConf.from_dotlist([
-        f"model.variant={DYNAMIC_VARIANT}",
+        f"model.variant={args.variant}",
         f"device=[{args.device}]",
         f"train.batch_size={args.batch_size}",
         "data.num_workers=0",
         "data.eval_num_workers=0",
-        # Dynamic V6 never consumes boxes. Null also makes the smoke portable to
+        # Dynamic V7 never consumes boxes. Null also makes the smoke portable to
         # machines without the optional predicted-tracking JSON; the loader may
         # still expose native GT boxes for diagnostics.
         "data.bbox_json_path=null",
@@ -186,8 +191,56 @@ def main():
     batch = to_device(multiframe_collate_fn(items), device)
 
     model = ModelWrapper(cfg).to(device).train()
+    p2g = model.p2g_model
+    if not p2g.utonia_lora_enabled:
+        raise RuntimeError("dynamic smoke requires Utonia XYZI LoRA")
+    if any(module is not None for module in (
+        p2g.anchor_builder.intensity_encoder,
+        p2g.utonia_adapter,
+        p2g.intensity_agg_mlp,
+        p2g.joint_refiner,
+    )):
+        raise RuntimeError(
+            "Utonia LoRA path constructed a legacy intensity/fusion/refiner module"
+        )
+    utonia_named_parameters = list(
+        p2g.feature_extractor.named_parameters()
+    )
+    trainable_utonia_parameters = [
+        (name, parameter)
+        for name, parameter in utonia_named_parameters
+        if parameter.requires_grad
+    ]
+    trainable_utonia_count = sum(
+        parameter.numel() for _, parameter in trainable_utonia_parameters
+    )
+    if trainable_utonia_count != p2g.utonia_lora_trainable_parameters:
+        raise RuntimeError(
+            "active Utonia LoRA parameter count does not match construction report"
+        )
+    unexpected_utonia_trainable = [
+        name for name, _ in trainable_utonia_parameters
+        if ".lora_down." not in name and ".lora_up." not in name
+    ]
+    if unexpected_utonia_trainable:
+        raise RuntimeError(
+            "non-LoRA Utonia parameters are trainable: "
+            + ", ".join(unexpected_utonia_trainable[:5])
+        )
+    lora_up_name, lora_up_parameter = next(
+        (name, parameter)
+        for name, parameter in utonia_named_parameters
+        if ".lora_up." in name and parameter.requires_grad
+    )
+    frozen_base_name, frozen_base_parameter = next(
+        (name, parameter)
+        for name, parameter in utonia_named_parameters
+        if ".base_layer." in name
+    )
+    if frozen_base_parameter.requires_grad:
+        raise RuntimeError(f"Utonia base parameter is trainable: {frozen_base_name}")
     parameters = [
-        parameter for parameter in model.p2g_model.parameters()
+        parameter for parameter in p2g.parameters()
         if parameter.requires_grad
     ]
     optimizer = torch.optim.AdamW(
@@ -196,15 +249,31 @@ def main():
         weight_decay=float(cfg.train.weight_decay),
     )
     temporal_weight = model.p2g_model.dynamic_backend.temporal.q_proj[0].weight
-    proposal_weight = (
-        model.p2g_model.dynamic_backend.motion_proposal.descriptor.weight
+    dynamic_backend = model.p2g_model.dynamic_backend
+    proposal_module = getattr(dynamic_backend, "motion_proposal", None)
+    search_speed = (
+        getattr(proposal_module, "search_speed", None)
+        if proposal_module is not None else None
     )
-    proposal_adapter_weight = (
-        model.p2g_model.dynamic_backend.motion_proposal
-        .descriptor_adapter[-1].weight
-    )
+    proposal_weight = search_speed.weight if search_speed is not None else None
     velocity_weight = (
         model.p2g_model.dynamic_backend.velocity_head.velocity.weight
+    )
+    dustbin_predictor = (
+        getattr(proposal_module, "dustbin_predictor", None)
+        if proposal_module is not None else None
+    )
+    dustbin_predictor_weight = (
+        dustbin_predictor[-1].weight
+        if dustbin_predictor is not None else None
+    )
+    count_predictor = getattr(
+        getattr(dynamic_backend, "gaussian_head", None),
+        "count_predictor",
+        None,
+    )
+    count_router_weight = (
+        count_predictor[-1].weight if count_predictor is not None else None
     )
 
     torch.cuda.reset_peak_memory_stats(device)
@@ -217,10 +286,30 @@ def main():
             losses, gaussians = forward_loss(model, batch)
         total = losses["total"]
         total.backward()
+        unused_lora = [
+            name for name, parameter in trainable_utonia_parameters
+            if parameter.grad is None
+        ]
+        if unused_lora:
+            raise RuntimeError(
+                "active Utonia LoRA parameters were unused: "
+                + ", ".join(unused_lora[:5])
+            )
         temporal_grad = grad_norm(temporal_weight)
-        proposal_grad = grad_norm(proposal_weight)
-        proposal_adapter_grad = grad_norm(proposal_adapter_weight)
+        proposal_grad = (
+            grad_norm(proposal_weight) if proposal_weight is not None else None
+        )
         velocity_grad = grad_norm(velocity_weight)
+        dustbin_predictor_grad = (
+            grad_norm(dustbin_predictor_weight)
+            if dustbin_predictor_weight is not None else None
+        )
+        count_router_grad = (
+            grad_norm(count_router_weight)
+            if count_router_weight is not None else None
+        )
+        lora_up_grad = grad_norm(lora_up_parameter)
+        frozen_base_grad = grad_norm(frozen_base_parameter)
         torch.nn.utils.clip_grad_norm_(parameters, float(cfg.train.grad_clip))
         optimizer.step()
 
@@ -240,10 +329,34 @@ def main():
                 "motion_top1_probability",
                 "motion_effective_support",
                 "motion_reciprocal_probability",
+                "motion_selected_forward_probability",
+                "motion_consensus_entropy",
+                "motion_head_js_divergence",
+                "motion_candidate_probability_mass",
+                "motion_selection_log_margin",
+                "motion_hard_soft_displacement_cosine",
+                "motion_hard_soft_displacement_norm_ratio",
+                "motion_selected_distance_prior_penalty",
+                "motion_match_support",
+                "motion_candidate_entropy",
+                "motion_best_candidate_displacement_m",
+                "motion_reciprocal_probability_sum",
+                "motion_mean_displacement_m",
+                "motion_candidate_spread_m",
+                "motion_normalized_mean_displacement",
+                "motion_normalized_candidate_spread",
+                "motion_soft_match_probability",
+                "motion_hard_reject",
                 "motion_search_speed_mps",
             ):
                 if all(field in item for item in gaussians):
                     value = torch.cat([item[field] for item in gaussians]).float()
+                    if field in (
+                        "motion_best_candidate_displacement_m",
+                        "motion_mean_displacement_m",
+                    ):
+                        value = value.norm(dim=-1)
+                        field = field.removesuffix("_m") + "_magnitude"
                     proposal_stats[f"{field}_mean"] = float(value.mean())
             record = {
                 "step": step,
@@ -255,8 +368,11 @@ def main():
                 "scale": float(losses["loss_scale"].detach()),
                 "temporal_grad_norm": temporal_grad,
                 "proposal_grad_norm": proposal_grad,
-                "proposal_adapter_grad_norm": proposal_adapter_grad,
                 "velocity_grad_norm": velocity_grad,
+                "dustbin_predictor_grad_norm": dustbin_predictor_grad,
+                "count_router_grad_norm": count_router_grad,
+                "utonia_lora_up_grad_norm": lora_up_grad,
+                "utonia_frozen_base_grad_norm": frozen_base_grad,
                 "velocity_speed_mean_mps": float(speeds.mean()),
                 "velocity_speed_max_mps": float(speeds.max()),
                 "middle_displacement_mean_m": float(displacement),
@@ -270,6 +386,25 @@ def main():
     peak_gib = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
     peak_reserved_gib = torch.cuda.max_memory_reserved(device) / (1024 ** 3)
     if args.memory_only:
+        if not all(item["utonia_lora_up_grad_norm"] > 0.0 for item in records):
+            raise RuntimeError("memory probe did not reach Utonia LoRA")
+        if any(
+            item["utonia_frozen_base_grad_norm"] != 0.0
+            for item in records
+        ):
+            raise RuntimeError(
+                "memory probe unexpectedly reached frozen Utonia base"
+            )
+        if dustbin_predictor_weight is not None and not all(
+            item["dustbin_predictor_grad_norm"] > 0.0 for item in records
+        ):
+            raise RuntimeError(
+                "memory probe did not reach evidence dustbin predictor"
+            )
+        if count_router_weight is not None and not all(
+            item["count_router_grad_norm"] > 0.0 for item in records
+        ):
+            raise RuntimeError("memory probe did not reach adaptive-K router")
         print(json.dumps({
             "attention_layers": args.attention_layers,
             "batch_size": args.batch_size,
@@ -278,10 +413,19 @@ def main():
             "peak_memory_reserved_gib": peak_reserved_gib,
             "temporal_grad_norm": records[-1]["temporal_grad_norm"],
             "proposal_grad_norm": records[-1]["proposal_grad_norm"],
-            "proposal_adapter_grad_norm": (
-                records[-1]["proposal_adapter_grad_norm"]
-            ),
             "velocity_grad_norm": records[-1]["velocity_grad_norm"],
+            "dustbin_predictor_grad_norm": (
+                records[-1]["dustbin_predictor_grad_norm"]
+            ),
+            "count_router_grad_norm": records[-1]["count_router_grad_norm"],
+            "utonia_lora_parameter": lora_up_name,
+            "utonia_lora_up_grad_norm": (
+                records[-1]["utonia_lora_up_grad_norm"]
+            ),
+            "utonia_frozen_base_parameter": frozen_base_name,
+            "utonia_frozen_base_grad_norm": (
+                records[-1]["utonia_frozen_base_grad_norm"]
+            ),
         }, sort_keys=True), flush=True)
         return
     initial = records[0]["total"]
@@ -349,12 +493,24 @@ def main():
     }
     if not all(item["temporal_grad_norm"] > 0.0 for item in records):
         raise RuntimeError("render loss did not reach temporal cross-attention")
-    if not all(item["proposal_grad_norm"] > 0.0 for item in records):
+    if proposal_weight is not None and not all(
+        item["proposal_grad_norm"] > 0.0 for item in records
+    ):
         raise RuntimeError("render loss did not reach the motion proposal")
-    if not all(item["proposal_adapter_grad_norm"] > 0.0 for item in records):
-        raise RuntimeError("render loss did not reach the proposal adapter")
     if not all(item["velocity_grad_norm"] > 0.0 for item in records):
         raise RuntimeError("render loss did not reach the velocity output head")
+    if dustbin_predictor_weight is not None and not all(
+        item["dustbin_predictor_grad_norm"] > 0.0 for item in records
+    ):
+        raise RuntimeError("render loss did not reach evidence dustbin predictor")
+    if count_router_weight is not None and not all(
+        item["count_router_grad_norm"] > 0.0 for item in records
+    ):
+        raise RuntimeError("render loss did not reach adaptive-K router")
+    if not all(item["utonia_lora_up_grad_norm"] > 0.0 for item in records):
+        raise RuntimeError("render loss did not reach Utonia LoRA")
+    if any(item["utonia_frozen_base_grad_norm"] != 0.0 for item in records):
+        raise RuntimeError("render loss unexpectedly reached frozen Utonia base")
     if records[-1]["velocity_speed_mean_mps"] <= 1.0e-5:
         raise RuntimeError("velocity stayed identically zero after optimization")
     if records[-1]["middle_displacement_mean_m"] <= 1.0e-6:
