@@ -62,6 +62,7 @@ tests/*
 !tests/test_config_loader.py
 !tests/test_compact_val.py
 !tests/test_dynamic_gaussian.py
+!tests/test_utonia_lora.py
 !tests/run_dynamic_smoke.py
 test_bbox_viz.py
 inspect_overfit_pair.py

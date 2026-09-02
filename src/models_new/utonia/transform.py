@@ -1206,8 +1206,9 @@ def default(scale = 1.0, apply_z_positive = True, normalize_coord = False, keep_
     # keep_strength: also collect the per-point "strength" (LiDAR intensity). It is
     # in GridSample's index_valid_keys, so it is subsampled to the SAME kept point
     # per voxel as coord -> the sampled point's intensity, aligned to the output.
-    # feat_keys is unchanged (coord/color/normal only), so the encoder input never
-    # sees intensity; it rides alongside for a separate intensity branch.
+    # Keep the checkpoint-compatible 9D feat in the collated batch. Point2Gaus
+    # recomposes it as exact [coord, strength] only when Utonia XYZI LoRA is enabled;
+    # otherwise strength continues to feed the separate legacy intensity branch.
     collect_keys = ("coord", "grid_coord", "color", "inverse")
     if keep_strength:
         collect_keys = collect_keys + ("strength",)
