@@ -1,0 +1,99 @@
+# Bbox-free Dynamic 2DGS V7.1.
+#
+# V7.1 preserves V7's direct descriptor, proposal-warped temporal attention,
+# and additive velocity residual. It changes the unmatched evidence, hard
+# decision, and search-radius floor: the selected M=4 hypotheses provide metric
+# mean/spread plus a weighted reciprocal score, p_unmatched=0.5 is the binary
+# STE boundary, and the minimum search speed is 4 m/s.
+model:
+  variant: dynamic_2dgs_attention_velocity_v7_1
+
+device: [0]
+
+exp_name: ${model.variant}-bs-${train.batch_size}
+
+p2g:
+  anchor_mode: grid
+  # Legacy-only fallback when Utonia LoRA is disabled.
+  agg_mlp:
+    hidden_dim: 1024
+    hidden_layers: 2
+    out_dim: 576
+  joint_refiner:
+    num_heads: 12
+    rope_base: 10.0
+    rope_position_scale: 4.0
+
+data:
+  mode: bbox
+  bbox_json_path: null
+
+dynamic_2dgs:
+  temporal:
+    implementation: flash_varlen
+    layers: 4
+    num_heads: 12
+    mlp_ratio: 4
+    use_time_embedding: false
+    rope_base: 100.0
+    rope_position_scale: 1.2566370614359172
+    layer_scale_init: 0.1
+
+  motion_proposal:
+    descriptor_mode: direct_l2
+    candidate_count: 16
+    # The reciprocal feature, mean, and spread are all computed over exactly
+    # these four candidates after reciprocal re-ranking.
+    match_count: 4
+    temperature: 0.07
+    score_chunk_size: 512
+
+    dustbin_mode: evidence_mlp
+    dustbin_evidence_mode: mean_spread_reciprocal_m4
+    dustbin_hidden_dim: 16
+    # The output bias is logit(0.05), so a fresh run starts at p_unmatched=0.05.
+    dustbin_prior_probability: 0.05
+    # Forward stays binary. At threshold 0.5, the backward surrogate 1-p has
+    # its midpoint at the same decision boundary.
+    unmatched_gate_mode: ste_hard
+    unmatched_hard_threshold: 0.5
+
+    # MLP input order:
+    # [||d_bar||/(||d_bar||+4m), spread/(spread+0.5m), reciprocal_M4].
+    # d_bar and spread are metric spatial quantities; delta_t is not consumed.
+    mean_displacement_scale_m: 4.0
+    spread_scale_m: 0.5
+
+    # Give fast movers a wider correspondence neighborhood from the start.
+    # This is a soft spatial-prior floor, not a minimum predicted velocity.
+    search_speed_min_mps: 4.0
+    search_speed_init_mps: 8.0
+    search_speed_max_mps: 30.0
+
+  gaussian_head:
+    initial_opacity: 0.2
+    initial_scale_m: 0.3
+
+  motion:
+    zero_init: true
+    detach_init_condition: true
+    velocity_embedding_dim: 32
+    duration_embedding_dim: 16
+    duration_frequencies: 4
+    duration_reference_sec: 1.0
+    residual_hidden_dim: 96
+
+  regularization:
+    small_motion:
+      enabled: false
+      weight: 0.005
+      epsilon_m: 0.001
+      warmup_steps: 300
+      ramp_steps: 1700
+
+    velocity_l2:
+      enabled: true
+      mode: offset_l2
+      weight: 0.05
+      warmup_steps: 0
+      ramp_steps: 500

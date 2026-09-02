@@ -1,0 +1,98 @@
+# Bbox-free Dynamic 2DGS V9.
+#
+# V9 moves the standalone motion proposal behind temporal refinement. Twelve
+# time-conditioned cross-attention layers produce f', and that same f' feeds
+# both a learned LN+projection descriptor branch and the feature-only velocity
+# offset. Correspondence is a plain dense expectation over every opposite-frame
+# key: no Top-K support, straight-through surrogate, reciprocal re-ranking,
+# dustbin, or query-coordinate warp. The distance prior keeps V7.2's form and
+# tightens its denominator from 30 m/s to 5 m/s.
+model:
+  variant: dynamic_2dgs_attention_velocity_v9
+
+device: [0]
+
+exp_name: ${model.variant}-bs-${train.batch_size}
+
+p2g:
+  anchor_mode: grid
+  # Legacy-only fallback when Utonia LoRA is disabled.
+  agg_mlp:
+    hidden_dim: 1024
+    hidden_layers: 2
+    out_dim: 576
+  joint_refiner:
+    num_heads: 12
+    rope_base: 10.0
+    rope_position_scale: 4.0
+
+data:
+  mode: bbox
+  bbox_json_path: null
+
+dynamic_2dgs:
+  temporal:
+    implementation: flash_varlen
+    # The proposal reads the output of this stack, so depth is shared between
+    # rendering refinement and correspondence rather than split across them.
+    layers: 12
+    num_heads: 12
+    mlp_ratio: 4
+    # V5-style conditioning: raw relative seconds pass through
+    # Fourier -> 64D -> bias-free Linear -> token_dim and are added once as
+    # f = f + E(t) before layer one. Unlike V6/V7/V7.2 the matcher therefore
+    # sees time, because it consumes the refined feature.
+    use_time_embedding: true
+    time_embedding_dim: 64
+    time_frequencies: 8
+    time_reference_sec: 1.0
+    rope_base: 100.0
+    # 2*pi / scale = 5 m for the highest-frequency 3D RoPE band.
+    rope_position_scale: 1.2566370614359172
+    layer_scale_init: 0.1
+
+  motion_proposal:
+    # descriptor = L2Norm(Linear(432,128)(LN(f'))). This replaces V7.2's
+    # parameter-free direct_l2 on raw Utonia tokens.
+    descriptor_mode: projected_l2
+    descriptor_dim: 128
+    temperature: 0.07
+    # score -= (distance_m / (5 m/s * raw_duration_sec))^2. Same fixed
+    # sample-level envelope as V7.2 with only the speed changed: at a
+    # one-second interval 5, 10, and 15 m now cost 1.0, 4.0, and 9.0 logits.
+    distance_prior_speed_mps: 5.0
+    # Plain dense expectation over every key -- no Top-K forward and no STE.
+    readout: dense_expectation
+    # Dense scores are retained for only one query chunk. Checkpointing
+    # recomputes each chunk during backward instead of storing every score row.
+    score_chunk_size: 128
+
+  gaussian_head:
+    initial_opacity: 0.2
+    initial_scale_m: 0.3
+
+  motion:
+    # Unchanged from V7.2: LN(f') -> Linear(432,96) -> SiLU -> Linear(96,3).
+    # The output Linear starts at zero, hence a fresh model begins at
+    # v_final=v_init.
+    zero_init: true
+    residual_hidden_dim: 96
+
+  regularization:
+    small_motion:
+      enabled: false
+      weight: 0.005
+      epsilon_m: 0.001
+      warmup_steps: 300
+      ramp_steps: 1700
+
+    velocity_l2:
+      enabled: true
+      # Regularize the rendered total velocity v_init + v_offset, so the prior
+      # also sends a restoring gradient into correspondence. final_group_l2 is
+      # mean(||v||^2) rather than final_l2's mean over squared components; at
+      # an unchanged weight that is exactly 3x the historical strength.
+      mode: final_group_l2
+      weight: 0.05
+      warmup_steps: 0
+      ramp_steps: 500

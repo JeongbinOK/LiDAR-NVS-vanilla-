@@ -1,0 +1,106 @@
+# Bbox-free Dynamic 2DGS V7.
+#
+# A direct L2-normalized Utonia descriptor proposes conditional matches. The
+# proposal's hard-gated initializer is detached and used only to move RoPE Q
+# coordinates toward the opposite frame. A confidently unmatched query stays
+# at its observed position. Cross-attention itself receives no time embedding
+# and is not multiplicatively confidence-gated. A separate evidence MLP
+# predicts unmatched probability from the bidirectional candidate distributions.
+model:
+  variant: dynamic_2dgs_attention_velocity_v7
+
+device: [0]
+
+exp_name: ${model.variant}-bs-${train.batch_size}
+
+p2g:
+  anchor_mode: grid
+  # Legacy-only fallback when Utonia LoRA is disabled.
+  agg_mlp:
+    hidden_dim: 1024
+    hidden_layers: 2
+    out_dim: 576
+  joint_refiner:
+    num_heads: 12
+    rope_base: 10.0
+    rope_position_scale: 4.0
+
+data:
+  mode: bbox
+  bbox_json_path: null
+
+dynamic_2dgs:
+  temporal:
+    implementation: flash_varlen
+    layers: 4
+    num_heads: 12
+    mlp_ratio: 4
+    # V7 removes endpoint time from Q/K/V and the residual stream. Signed
+    # physical duration enters only through the detached v_init Q warp;
+    # unsigned raw duration is embedded later by the offset head.
+    use_time_embedding: false
+    # Six bands/head span 5.00, 10.77, 23.21, 50.00, 107.72,
+    # and 232.08 m at the default 432D/12-head width.
+    rope_base: 100.0
+    # 2*pi / scale = 5 m for the highest-frequency 3D RoPE band.
+    rope_position_scale: 1.2566370614359172
+    layer_scale_init: 0.1
+
+  motion_proposal:
+    # Matching descriptor path is exactly f_utonia -> L2Norm. No LayerNorm,
+    # adapter, or learned descriptor projection is used.
+    descriptor_mode: direct_l2
+    candidate_count: 16
+    match_count: 4
+    temperature: 0.07
+    score_chunk_size: 512
+
+    # Dustbin is not an extra candidate category. Its probability is predicted
+    # from three normalized channels: [Top-K entropy, best-candidate displacement
+    # magnitude, reciprocal-probability sum]. Displacement is normalized by
+    # search_speed_max_mps * raw duration and smoothly bounded with tanh.
+    # No token feature is consumed.
+    dustbin_mode: evidence_mlp
+    dustbin_hidden_dim: 16
+    dustbin_prior_probability: 0.05
+    # Forward: reject only when p_unmatched >= 0.9, otherwise keep the full
+    # v_match. Backward: use d(1-p_unmatched)/dp so the evidence MLP trains
+    # through the hard decision. Set mode=soft to recover continuous scaling.
+    unmatched_gate_mode: ste_hard
+    unmatched_hard_threshold: 0.9
+
+    # This feature-conditioned radius is only a soft geometric search prior;
+    # it is independent from the direct descriptor path above.
+    search_speed_min_mps: 2.0
+    search_speed_init_mps: 8.0
+    search_speed_max_mps: 30.0
+
+  gaussian_head:
+    initial_opacity: 0.2
+    initial_scale_m: 0.3
+
+  motion:
+    # Head input: LN(refined_feature) + MLP(v_init: 3->32->32) +
+    # MLP(Fourier4(raw_duration): 8->16->16), then 480->96->3.
+    zero_init: true
+    detach_init_condition: true
+    velocity_embedding_dim: 32
+    duration_embedding_dim: 16
+    duration_frequencies: 4
+    duration_reference_sec: 1.0
+    residual_hidden_dim: 96
+
+  regularization:
+    small_motion:
+      enabled: false
+      weight: 0.005
+      epsilon_m: 0.001
+      warmup_steps: 300
+      ramp_steps: 1700
+
+    velocity_l2:
+      enabled: true
+      mode: offset_l2
+      weight: 0.05
+      warmup_steps: 0
+      ramp_steps: 500

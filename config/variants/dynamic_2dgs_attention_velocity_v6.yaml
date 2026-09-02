@@ -1,7 +1,7 @@
 # Bbox-free Dynamic 2DGS V6.
 #
 # Motion correspondence is independent from temporal feature attention. It
-# reads frozen Utonia tokens before any trainable fusion or time embedding,
+# reads frozen-base, LoRA-adapted Utonia tokens before time embedding,
 # applies one shared endpoint projection, and keeps at most K candidates from
 # the global content + soft-distance score. Soft reciprocal reweighting and one
 # in-softmax dustbin confidence-weight the proposal velocity; an
@@ -17,14 +17,16 @@ exp_name: ${model.variant}-bs-${train.batch_size}
 
 p2g:
   anchor_mode: grid
+  # With p2g.utonia_lora.enable=true, the stage-3 432D XYZI feature goes directly
+  # into the temporal cross-attention below; these legacy blocks are not built.
+  # They preserve the previous 576D path for a one-switch A/B run with
+  # p2g.utonia_lora.enable=false and for checkpoint-local legacy configs.
   agg_mlp:
     hidden_dim: 1024
     hidden_layers: 2
     out_dim: 576
   joint_refiner:
-    # Same-frame context is used by the GS/offset trunk. Stage-3 cells are 0.4 m
-    # and window_size=3 reaches only +/-0.4 m per axis, so one cell advances the
-    # highest-frequency RoPE band by about 1.6 rad rather than 0.08 rad.
+    # Legacy-only: 576 / 12 = 48 channels/head for 3D RoPE.
     num_heads: 12
     rope_base: 10.0
     rope_position_scale: 4.0
@@ -41,7 +43,7 @@ dynamic_2dgs:
     layers: 4
     num_heads: 12
     mlp_ratio: 4
-    # 8 Fourier frequencies produce 17 scalars; one MLP maps 17 -> 64 -> 576.
+    # 8 Fourier frequencies produce 17 scalars; one MLP maps 17 -> 64 -> 432.
     # The 64D value is a hidden bottleneck, not a separately projected embedding.
     time_hidden_dim: 64
     time_frequencies: 8
@@ -53,7 +55,8 @@ dynamic_2dgs:
   motion_proposal:
     # h = LN_no_affine(f_utonia); h' = h + zero-init MLP(h);
     # z = L2Norm(W h'). The adapter and W are shared by both endpoints.
-    # The dustbin is part of the same directional row softmax.
+    # The dustbin is part of the same directional row softmax. Its global
+    # baseline gets a zero-init residual from each time-free Utonia token.
     adapter_hidden_dim: 96
     descriptor_dim: 96
     candidate_count: 16
@@ -62,7 +65,8 @@ dynamic_2dgs:
     match_count: 4
     temperature: 0.07
     score_chunk_size: 512
-    dustbin_similarity_init: 0.70
+    dustbin_similarity_init: 0.50
+    dustbin_token_conditioned: true
 
     # The soft prior is -||p_i-p_j||^2 / (r_i^2+r_j^2), with
     # r_i = predicted_search_speed_i * endpoint_duration. It never removes a
@@ -83,6 +87,11 @@ dynamic_2dgs:
     init_conditioned_residual: true
     init_condition_scale_mps: 10.0
     detach_init_condition: true
+    # One bottleneck layer: 435 -> 96 -> 3 (42k parameters). The historical
+    # two 432-wide layers (376k) never stopped growing in weight norm across
+    # every V6 run measured, while the offset they produce stays at ~0.4 m/s
+    # against a 4 m/s v_init. Omit the key to rebuild that wider refiner.
+    residual_hidden_dim: 96
 
   regularization:
     small_motion:
@@ -94,9 +103,10 @@ dynamic_2dgs:
 
     velocity_l2:
       enabled: true
-      # Backward-compatible block name; this mode is mean ||v_final||_2 (group
-      # L1 over velocity vectors), not squared component L2.
-      mode: final_group_l1
+      # Backward-compatible block name. Penalize only the learned correction;
+      # the correspondence-derived v_init remains free to represent motion.
+      # This is mean(v_offset^2) over all tokens and xyz components.
+      mode: offset_l2
       weight: 0.05
       warmup_steps: 0
       ramp_steps: 500

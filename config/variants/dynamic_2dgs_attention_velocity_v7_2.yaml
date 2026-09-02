@@ -1,0 +1,89 @@
+# Bbox-free Dynamic 2DGS V7.2.
+#
+# V7.2 uses direct pre-cross Utonia cosine with a normalized Top-4 forward and
+# dense all-key STE backward. A fixed 30 m/s distance envelope removes remote
+# outliers without V7's learned per-token radii; reciprocal, unmatched, and
+# dustbin branches are absent. The hard initializer still warps detached RoPE Q
+# coordinates. Raw endpoint time is added only inside the four-layer temporal
+# stack, and the zero-initialized velocity offset consumes LN(refined_feature)
+# alone.
+model:
+  variant: dynamic_2dgs_attention_velocity_v7_2
+
+device: [0]
+
+exp_name: ${model.variant}-bs-${train.batch_size}
+
+p2g:
+  anchor_mode: grid
+  # Legacy-only fallback when Utonia LoRA is disabled.
+  agg_mlp:
+    hidden_dim: 1024
+    hidden_layers: 2
+    out_dim: 576
+  joint_refiner:
+    num_heads: 12
+    rope_base: 10.0
+    rope_position_scale: 4.0
+
+data:
+  mode: bbox
+  bbox_json_path: null
+
+dynamic_2dgs:
+  temporal:
+    implementation: flash_varlen
+    layers: 4
+    num_heads: 12
+    mlp_ratio: 4
+    # Keep the matcher time-free. The temporal path alone receives the exact
+    # V5-style source-time feature addition: f = f + E(t), before layer one.
+    use_time_embedding: true
+    time_embedding_dim: 64
+    time_frequencies: 8
+    time_reference_sec: 1.0
+    rope_base: 100.0
+    rope_position_scale: 1.2566370614359172
+    layer_scale_init: 0.1
+
+  motion_proposal:
+    # score_ij = cosine(L2Norm(f_i), L2Norm(f_j)) / temperature.
+    descriptor_mode: direct_l2
+    match_count: 4
+    temperature: 0.07
+    # score -= (distance_m / (30 m/s * raw_duration_sec))^2. This is one fixed
+    # sample-level physical scale, never a learned or token-dependent radius.
+    distance_prior_speed_mps: 30.0
+    # Dense scores are retained for only one query chunk. Checkpointing
+    # recomputes each chunk during backward instead of storing every score row.
+    score_chunk_size: 128
+    # Forward: normalized Top-4. Backward: untruncated all-key softmax.
+    ste_surrogate: dense_softmax
+
+  gaussian_head:
+    initial_opacity: 0.2
+    initial_scale_m: 0.3
+
+  motion:
+    # LN(feature) -> Linear(432,96) -> SiLU -> Linear(96,3). There is exactly
+    # one activation and no explicit v_init or duration input. The output
+    # Linear starts at zero, hence a fresh model begins at v_final=v_init.
+    zero_init: true
+    residual_hidden_dim: 96
+
+  regularization:
+    small_motion:
+      enabled: false
+      weight: 0.005
+      epsilon_m: 0.001
+      warmup_steps: 300
+      ramp_steps: 1700
+
+    # v_init is not regularized. Only the learned correction is discouraged
+    # from overriding a usable correspondence initializer.
+    velocity_l2:
+      enabled: true
+      mode: offset_l2
+      weight: 0.05
+      warmup_steps: 0
+      ramp_steps: 500

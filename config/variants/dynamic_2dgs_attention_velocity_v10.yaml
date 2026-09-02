@@ -1,0 +1,117 @@
+# Bbox-free Dynamic 2DGS V10.
+#
+# Every temporal layer contributes a dense correspondence map. Within a layer,
+# all 12 head probabilities are averaged into W_l. A single learned token is
+# broadcast per frame/query direction, appended only to Q, and carried through
+# the same cross-attention residual + FFN. The shared
+# Linear(432,96) -> SiLU -> Linear(96,1) scorer reads that token after every FFN;
+# softmax over its 12 logits gives k_l. The implementation uses linearity to
+# accumulate sum_l k_l * (W_l @ xyz), so it never stores twelve dense NxN maps.
+# The resulting refined token is normalized and routed through the legacy
+# learned_gumbel K={1,2,3} grid head. Each selected child Gaussian receives the
+# same token-level v_init + v_offset.
+model:
+  variant: dynamic_2dgs_attention_velocity_v10
+
+device: [0]
+
+exp_name: ${model.variant}-bs-${train.batch_size}
+
+p2g:
+  anchor_mode: grid
+  freeze_utonia: true
+  utonia_feature_stage: 3
+  utonia_lora:
+    enable: true
+    input_mode: xyzi
+    rank: 16
+    alpha: 16
+    dropout: 0.0
+  # Inactive compatibility values; V10 validation requires LoRA above.
+  agg_mlp:
+    hidden_dim: 1024
+    hidden_layers: 2
+    out_dim: 576
+  joint_refiner:
+    num_heads: 12
+    rope_base: 10.0
+    rope_position_scale: 4.0
+  # Reuse the bbox model's post-refinement K-adaptive grid head. The router
+  # chooses exactly one of K={1,2,3} with hard Gumbel-Softmax STE; only the
+  # selected K-specific Gaussian head executes in the forward pass.
+  grid_query:
+    count_mode: learned_gumbel
+    grad_balance: sqrt_k
+    learned_count:
+      K_max: 3
+      tau: 1.0
+      seed_mode: range_quantile
+      grad_balance_scope: token
+      budget:
+        enable: false
+      logging:
+        enable: true
+        interval: 20
+        range_edges_m: [0, 10, 20, 30, 40, 60, 80, 110]
+
+data:
+  mode: bbox
+  bbox_json_path: null
+
+dynamic_2dgs:
+  temporal:
+    implementation: flash_varlen
+    layers: 12
+    num_heads: 12
+    mlp_ratio: 4
+
+    # Preserve V5's physical endpoint-time conditioning before layer one.
+    use_time_embedding: true
+    time_embedding_dim: 64
+    time_frequencies: 8
+    time_reference_sec: 1.0
+
+    # Replace 3D RoPE with the existing physical quadratic distance prior:
+    #   score_ij = q_i k_j / sqrt(d) - (distance_ij / (30 m/s * dt))^2.
+    # At dt=0.5 s this gives a conservative 15 m radius (penalties 0.11, 0.44,
+    # and 1.0 at 5, 10, and 15 m), so content remains able to match motion while
+    # implausibly distant keys are softly suppressed.
+    position_encoding: distance_bias
+    distance_bias_speed_mps: 30.0
+    qk_norm: true
+
+    # Shared two-layer/one-activation a_l predictor on the global query token.
+    layer_weight_hidden_dim: 96
+    layer_scale_init: 0.1
+
+  gaussian_head:
+    # These priors initialize every slot of each K-specific joint head.
+    initial_opacity: 0.2
+    initial_scale_m: 0.3
+
+  motion:
+    # Existing feature-only offset: LN(f') -> Linear(432,96) -> SiLU ->
+    # Linear(96,3). The zero output initialization starts at v_total=v_init.
+    zero_init: true
+    residual_hidden_dim: 96
+
+  regularization:
+    small_motion:
+      enabled: false
+      weight: 0.005
+      epsilon_m: 0.001
+      warmup_steps: 300
+      ramp_steps: 1700
+
+    velocity_l2:
+      enabled: true
+      # 0.01 * mean(||v_total||_2^2), with no component-wise /3 reduction.
+      mode: final_group_l2
+      weight: 0.01
+      warmup_steps: 0
+      ramp_steps: 0
+
+# Keep the requested reconstruction/scale objective explicit in this variant.
+loss:
+  w_chamfer: 0.02
+  w_scale: 0.0

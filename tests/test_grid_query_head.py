@@ -104,6 +104,17 @@ def _builder_cfg(anchor_mode, **grid_overrides):
     )
 
 
+def test_lora_builder_bypasses_separate_intensity_encoder():
+    cfg = _builder_cfg("grid")
+    cfg.utonia_lora = SimpleNamespace(enable=True)
+
+    builder = OccupiedGridTokenBuilder(cfg, one_seed_per_token=True)
+
+    assert builder.intensity_mode == "utonia_xyzi"
+    assert builder.intensity_encoder is None
+    assert builder.intensity_out_dim == 0
+
+
 def _learned_cfg(k_max=4, tau=1.0, **overrides):
     return _cfg(
         count_mode="learned_gumbel",

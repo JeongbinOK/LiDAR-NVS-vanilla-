@@ -4,7 +4,10 @@ For each frame the raw points are scattered into the Utonia bottleneck cells the
 fall in (0.4/0.8 m, same grid as features['grid_coord']); each occupied cell is
 one primitive: position = Utonia cell position, utonia_feat = that cell's feature.
 
-Intensity per primitive comes from one of three encoders (config
+With ``p2g.utonia_lora.enable=true``, aligned intensity is already part of the
+Utonia XYZI input and this builder returns occupied Utonia tokens directly. No
+separate intensity encoder is constructed. In the legacy path, intensity per
+primitive comes from one of three encoders (config
 ``p2g.intensity_encoder.type``; absent -> legacy ``intensity_sparse.enable`` switch):
 - "ptv3": a mini ``PointTransformerV3`` mirroring the Utonia backbone
   (``IntensityPTv3Encoder``), run once on the full batch. Its stage output aligns
@@ -52,7 +55,7 @@ class OccupiedTokenBatch:
 
     positions: list[torch.Tensor]
     utonia_features: list[torch.Tensor]
-    intensity_features: list[torch.Tensor]
+    intensity_features: Optional[list[torch.Tensor]]
     grid_coords: list[torch.Tensor]
     raw_counts: list[torch.Tensor]
     grid_seeds: Optional[list[GridSeedData]]
@@ -66,9 +69,9 @@ class OccupiedGridTokenBuilder(nn.Module):
         self.anchor_mode = str(getattr(cfg, "anchor_mode", "spherical")).lower()
         self.grid_seed_config = None
         if self.anchor_mode == "grid" and one_seed_per_token:
-            # Dynamic 2DGS owns its Gaussian-count contract: one observed
-            # medoid seed for every occupied token. Do not require or read the
-            # legacy GridSlotHead routing/count configuration.
+            # Fixed-count Dynamic 2DGS variants own this contract: one observed
+            # medoid seed for every occupied token. V10 passes false here and
+            # reuses the learned GridSlotHead seed bank instead.
             self.grid_seed_config = ("legacy", 1, 1, 1, None)
         elif self.anchor_mode == "grid":
             grid_query = getattr(cfg, "grid_query", None)
@@ -139,11 +142,20 @@ class OccupiedGridTokenBuilder(nn.Module):
                     "p2g.grid_query.count_mode must be 'legacy', "
                     "'learned_gumbel', or 'learned_gumbel_viewpt'"
                 )
-        (
-            self.intensity_mode,
-            self.intensity_encoder,
-            self.intensity_out_dim,
-        ) = build_intensity_encoder(cfg)
+        lora_cfg = getattr(cfg, "utonia_lora", None)
+        self.intensity_in_utonia = bool(
+            getattr(lora_cfg, "enable", False)
+        ) if lora_cfg is not None else False
+        if self.intensity_in_utonia:
+            self.intensity_mode = "utonia_xyzi"
+            self.intensity_encoder = None
+            self.intensity_out_dim = 0
+        else:
+            (
+                self.intensity_mode,
+                self.intensity_encoder,
+                self.intensity_out_dim,
+            ) = build_intensity_encoder(cfg)
 
     def forward(self, lidar_points, offset, pose, features, ptv3_input, mapper):
         device = features["feat"].device
@@ -199,17 +211,20 @@ class OccupiedGridTokenBuilder(nn.Module):
             gc_list.append(occ_gc)
             raw_count_list.append(raw_count)
 
-        ifeat_list = encode_intensity_features(
-            self.intensity_mode,
-            self.intensity_encoder,
-            ptv3_input=ptv3_input,
-            input_coord_list=in_coord_list,
-            input_grid_coord_list=in_gc_list,
-            token_grid_coord_list=grid_coord_list,
-            occupied_masks=occ_list,
-            occupied_grid_coord_list=gc_list,
-            cell_statistics_list=int5_list,
-        )
+        if self.intensity_in_utonia:
+            ifeat_list = None
+        else:
+            ifeat_list = encode_intensity_features(
+                self.intensity_mode,
+                self.intensity_encoder,
+                ptv3_input=ptv3_input,
+                input_coord_list=in_coord_list,
+                input_grid_coord_list=in_gc_list,
+                token_grid_coord_list=grid_coord_list,
+                occupied_masks=occ_list,
+                occupied_grid_coord_list=gc_list,
+                cell_statistics_list=int5_list,
+            )
         return OccupiedTokenBatch(
             positions=pos_list,
             utonia_features=ufeat_list,

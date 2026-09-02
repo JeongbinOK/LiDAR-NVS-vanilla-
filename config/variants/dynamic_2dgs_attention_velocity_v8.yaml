@@ -1,0 +1,99 @@
+# Bbox-free Dynamic 2DGS V8.
+#
+# V8 moves correspondence back behind temporal refinement. The final layer's
+# heads [0,4) still participate in ordinary dense feature cross-attention. Their
+# dense probabilities are additionally averaged into one consensus matrix;
+# K=16 recall candidates are reciprocal-re-ranked and exactly M=4 coordinates
+# form the velocity initializer. There is no independent descriptor branch,
+# distance bias, dustbin, or proposal-based RoPE query warp.
+model:
+  variant: dynamic_2dgs_attention_velocity_v8
+
+device: [0]
+
+exp_name: ${model.variant}-bs-${train.batch_size}
+
+p2g:
+  anchor_mode: grid
+  # Used only if the inherited Utonia LoRA switch is explicitly disabled.
+  agg_mlp:
+    hidden_dim: 1024
+    hidden_layers: 2
+    out_dim: 576
+  joint_refiner:
+    num_heads: 12
+    rope_base: 10.0
+    rope_position_scale: 4.0
+
+data:
+  mode: bbox
+  bbox_json_path: null
+
+dynamic_2dgs:
+  temporal:
+    implementation: flash_varlen
+    layers: 12
+    num_heads: 12
+    # The same final-layer heads [0,4) serve dense rendering refinement and the
+    # coordinate-only consensus readout. Top-K/M is never applied per head.
+    motion_head_count: 4
+    mlp_ratio: 4
+
+    # Preserve V5's endpoint-time conditioning parameterization. The Fourier
+    # encoder emits 64D and a bias-free Linear projects it to the active token
+    # width (432D for stage-3 LoRA) before one addition to the input tokens.
+    use_time_embedding: true
+    time_embedding_dim: 64
+    time_frequencies: 8
+    time_reference_sec: 1.0
+
+    # Use exactly the current cross-attention spatial band for every head and
+    # for matching: the matcher reuses these already-rotated Q/K tensors and
+    # has no separate motion RoPE.
+    rope_base: 100.0
+    rope_position_scale: 1.2566370614359172
+    qk_norm: true
+    # Copy Q -> K once for the final layer's heads [0,4). Q and K remain
+    # independent trainable parameters after construction.
+    tie_motion_qk_init: true
+    layer_scale_init: 0.1
+
+  motion_matching:
+    candidate_count: 16
+    match_count: 4
+    # Dense head probabilities are recomputed only for coordinate readout in
+    # bounded query chunks; feature attention itself stays FlashAttention-dense.
+    score_chunk_size: 128
+
+  gaussian_head:
+    initial_opacity: 0.2
+    initial_scale_m: 0.3
+
+  motion:
+    # v_final = v_init + v_offset. The offset sees refined features and an
+    # embedded detached copy of v_init. Temporal time conditioning already
+    # exposes endpoint cadence, so V8 adds no redundant duration branch here.
+    # The final Linear starts at zero, while the additive v_init path still
+    # trains correspondence.
+    zero_init: true
+    detach_init_condition: true
+    velocity_embedding_dim: 32
+    residual_hidden_dim: 96
+
+  regularization:
+    small_motion:
+      enabled: false
+      weight: 0.005
+      epsilon_m: 0.001
+      warmup_steps: 300
+      ramp_steps: 1700
+
+    velocity_l2:
+      enabled: true
+      # Regularize the rendered total velocity v_init + v_offset. Unlike the
+      # previous offset-only prior, this also provides a restoring gradient to
+      # correspondence when a fresh LoRA descriptor proposes implausible motion.
+      mode: final_l2
+      weight: 0.05
+      warmup_steps: 0
+      ramp_steps: 500

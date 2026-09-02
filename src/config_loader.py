@@ -24,17 +24,41 @@ DYNAMIC_VARIANT_V3 = "dynamic_2dgs_physical_velocity_v3"
 DYNAMIC_VARIANT_V3_1 = "dynamic_2dgs_physical_velocity_v3_1"
 DYNAMIC_VARIANT_V4 = "dynamic_2dgs_attention_velocity_v4"
 DYNAMIC_VARIANT_V5 = "dynamic_2dgs_attention_velocity_v5"
-DYNAMIC_VARIANT = "dynamic_2dgs_attention_velocity_v6"
-# V4 and V5 share the attention-initialized velocity backend; V5 only adds
-# QK-Norm and a finer motion-head RoPE band on top of the same parameters.
-ATTENTION_VELOCITY_VARIANTS = (DYNAMIC_VARIANT_V4, DYNAMIC_VARIANT_V5)
+DYNAMIC_VARIANT_V6 = "dynamic_2dgs_attention_velocity_v6"
+DYNAMIC_VARIANT_V7 = "dynamic_2dgs_attention_velocity_v7"
+DYNAMIC_VARIANT_V7_1 = "dynamic_2dgs_attention_velocity_v7_1"
+DYNAMIC_VARIANT_V7_2 = "dynamic_2dgs_attention_velocity_v7_2"
+DYNAMIC_VARIANT_V8 = "dynamic_2dgs_attention_velocity_v8"
+DYNAMIC_VARIANT_V9 = "dynamic_2dgs_attention_velocity_v9"
+DYNAMIC_VARIANT_V10 = "dynamic_2dgs_attention_velocity_v10"
+# The unsuffixed constant always names the current fresh-run baseline. Keep an
+# explicit constant for each predecessor so checkpoint semantics stay exact.
+DYNAMIC_VARIANT = DYNAMIC_VARIANT_V7_2
+# V4/V5 use a dense coordinate expectation from selected attention heads. V8
+# reuses selected final-layer heads with a consensus readout; V10 reads every
+# head at every layer and therefore has no `motion_head_count` config key.
+_SELECTED_HEAD_ATTENTION_VELOCITY_VARIANTS = (
+    DYNAMIC_VARIANT_V4,
+    DYNAMIC_VARIANT_V5,
+    DYNAMIC_VARIANT_V8,
+)
+ATTENTION_VELOCITY_VARIANTS = (
+    *_SELECTED_HEAD_ATTENTION_VELOCITY_VARIANTS,
+    DYNAMIC_VARIANT_V10,
+)
 DYNAMIC_VARIANTS = (
     DYNAMIC_VARIANT_V1,
     DYNAMIC_VARIANT_V3,
     DYNAMIC_VARIANT_V3_1,
     DYNAMIC_VARIANT_V4,
     DYNAMIC_VARIANT_V5,
-    DYNAMIC_VARIANT,
+    DYNAMIC_VARIANT_V6,
+    DYNAMIC_VARIANT_V7,
+    DYNAMIC_VARIANT_V7_1,
+    DYNAMIC_VARIANT_V7_2,
+    DYNAMIC_VARIANT_V8,
+    DYNAMIC_VARIANT_V9,
+    DYNAMIC_VARIANT_V10,
 )
 
 # V3 and later share the physical-time contract. V4/V5 add attention-derived
@@ -44,7 +68,34 @@ PHYSICAL_VELOCITY_VARIANTS = (
     DYNAMIC_VARIANT_V3_1,
     DYNAMIC_VARIANT_V4,
     DYNAMIC_VARIANT_V5,
-    DYNAMIC_VARIANT,
+    DYNAMIC_VARIANT_V6,
+    DYNAMIC_VARIANT_V7,
+    DYNAMIC_VARIANT_V7_1,
+    DYNAMIC_VARIANT_V7_2,
+    DYNAMIC_VARIANT_V8,
+    DYNAMIC_VARIANT_V9,
+    DYNAMIC_VARIANT_V10,
+)
+
+WARPED_PROPOSAL_VELOCITY_VARIANTS = (
+    DYNAMIC_VARIANT_V7,
+    DYNAMIC_VARIANT_V7_1,
+    DYNAMIC_VARIANT_V7_2,
+)
+DURATION_OFFSET_VELOCITY_VARIANTS = (
+    DYNAMIC_VARIANT_V7,
+    DYNAMIC_VARIANT_V7_1,
+)
+# These proposals run *before* temporal attention on raw LoRA Utonia tokens,
+# which is what makes them need a detached query warp to reach the trunk.
+PROPOSAL_VELOCITY_VARIANTS = (
+    DYNAMIC_VARIANT_V6,
+    *WARPED_PROPOSAL_VELOCITY_VARIANTS,
+)
+# V9 keeps a standalone proposal branch but reads the refined feature instead,
+# so it shares the `motion_proposal` config root and nothing else with the above.
+REFINED_PROPOSAL_VELOCITY_VARIANTS = (
+    DYNAMIC_VARIANT_V9,
 )
 
 VARIANT_CONFIG_PATHS = {
@@ -64,7 +115,27 @@ VARIANT_CONFIG_PATHS = {
     DYNAMIC_VARIANT_V5: (
         REPO_ROOT / "config" / "variants" / f"{DYNAMIC_VARIANT_V5}.yaml"
     ),
-    DYNAMIC_VARIANT: REPO_ROOT / "config" / "variants" / f"{DYNAMIC_VARIANT}.yaml",
+    DYNAMIC_VARIANT_V6: (
+        REPO_ROOT / "config" / "variants" / f"{DYNAMIC_VARIANT_V6}.yaml"
+    ),
+    DYNAMIC_VARIANT_V7: (
+        REPO_ROOT / "config" / "variants" / f"{DYNAMIC_VARIANT_V7}.yaml"
+    ),
+    DYNAMIC_VARIANT_V7_1: (
+        REPO_ROOT / "config" / "variants" / f"{DYNAMIC_VARIANT_V7_1}.yaml"
+    ),
+    DYNAMIC_VARIANT_V7_2: (
+        REPO_ROOT / "config" / "variants" / f"{DYNAMIC_VARIANT_V7_2}.yaml"
+    ),
+    DYNAMIC_VARIANT_V8: (
+        REPO_ROOT / "config" / "variants" / f"{DYNAMIC_VARIANT_V8}.yaml"
+    ),
+    DYNAMIC_VARIANT_V9: (
+        REPO_ROOT / "config" / "variants" / f"{DYNAMIC_VARIANT_V9}.yaml"
+    ),
+    DYNAMIC_VARIANT_V10: (
+        REPO_ROOT / "config" / "variants" / f"{DYNAMIC_VARIANT_V10}.yaml"
+    ),
 }
 
 # W&B omits empty mappings, and configs saved before model variants existed have
@@ -116,6 +187,11 @@ _CHECKPOINT_PROTECTED_PATHS = (
 
 _IMPLEMENTED_VARIANTS = {LEGACY_VARIANT, *DYNAMIC_VARIANTS}
 
+# Pointcept/Utonia encoder widths from config/utonia_pretrained.yaml. LoRA mode
+# exits at the configured encoder stage and bypasses the legacy fusion MLP, so
+# static config validation must use this width for downstream attention.
+_UTONIA_ENCODER_STAGE_DIMS = (54, 108, 216, 432, 576)
+
 
 def _as_config(value=None) -> DictConfig:
     if value is None:
@@ -161,6 +237,70 @@ def _validate_3d_rope_width(dim: int, num_heads: int, label: str) -> None:
         )
 
 
+def _validate_utonia_lora_config(config) -> bool:
+    block = OmegaConf.select(config, "p2g.utonia_lora", default=None)
+    if block is None:
+        return False
+    _reject_unknown_keys(
+        config,
+        "p2g.utonia_lora",
+        {
+            "enable", "input_mode", "rank", "linear_rank", "conv_rank",
+            "alpha", "linear_alpha", "conv_alpha", "dropout",
+        },
+    )
+    enabled = bool(OmegaConf.select(config, "p2g.utonia_lora.enable", default=False))
+    if not enabled:
+        return False
+    if not bool(OmegaConf.select(config, "p2g.freeze_utonia", default=True)):
+        raise ValueError(
+            "p2g.utonia_lora.enable=true requires p2g.freeze_utonia=true"
+        )
+    input_mode = str(OmegaConf.select(
+        config, "p2g.utonia_lora.input_mode", default="xyzi"
+    )).lower()
+    if input_mode != "xyzi":
+        raise ValueError(
+            "p2g.utonia_lora.input_mode currently supports only 'xyzi'"
+        )
+    shared_rank = int(OmegaConf.select(
+        config, "p2g.utonia_lora.rank", default=16
+    ))
+    for name in ("linear_rank", "conv_rank"):
+        value = int(OmegaConf.select(
+            config, f"p2g.utonia_lora.{name}", default=shared_rank
+        ))
+        if value <= 0:
+            raise ValueError(f"p2g.utonia_lora.{name} must be positive")
+    shared_alpha = float(OmegaConf.select(
+        config, "p2g.utonia_lora.alpha", default=shared_rank
+    ))
+    for name in ("linear_alpha", "conv_alpha"):
+        value = float(OmegaConf.select(
+            config, f"p2g.utonia_lora.{name}", default=shared_alpha
+        ))
+        if value <= 0.0:
+            raise ValueError(f"p2g.utonia_lora.{name} must be positive")
+    dropout = float(OmegaConf.select(
+        config, "p2g.utonia_lora.dropout", default=0.0
+    ))
+    if not 0.0 <= dropout < 1.0:
+        raise ValueError("p2g.utonia_lora.dropout must be in [0, 1)")
+    return True
+
+
+def _configured_p2g_trunk_dim(config, *, lora_enabled: bool) -> int:
+    if not lora_enabled:
+        return int(OmegaConf.select(config, "p2g.agg_mlp.out_dim"))
+    stage = int(OmegaConf.select(config, "p2g.utonia_feature_stage"))
+    if not 0 <= stage < len(_UTONIA_ENCODER_STAGE_DIMS):
+        raise ValueError(
+            "p2g.utonia_feature_stage must be in [0, "
+            f"{len(_UTONIA_ENCODER_STAGE_DIMS) - 1}], got {stage}"
+        )
+    return _UTONIA_ENCODER_STAGE_DIMS[stage]
+
+
 def _load_variant_overlay(variant: str) -> tuple[DictConfig, Path]:
     try:
         path = VARIANT_CONFIG_PATHS[variant]
@@ -193,19 +333,32 @@ def validate_experiment_config(config) -> None:
             f"Unknown model.variant={variant!r}; expected one of: {allowed}"
         )
 
+    lora_enabled = _validate_utonia_lora_config(config)
+
     if variant in DYNAMIC_VARIANTS:
         if str(OmegaConf.select(config, "p2g.anchor_mode", default="")) != "grid":
             raise ValueError(f"{variant} requires p2g.anchor_mode=grid")
+        if variant == DYNAMIC_VARIANT_V10 and not lora_enabled:
+            raise ValueError("V10 requires p2g.utonia_lora.enable=true")
         if OmegaConf.select(config, "dynamic_2dgs", default=None) is None:
             raise ValueError(f"{variant} requires a dynamic_2dgs config block")
-        trunk_dim = int(OmegaConf.select(config, "p2g.agg_mlp.out_dim"))
+        trunk_dim = _configured_p2g_trunk_dim(
+            config, lora_enabled=lora_enabled
+        )
         temporal_heads = int(OmegaConf.select(
             config, "dynamic_2dgs.temporal.num_heads"
         ))
-        _validate_3d_rope_width(
-            trunk_dim, temporal_heads, "dynamic temporal attention"
-        )
-        if bool(OmegaConf.select(
+        if variant == DYNAMIC_VARIANT_V10:
+            if trunk_dim % temporal_heads != 0:
+                raise ValueError(
+                    "dynamic temporal attention: "
+                    f"dim={trunk_dim} must be divisible by heads={temporal_heads}"
+                )
+        else:
+            _validate_3d_rope_width(
+                trunk_dim, temporal_heads, "dynamic temporal attention"
+            )
+        if not lora_enabled and bool(OmegaConf.select(
             config, "p2g.joint_refiner.enable", default=False
         )):
             joint_heads = int(OmegaConf.select(
@@ -218,26 +371,58 @@ def validate_experiment_config(config) -> None:
             dynamic_keys = {
                 "temporal", "gaussian_head", "motion", "regularization",
             }
-            if variant == DYNAMIC_VARIANT:
+            if variant in (
+                *PROPOSAL_VELOCITY_VARIANTS,
+                *REFINED_PROPOSAL_VELOCITY_VARIANTS,
+            ):
                 dynamic_keys.add("motion_proposal")
+            if variant == DYNAMIC_VARIANT_V8:
+                dynamic_keys.add("motion_matching")
             _reject_unknown_keys(
                 config,
                 "dynamic_2dgs",
                 dynamic_keys,
             )
-            temporal_keys = {
-                "implementation", "layers", "num_heads", "mlp_ratio",
-                "time_frequencies", "rope_base", "rope_position_scale",
-                "time_reference_sec", "layer_scale_init",
-            }
-            if variant == DYNAMIC_VARIANT:
-                temporal_keys.add("time_hidden_dim")
+            if variant == DYNAMIC_VARIANT_V10:
+                temporal_keys = {
+                    "implementation", "layers", "num_heads", "mlp_ratio",
+                    "use_time_embedding", "time_frequencies",
+                    "time_embedding_dim", "time_reference_sec",
+                    "position_encoding", "distance_bias_speed_mps", "qk_norm",
+                    "layer_weight_hidden_dim", "layer_scale_init",
+                }
             else:
-                # V3-V5 checkpoints keep the historical two-stage time path.
-                temporal_keys.add("time_embedding_dim")
-            if variant in ATTENTION_VELOCITY_VARIANTS:
+                temporal_keys = {
+                    "implementation", "layers", "num_heads", "mlp_ratio",
+                    "rope_base", "rope_position_scale", "layer_scale_init",
+                }
+                if variant in WARPED_PROPOSAL_VELOCITY_VARIANTS:
+                    temporal_keys.add("use_time_embedding")
+                    if variant == DYNAMIC_VARIANT_V7_2:
+                        temporal_keys.update({
+                            "time_frequencies", "time_embedding_dim",
+                            "time_reference_sec",
+                        })
+                elif variant == DYNAMIC_VARIANT_V6:
+                    temporal_keys.update({
+                        "time_frequencies", "time_hidden_dim",
+                        "time_reference_sec",
+                    })
+                else:
+                    # V3-V5 checkpoints keep the historical two-stage time path.
+                    temporal_keys.update({
+                        "time_frequencies", "time_embedding_dim",
+                        "time_reference_sec",
+                    })
+                    if variant == DYNAMIC_VARIANT_V8:
+                        temporal_keys.update({
+                            "use_time_embedding", "tie_motion_qk_init",
+                        })
+                    elif variant == DYNAMIC_VARIANT_V9:
+                        temporal_keys.add("use_time_embedding")
+            if variant in _SELECTED_HEAD_ATTENTION_VELOCITY_VARIANTS:
                 temporal_keys.add("motion_head_count")
-            if variant == DYNAMIC_VARIANT_V5:
+            if variant in (DYNAMIC_VARIANT_V5, DYNAMIC_VARIANT_V8):
                 temporal_keys.add("qk_norm")
             if variant == DYNAMIC_VARIANT_V5:
                 temporal_keys.update({
@@ -248,7 +433,7 @@ def validate_experiment_config(config) -> None:
                 "dynamic_2dgs.temporal",
                 temporal_keys,
             )
-            if variant in ATTENTION_VELOCITY_VARIANTS:
+            if variant in _SELECTED_HEAD_ATTENTION_VELOCITY_VARIANTS:
                 motion_heads = int(OmegaConf.select(
                     config, "dynamic_2dgs.temporal.motion_head_count"
                 ))
@@ -257,7 +442,164 @@ def validate_experiment_config(config) -> None:
                         "dynamic_2dgs.temporal.motion_head_count must be in "
                         f"[1, {temporal_heads}]"
                     )
-            if variant == DYNAMIC_VARIANT:
+            if variant == DYNAMIC_VARIANT_V8:
+                matching_path = "dynamic_2dgs.motion_matching"
+                _reject_unknown_keys(
+                    config,
+                    matching_path,
+                    {"candidate_count", "match_count", "score_chunk_size"},
+                )
+                for name in (
+                    "candidate_count", "match_count", "score_chunk_size",
+                ):
+                    value = int(OmegaConf.select(
+                        config, f"{matching_path}.{name}"
+                    ))
+                    if value <= 0:
+                        raise ValueError(
+                            f"{matching_path}.{name} must be positive"
+                        )
+                candidate_count = int(OmegaConf.select(
+                    config, f"{matching_path}.candidate_count"
+                ))
+                match_count = int(OmegaConf.select(
+                    config, f"{matching_path}.match_count"
+                ))
+                if match_count > candidate_count:
+                    raise ValueError(
+                        "motion_matching.match_count must not exceed "
+                        "candidate_count"
+                    )
+                if match_count != 4:
+                    raise ValueError("V8 requires motion_matching.match_count=4")
+            if variant in WARPED_PROPOSAL_VELOCITY_VARIANTS:
+                use_time_embedding = bool(OmegaConf.select(
+                    config,
+                    "dynamic_2dgs.temporal.use_time_embedding",
+                    default=True,
+                ))
+                if variant == DYNAMIC_VARIANT_V7_2:
+                    if not use_time_embedding:
+                        raise ValueError(
+                            "V7.2 requires dynamic_2dgs.temporal."
+                            "use_time_embedding=true"
+                        )
+                elif use_time_embedding:
+                    raise ValueError(
+                        "V7 requires dynamic_2dgs.temporal."
+                        "use_time_embedding=false"
+                    )
+            elif variant == DYNAMIC_VARIANT_V9:
+                if not bool(OmegaConf.select(
+                    config,
+                    "dynamic_2dgs.temporal.use_time_embedding",
+                    default=True,
+                )):
+                    raise ValueError(
+                        "V9 requires dynamic_2dgs.temporal."
+                        "use_time_embedding=true"
+                    )
+            elif variant == DYNAMIC_VARIANT_V10:
+                temporal_path = "dynamic_2dgs.temporal"
+                if not bool(OmegaConf.select(
+                    config, f"{temporal_path}.use_time_embedding"
+                )):
+                    raise ValueError(
+                        "V10 requires dynamic_2dgs.temporal."
+                        "use_time_embedding=true"
+                    )
+                if str(OmegaConf.select(
+                    config, f"{temporal_path}.position_encoding"
+                )).lower() != "distance_bias":
+                    raise ValueError(
+                        "V10 temporal.position_encoding must be 'distance_bias'"
+                    )
+                if float(OmegaConf.select(
+                    config, f"{temporal_path}.distance_bias_speed_mps"
+                )) <= 0.0:
+                    raise ValueError(
+                        "V10 temporal.distance_bias_speed_mps must be positive"
+                    )
+                if not bool(OmegaConf.select(
+                    config, f"{temporal_path}.qk_norm"
+                )):
+                    raise ValueError("V10 requires temporal.qk_norm=true")
+                if int(OmegaConf.select(
+                    config, f"{temporal_path}.layer_weight_hidden_dim"
+                )) <= 0:
+                    raise ValueError(
+                        "V10 temporal.layer_weight_hidden_dim must be positive"
+                    )
+                count_path = "p2g.grid_query"
+                _reject_unknown_keys(
+                    config,
+                    count_path,
+                    {"count_mode", "grad_balance", "learned_count"},
+                )
+                if str(OmegaConf.select(
+                    config, f"{count_path}.count_mode"
+                )).lower() != "learned_gumbel":
+                    raise ValueError(
+                        "V10 requires p2g.grid_query.count_mode=learned_gumbel"
+                    )
+                if str(OmegaConf.select(
+                    config, f"{count_path}.grad_balance"
+                )).lower() not in ("sqrt_k", "none"):
+                    raise ValueError(
+                        "V10 grid_query.grad_balance must be 'sqrt_k' or 'none'"
+                    )
+                learned_path = f"{count_path}.learned_count"
+                _reject_unknown_keys(
+                    config,
+                    learned_path,
+                    {
+                        "K_max", "tau", "seed_mode", "grad_balance_scope",
+                        "budget", "logging",
+                    },
+                )
+                if int(OmegaConf.select(
+                    config, f"{learned_path}.K_max"
+                )) != 3:
+                    raise ValueError(
+                        "V10 requires grid_query.learned_count.K_max=3"
+                    )
+                if float(OmegaConf.select(
+                    config, f"{learned_path}.tau"
+                )) <= 0.0:
+                    raise ValueError(
+                        "V10 grid_query.learned_count.tau must be positive"
+                    )
+                if str(OmegaConf.select(
+                    config, f"{learned_path}.seed_mode"
+                )).lower() != "range_quantile":
+                    raise ValueError(
+                        "V10 grid_query.learned_count.seed_mode must be "
+                        "'range_quantile'"
+                    )
+                if str(OmegaConf.select(
+                    config, f"{learned_path}.grad_balance_scope"
+                )).lower() not in ("output", "token"):
+                    raise ValueError(
+                        "V10 learned_count.grad_balance_scope must be "
+                        "'output' or 'token'"
+                    )
+                budget_path = f"{learned_path}.budget"
+                _reject_unknown_keys(config, budget_path, {"enable"})
+                if bool(OmegaConf.select(config, f"{budget_path}.enable")):
+                    raise ValueError("V10 does not use a routing budget loss")
+                logging_path = f"{learned_path}.logging"
+                _reject_unknown_keys(
+                    config,
+                    logging_path,
+                    {"enable", "interval", "range_edges_m"},
+                )
+                if int(OmegaConf.select(
+                    config, f"{logging_path}.interval"
+                )) <= 0:
+                    raise ValueError(
+                        "V10 learned_count.logging.interval must be positive"
+                    )
+            elif variant == DYNAMIC_VARIANT_V6:
                 time_hidden_dim = int(OmegaConf.select(
                     config, "dynamic_2dgs.temporal.time_hidden_dim"
                 ))
@@ -265,71 +607,280 @@ def validate_experiment_config(config) -> None:
                     raise ValueError(
                         "dynamic_2dgs.temporal.time_hidden_dim must be positive"
                     )
+            if variant in REFINED_PROPOSAL_VELOCITY_VARIANTS:
+                proposal_path = "dynamic_2dgs.motion_proposal"
                 _reject_unknown_keys(
                     config,
-                    "dynamic_2dgs.motion_proposal",
+                    proposal_path,
                     {
-                        "adapter_hidden_dim", "descriptor_dim",
-                        "candidate_count", "match_count", "temperature",
-                        "dustbin_similarity_init", "score_chunk_size",
-                        "search_speed_min_mps", "search_speed_init_mps",
-                        "search_speed_max_mps",
+                        "descriptor_mode", "descriptor_dim", "temperature",
+                        "score_chunk_size", "readout",
+                        "distance_prior_speed_mps",
                     },
                 )
-                proposal_path = "dynamic_2dgs.motion_proposal"
-                for name in (
-                    "adapter_hidden_dim", "descriptor_dim", "candidate_count",
-                    "match_count", "score_chunk_size",
-                ):
-                    value = int(OmegaConf.select(config, f"{proposal_path}.{name}"))
+                for name in ("descriptor_dim", "score_chunk_size"):
+                    value = int(OmegaConf.select(
+                        config, f"{proposal_path}.{name}"
+                    ))
                     if value <= 0:
-                        raise ValueError(f"{proposal_path}.{name} must be positive")
-                match_count = int(OmegaConf.select(
-                    config, f"{proposal_path}.match_count"
-                ))
-                candidate_count = int(OmegaConf.select(
-                    config, f"{proposal_path}.candidate_count"
-                ))
-                if match_count > candidate_count:
+                        raise ValueError(
+                            f"{proposal_path}.{name} must be positive"
+                        )
+                if float(OmegaConf.select(
+                    config, f"{proposal_path}.temperature"
+                )) <= 0.0:
                     raise ValueError(
-                        "motion_proposal.match_count must not exceed candidate_count"
+                        "motion_proposal.temperature must be positive"
                     )
-                for name in ("temperature",):
-                    value = float(OmegaConf.select(config, f"{proposal_path}.{name}"))
-                    if value <= 0.0:
-                        raise ValueError(f"{proposal_path}.{name} must be positive")
-                dustbin_similarity = float(OmegaConf.select(
-                    config, f"{proposal_path}.dustbin_similarity_init"
-                ))
-                if not -1.0 < dustbin_similarity < 1.0:
+                if float(OmegaConf.select(
+                    config, f"{proposal_path}.distance_prior_speed_mps"
+                )) <= 0.0:
                     raise ValueError(
-                        "motion_proposal.dustbin_similarity_init must be in (-1, 1)"
+                        "motion_proposal.distance_prior_speed_mps must be "
+                        "positive"
                     )
-                speed_min = float(OmegaConf.select(
-                    config, f"{proposal_path}.search_speed_min_mps"
-                ))
-                speed_init = float(OmegaConf.select(
-                    config, f"{proposal_path}.search_speed_init_mps"
-                ))
-                speed_max = float(OmegaConf.select(
-                    config, f"{proposal_path}.search_speed_max_mps"
-                ))
-                if not 0.0 < speed_min < speed_init < speed_max:
+                if str(OmegaConf.select(
+                    config, f"{proposal_path}.descriptor_mode"
+                )) != "projected_l2":
                     raise ValueError(
-                        "motion_proposal search speeds must satisfy "
-                        "0 < min < init < max"
+                        "V9 motion_proposal.descriptor_mode must be "
+                        "'projected_l2'"
                     )
+                if str(OmegaConf.select(
+                    config, f"{proposal_path}.readout"
+                )) != "dense_expectation":
+                    raise ValueError(
+                        "V9 motion_proposal.readout must be "
+                        "'dense_expectation'"
+                    )
+            if variant in PROPOSAL_VELOCITY_VARIANTS:
+                proposal_path = "dynamic_2dgs.motion_proposal"
+                if variant == DYNAMIC_VARIANT_V7_2:
+                    _reject_unknown_keys(
+                        config,
+                        proposal_path,
+                        {
+                            "descriptor_mode", "match_count", "temperature",
+                            "score_chunk_size", "ste_surrogate",
+                            "distance_prior_speed_mps",
+                        },
+                    )
+                    for name in ("match_count", "score_chunk_size"):
+                        value = int(OmegaConf.select(
+                            config, f"{proposal_path}.{name}"
+                        ))
+                        if value <= 0:
+                            raise ValueError(
+                                f"{proposal_path}.{name} must be positive"
+                            )
+                    if int(OmegaConf.select(
+                        config, f"{proposal_path}.match_count"
+                    )) != 4:
+                        raise ValueError(
+                            "V7.2 requires motion_proposal.match_count=4"
+                        )
+                    if float(OmegaConf.select(
+                        config, f"{proposal_path}.temperature"
+                    )) <= 0.0:
+                        raise ValueError(
+                            "motion_proposal.temperature must be positive"
+                        )
+                    if float(OmegaConf.select(
+                        config, f"{proposal_path}.distance_prior_speed_mps"
+                    )) <= 0.0:
+                        raise ValueError(
+                            "motion_proposal.distance_prior_speed_mps must be "
+                            "positive"
+                        )
+                    if str(OmegaConf.select(
+                        config, f"{proposal_path}.descriptor_mode"
+                    )) != "direct_l2":
+                        raise ValueError(
+                            "V7.2 motion_proposal.descriptor_mode must be "
+                            "'direct_l2'"
+                        )
+                    if str(OmegaConf.select(
+                        config, f"{proposal_path}.ste_surrogate"
+                    )) != "dense_softmax":
+                        raise ValueError(
+                            "V7.2 motion_proposal.ste_surrogate must be "
+                            "'dense_softmax'"
+                        )
+                else:
+                    proposal_keys = {
+                        "candidate_count", "match_count", "temperature",
+                        "score_chunk_size", "search_speed_min_mps",
+                        "search_speed_init_mps", "search_speed_max_mps",
+                    }
+                    if variant == DYNAMIC_VARIANT_V6:
+                        proposal_keys.update({
+                            "adapter_hidden_dim", "descriptor_dim",
+                            "dustbin_similarity_init",
+                            "dustbin_token_conditioned",
+                        })
+                    else:
+                        proposal_keys.update({
+                            "descriptor_mode", "dustbin_mode",
+                            "dustbin_hidden_dim", "dustbin_prior_probability",
+                            "unmatched_gate_mode", "unmatched_hard_threshold",
+                        })
+                        if variant == DYNAMIC_VARIANT_V7_1:
+                            proposal_keys.update({
+                                "dustbin_evidence_mode",
+                                "mean_displacement_scale_m",
+                                "spread_scale_m",
+                            })
+                    _reject_unknown_keys(config, proposal_path, proposal_keys)
+                    integer_keys = [
+                        "candidate_count", "match_count", "score_chunk_size",
+                    ]
+                    if variant == DYNAMIC_VARIANT_V6:
+                        integer_keys.extend([
+                            "adapter_hidden_dim", "descriptor_dim",
+                        ])
+                    else:
+                        integer_keys.append("dustbin_hidden_dim")
+                    for name in integer_keys:
+                        value = int(OmegaConf.select(
+                            config, f"{proposal_path}.{name}"
+                        ))
+                        if value <= 0:
+                            raise ValueError(
+                                f"{proposal_path}.{name} must be positive"
+                            )
+                    match_count = int(OmegaConf.select(
+                        config, f"{proposal_path}.match_count"
+                    ))
+                    candidate_count = int(OmegaConf.select(
+                        config, f"{proposal_path}.candidate_count"
+                    ))
+                    if match_count > candidate_count:
+                        raise ValueError(
+                            "motion_proposal.match_count must not exceed "
+                            "candidate_count"
+                        )
+                    if float(OmegaConf.select(
+                        config, f"{proposal_path}.temperature"
+                    )) <= 0.0:
+                        raise ValueError(
+                            "motion_proposal.temperature must be positive"
+                        )
+                    if variant == DYNAMIC_VARIANT_V6:
+                        dustbin_similarity = float(OmegaConf.select(
+                            config, f"{proposal_path}.dustbin_similarity_init"
+                        ))
+                        if not -1.0 < dustbin_similarity < 1.0:
+                            raise ValueError(
+                                "motion_proposal.dustbin_similarity_init must "
+                                "be in (-1, 1)"
+                            )
+                    else:
+                        descriptor_mode = str(OmegaConf.select(
+                            config, f"{proposal_path}.descriptor_mode"
+                        ))
+                        if descriptor_mode != "direct_l2":
+                            raise ValueError(
+                                "V7 motion_proposal.descriptor_mode must be "
+                                "'direct_l2'"
+                            )
+                        dustbin_mode = str(OmegaConf.select(
+                            config, f"{proposal_path}.dustbin_mode"
+                        ))
+                        if dustbin_mode != "evidence_mlp":
+                            raise ValueError(
+                                "V7 motion_proposal.dustbin_mode must be "
+                                "'evidence_mlp'"
+                            )
+                        dustbin_prior = float(OmegaConf.select(
+                            config, f"{proposal_path}.dustbin_prior_probability"
+                        ))
+                        if not 0.0 < dustbin_prior < 1.0:
+                            raise ValueError(
+                                "motion_proposal.dustbin_prior_probability must "
+                                "be in (0, 1)"
+                            )
+                        unmatched_gate_mode = str(OmegaConf.select(
+                            config, f"{proposal_path}.unmatched_gate_mode"
+                        ))
+                        if unmatched_gate_mode not in ("soft", "ste_hard"):
+                            raise ValueError(
+                                "motion_proposal.unmatched_gate_mode must be "
+                                "'soft' or 'ste_hard'"
+                            )
+                        unmatched_threshold = float(OmegaConf.select(
+                            config, f"{proposal_path}.unmatched_hard_threshold"
+                        ))
+                        if not 0.0 < unmatched_threshold < 1.0:
+                            raise ValueError(
+                                "motion_proposal.unmatched_hard_threshold must "
+                                "be in (0, 1)"
+                            )
+                        if variant == DYNAMIC_VARIANT_V7_1:
+                            evidence_mode = str(OmegaConf.select(
+                                config, f"{proposal_path}.dustbin_evidence_mode"
+                            ))
+                            if evidence_mode != "mean_spread_reciprocal_m4":
+                                raise ValueError(
+                                    "V7.1 motion_proposal.dustbin_evidence_mode "
+                                    "must be 'mean_spread_reciprocal_m4'"
+                                )
+                            if match_count != 4:
+                                raise ValueError(
+                                    "V7.1 requires motion_proposal.match_count=4"
+                                )
+                            for name in (
+                                "mean_displacement_scale_m", "spread_scale_m",
+                            ):
+                                value = float(OmegaConf.select(
+                                    config, f"{proposal_path}.{name}"
+                                ))
+                                if value <= 0.0:
+                                    raise ValueError(
+                                        f"{proposal_path}.{name} must be positive"
+                                    )
+                    speed_min = float(OmegaConf.select(
+                        config, f"{proposal_path}.search_speed_min_mps"
+                    ))
+                    speed_init = float(OmegaConf.select(
+                        config, f"{proposal_path}.search_speed_init_mps"
+                    ))
+                    speed_max = float(OmegaConf.select(
+                        config, f"{proposal_path}.search_speed_max_mps"
+                    ))
+                    if not 0.0 < speed_min < speed_init < speed_max:
+                        raise ValueError(
+                            "motion_proposal search speeds must satisfy "
+                            "0 < min < init < max"
+                        )
             _reject_unknown_keys(
                 config,
                 "dynamic_2dgs.gaussian_head",
                 {"initial_opacity", "initial_scale_m"},
             )
             motion_keys = {"zero_init"}
-            if variant == DYNAMIC_VARIANT:
+            if variant == DYNAMIC_VARIANT_V6:
                 motion_keys.update({
                     "init_conditioned_residual",
                     "init_condition_scale_mps",
                     "detach_init_condition",
+                    "residual_hidden_dim",
+                })
+            elif variant in DURATION_OFFSET_VELOCITY_VARIANTS:
+                motion_keys.update({
+                    "detach_init_condition", "velocity_embedding_dim",
+                    "duration_embedding_dim", "duration_frequencies",
+                    "duration_reference_sec", "residual_hidden_dim",
+                })
+            elif variant in (
+                DYNAMIC_VARIANT_V7_2,
+                DYNAMIC_VARIANT_V9,
+                DYNAMIC_VARIANT_V10,
+            ):
+                motion_keys.add("residual_hidden_dim")
+            elif variant == DYNAMIC_VARIANT_V8:
+                motion_keys.update({
+                    "detach_init_condition", "velocity_embedding_dim",
+                    "residual_hidden_dim",
                 })
             _reject_unknown_keys(
                 config,
@@ -337,7 +888,7 @@ def validate_experiment_config(config) -> None:
                 motion_keys,
             )
             if (
-                variant == DYNAMIC_VARIANT
+                variant == DYNAMIC_VARIANT_V6
                 and _has_path(
                     config, "dynamic_2dgs.motion.init_condition_scale_mps"
                 )
@@ -349,6 +900,71 @@ def validate_experiment_config(config) -> None:
                 raise ValueError(
                     "dynamic_2dgs.motion.init_condition_scale_mps must be positive"
                 )
+            if (
+                variant in (
+                    *PROPOSAL_VELOCITY_VARIANTS,
+                    *REFINED_PROPOSAL_VELOCITY_VARIANTS,
+                    DYNAMIC_VARIANT_V8,
+                    DYNAMIC_VARIANT_V10,
+                )
+                and _has_path(config, "dynamic_2dgs.motion.residual_hidden_dim")
+            ):
+                residual_hidden_dim = OmegaConf.select(
+                    config, "dynamic_2dgs.motion.residual_hidden_dim"
+                )
+                if residual_hidden_dim is not None and int(
+                    residual_hidden_dim
+                ) <= 0:
+                    raise ValueError(
+                        "dynamic_2dgs.motion.residual_hidden_dim must be "
+                        "positive when set"
+                    )
+            if variant in DURATION_OFFSET_VELOCITY_VARIANTS:
+                for name in (
+                    "velocity_embedding_dim", "duration_embedding_dim",
+                    "duration_frequencies", "residual_hidden_dim",
+                ):
+                    raw_value = OmegaConf.select(
+                        config, f"dynamic_2dgs.motion.{name}"
+                    )
+                    if raw_value is None or int(raw_value) <= 0:
+                        raise ValueError(
+                            f"dynamic_2dgs.motion.{name} must be positive"
+                        )
+                duration_reference = float(OmegaConf.select(
+                    config, "dynamic_2dgs.motion.duration_reference_sec"
+                ))
+                if duration_reference <= 0.0:
+                    raise ValueError(
+                        "dynamic_2dgs.motion.duration_reference_sec must be "
+                        "positive"
+                    )
+                if not bool(OmegaConf.select(
+                    config,
+                    "dynamic_2dgs.motion.detach_init_condition",
+                )):
+                    raise ValueError(
+                        "duration-conditioned offset requires dynamic_2dgs.motion."
+                        "detach_init_condition=true"
+                    )
+            elif variant == DYNAMIC_VARIANT_V8:
+                velocity_embedding_dim = int(OmegaConf.select(
+                    config,
+                    "dynamic_2dgs.motion.velocity_embedding_dim",
+                ))
+                if velocity_embedding_dim <= 0:
+                    raise ValueError(
+                        "dynamic_2dgs.motion.velocity_embedding_dim must be "
+                        "positive"
+                    )
+                if not bool(OmegaConf.select(
+                    config,
+                    "dynamic_2dgs.motion.detach_init_condition",
+                )):
+                    raise ValueError(
+                        "V8 requires dynamic_2dgs.motion."
+                        "detach_init_condition=true"
+                    )
             _reject_unknown_keys(
                 config,
                 "dynamic_2dgs.regularization",
@@ -372,11 +988,12 @@ def validate_experiment_config(config) -> None:
                     config, "dynamic_2dgs.regularization.velocity_l2.mode"
                 )
                 if mode is not None and str(mode) not in (
-                    "final_l2", "final_group_l1",
+                    "final_l2", "final_group_l2", "final_group_l1", "offset_l2",
                 ):
                     raise ValueError(
                         "dynamic_2dgs.regularization.velocity_l2.mode must be "
-                        "'final_l2' or 'final_group_l1'"
+                        "'final_l2', 'final_group_l2', 'final_group_l1', or "
+                        "'offset_l2'"
                     )
 
 
@@ -605,9 +1222,20 @@ __all__ = [
     "DYNAMIC_VARIANT_V3_1",
     "DYNAMIC_VARIANT_V4",
     "DYNAMIC_VARIANT_V5",
+    "DYNAMIC_VARIANT_V6",
+    "DYNAMIC_VARIANT_V7",
+    "DYNAMIC_VARIANT_V7_1",
+    "DYNAMIC_VARIANT_V7_2",
+    "DYNAMIC_VARIANT_V8",
+    "DYNAMIC_VARIANT_V9",
+    "DYNAMIC_VARIANT_V10",
     "DYNAMIC_VARIANTS",
+    "DURATION_OFFSET_VELOCITY_VARIANTS",
     "LEGACY_VARIANT",
     "PHYSICAL_VELOCITY_VARIANTS",
+    "PROPOSAL_VELOCITY_VARIANTS",
+    "REFINED_PROPOSAL_VELOCITY_VARIANTS",
+    "WARPED_PROPOSAL_VELOCITY_VARIANTS",
     "STRUCTURAL_DEFAULTS",
     "VARIANT_CONFIG_PATHS",
     "assert_model_variant_implemented",

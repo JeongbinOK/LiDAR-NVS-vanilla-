@@ -6,6 +6,14 @@ import torch
 import torch.nn as nn
 
 from .. import utonia
+from ..utonia.lora import (
+    adapt_utonia_embedding_to_xyzi,
+    build_xyzi_utonia_input,
+    freeze_utonia_and_enable_active_lora,
+    inject_utonia_lora,
+    resolve_utonia_lora_settings,
+    set_active_lora_mode,
+)
 from .anchor_modes import (
     build_grid_gaussian_seeds,
     build_spherical_gaussian_seeds,
@@ -30,6 +38,14 @@ class Point2Gaus(nn.Module):
         self.dynamic_variant = dynamic_variant
 
         self.freeze_utonia = bool(getattr(cfg, "freeze_utonia", True))
+        self.utonia_lora_settings = resolve_utonia_lora_settings(cfg)
+        self.utonia_lora_enabled = self.utonia_lora_settings.enabled
+        if self.utonia_lora_enabled and not self.freeze_utonia:
+            raise ValueError(
+                "p2g.utonia_lora.enable=true requires p2g.freeze_utonia=true; "
+                "LoRA fine-tunes adapters while the pretrained Utonia base "
+                "stays frozen"
+            )
         # Load the frozen Utonia encoder from a repo-local checkpoint so the weights
         # and their embedded architecture config live under the project (not ~/.cache).
         # The architecture config is also dumped to config/utonia_pretrained.yaml for
@@ -43,8 +59,6 @@ class Point2Gaus(nn.Module):
             repo_id="Pointcept/Utonia",
             custom_config={"freeze_encoder": True} if self.freeze_utonia else None,
         )
-        if self.freeze_utonia:
-            self.feature_extractor.eval()
         self.utonia_coord_scale = 0.2
         self.utonia_input_grid_size = 0.01
         self.utonia_feature_stage = int(
@@ -55,13 +69,58 @@ class Point2Gaus(nn.Module):
         self.utonia_feature_grid_size = self._infer_utonia_feature_grid_size()
         self.utonia_feature_dim = self._infer_utonia_feature_dim()
 
+        if self.utonia_lora_enabled:
+            # Load the untouched 9D checkpoint before migrating its functional
+            # [xyz, 0, ..., 0] stem to [xyz, intensity]. Both the new intensity
+            # base column and every LoRA up projection start at zero.
+            old_input_channels = adapt_utonia_embedding_to_xyzi(
+                self.feature_extractor
+            )
+        self.utonia_lora_report = inject_utonia_lora(
+            self.feature_extractor, self.utonia_lora_settings
+        )
+        self.utonia_lora_trainable_parameters = 0
+        if self.utonia_lora_enabled:
+            self.utonia_lora_trainable_parameters = (
+                freeze_utonia_and_enable_active_lora(
+                    self.feature_extractor, self._active_utonia_lora_roots()
+                )
+            )
+            print(
+                "Utonia LoRA: "
+                f"input={old_input_channels}->4 (xyzi), "
+                f"linear={self.utonia_lora_report.linear_modules} "
+                f"rank={self.utonia_lora_settings.linear_rank}, "
+                f"subm_conv3d={self.utonia_lora_report.conv_modules} "
+                f"rank={self.utonia_lora_settings.conv_rank}, "
+                "active_trainable="
+                f"{self.utonia_lora_trainable_parameters / 1e6:.2f}M"
+            )
+        if self.freeze_utonia:
+            self.feature_extractor.eval()
+            if self.utonia_lora_enabled:
+                set_active_lora_mode(
+                    self._active_utonia_lora_roots(), self.training
+                )
+
         # Both anchor modes start from the exact same occupied Utonia-grid tokens.
         self.grid_mapper = UtoniaGridMapper(
             self.utonia_coord_scale, self.utonia_input_grid_size, self.utonia_stride_factor
         )
+        if self.dynamic_cfg is not None:
+            from src.config_loader import DYNAMIC_VARIANT_V10
+
+            self.dynamic_adaptive_count = (
+                self.dynamic_variant == DYNAMIC_VARIANT_V10
+            )
+        else:
+            self.dynamic_adaptive_count = False
         self.anchor_mode, self.anchor_builder = build_token_builder(
             cfg,
-            one_seed_per_token=self.dynamic_cfg is not None,
+            one_seed_per_token=(
+                self.dynamic_cfg is not None
+                and not self.dynamic_adaptive_count
+            ),
         )
 
         self.agg_mlp = cfg.agg_mlp
@@ -69,17 +128,30 @@ class Point2Gaus(nn.Module):
         intensity_out_dim = getattr(self.anchor_builder, "intensity_out_dim", None)
         if intensity_out_dim is None:
             raise RuntimeError("the shared token builder must expose intensity_out_dim")
-        self.agg_in_dim = self.utonia_feature_dim + int(intensity_out_dim)
-        (
-            self.utonia_adapter,
-            self.intensity_agg_mlp,
-            self.joint_refiner,
-        ) = build_feature_fusion(
-            cfg,
-            utonia_dim=self.utonia_feature_dim,
-            intensity_dim=int(intensity_out_dim),
-            coord_scale=self.utonia_coord_scale,
-        )
+        if self.utonia_lora_enabled:
+            if int(intensity_out_dim) != 0:
+                raise RuntimeError(
+                    "Utonia XYZI LoRA must not construct a separate intensity "
+                    "encoder"
+                )
+            self.agg_in_dim = self.utonia_feature_dim
+            self.utonia_adapter = None
+            self.intensity_agg_mlp = None
+            self.joint_refiner = None
+            self.trunk_dim = self.utonia_feature_dim
+        else:
+            self.agg_in_dim = self.utonia_feature_dim + int(intensity_out_dim)
+            (
+                self.utonia_adapter,
+                self.intensity_agg_mlp,
+                self.joint_refiner,
+            ) = build_feature_fusion(
+                cfg,
+                utonia_dim=self.utonia_feature_dim,
+                intensity_dim=int(intensity_out_dim),
+                coord_scale=self.utonia_coord_scale,
+            )
+            self.trunk_dim = int(self.agg_mlp.out_dim)
 
         # Gaussian head size is derived purely from gs_params (shs+opacity+scaling+
         # rotation [+offset]). offset>0 adds the bounded position-offset output.
@@ -93,52 +165,92 @@ class Point2Gaus(nn.Module):
             int(cfg.gs_params.rotation),
         ] + ([self.offset_size] if self.use_offset else [])
         gs_out_dim = sum(self.gs_param_sizes)
-        trunk_dim = int(self.agg_mlp.out_dim)
+        trunk_dim = self.trunk_dim
 
-        # Dynamic 2DGS shares everything above this boundary (frozen Utonia,
-        # occupied-grid construction, intensity fusion, and joint refiner) but
-        # registers only its own temporal/GS/motion backend below it. Keeping
-        # the legacy modules absent avoids DDP unused parameters and makes the
-        # variant checkpoint structure unambiguous.
+        # Dynamic 2DGS shares occupied-grid construction and then registers only
+        # its own temporal/GS/motion backend. In LoRA mode its input is the direct
+        # 432D Utonia XYZI feature; the legacy intensity fusion and local refiner
+        # modules are not constructed.
         if self.dynamic_cfg is not None:
             if self.anchor_mode != "grid":
                 raise ValueError("Dynamic 2DGS requires p2g.anchor_mode='grid'")
             from src.config_loader import (
-                DYNAMIC_VARIANT,
                 DYNAMIC_VARIANT_V1,
                 DYNAMIC_VARIANT_V3,
                 DYNAMIC_VARIANT_V3_1,
                 DYNAMIC_VARIANT_V4,
                 DYNAMIC_VARIANT_V5,
+                DYNAMIC_VARIANT_V6,
+                DYNAMIC_VARIANT_V7,
+                DYNAMIC_VARIANT_V7_1,
+                DYNAMIC_VARIANT_V7_2,
+                DYNAMIC_VARIANT_V8,
+                DYNAMIC_VARIANT_V9,
+                DYNAMIC_VARIANT_V10,
             )
             from .dynamic_gaussian import (
                 AttentionInitializedVelocityGaussianBackend,
+                ConsensusAttentionVelocityGaussianBackend,
                 DynamicGaussianBackend,
+                LayerWeightedAttentionVelocityGaussianBackend,
                 PhysicalVelocityGaussianBackend,
+                PostAttentionProposalVelocityGaussianBackend,
                 ProposalInitializedVelocityGaussianBackend,
+                StraightThroughProposalVelocityGaussianBackend,
+                WarpedProposalVelocityGaussianBackend,
             )
 
             # V3.1 differs from V3 only by its objective. V4 preserves the same
             # parameter structure but activates attention-derived initialization.
             # V5 shares V4's backend and differs only by temporal config keys.
-            # V6 has an independent frozen-Utonia Siamese motion proposal and
-            # keeps temporal attention exclusively on feature refinement.
+            # V6 has an independent Siamese proposal. V7/V7.1 use its direct-L2
+            # sparse successor. V7.2 uses a direct Top-4 forward/full-key STE
+            # matcher, then V5-style endpoint-time refinement and a compact
+            # feature-only velocity offset. V9 keeps a standalone proposal
+            # branch but runs it after temporal refinement on the refined
+            # feature, so it needs no raw pre-attention Utonia stream. V10 reads
+            # every head at every temporal layer and learns a global-token
+            # softmax over the resulting dense coordinate expectations.
             backend_cls = {
                 DYNAMIC_VARIANT_V1: DynamicGaussianBackend,
                 DYNAMIC_VARIANT_V3: PhysicalVelocityGaussianBackend,
                 DYNAMIC_VARIANT_V3_1: PhysicalVelocityGaussianBackend,
                 DYNAMIC_VARIANT_V4: AttentionInitializedVelocityGaussianBackend,
                 DYNAMIC_VARIANT_V5: AttentionInitializedVelocityGaussianBackend,
-                DYNAMIC_VARIANT: ProposalInitializedVelocityGaussianBackend,
+                DYNAMIC_VARIANT_V6: ProposalInitializedVelocityGaussianBackend,
+                DYNAMIC_VARIANT_V7: WarpedProposalVelocityGaussianBackend,
+                DYNAMIC_VARIANT_V7_1: WarpedProposalVelocityGaussianBackend,
+                DYNAMIC_VARIANT_V7_2: (
+                    StraightThroughProposalVelocityGaussianBackend
+                ),
+                DYNAMIC_VARIANT_V8: ConsensusAttentionVelocityGaussianBackend,
+                DYNAMIC_VARIANT_V9: (
+                    PostAttentionProposalVelocityGaussianBackend
+                ),
+                DYNAMIC_VARIANT_V10: (
+                    LayerWeightedAttentionVelocityGaussianBackend
+                ),
             }.get(self.dynamic_variant)
             if backend_cls is None:
                 raise ValueError(
                     f"Unsupported dynamic model variant={self.dynamic_variant!r}"
                 )
-            self._uses_motion_proposal = self.dynamic_variant == DYNAMIC_VARIANT
+            self._uses_motion_proposal = self.dynamic_variant in (
+                DYNAMIC_VARIANT_V6,
+                DYNAMIC_VARIANT_V7,
+                DYNAMIC_VARIANT_V7_1,
+                DYNAMIC_VARIANT_V7_2,
+            )
             backend_kwargs = {}
             if self._uses_motion_proposal:
                 backend_kwargs["proposal_dim"] = self.utonia_feature_dim
+            if self.dynamic_variant == DYNAMIC_VARIANT_V10:
+                grid_query_cfg = getattr(cfg, "grid_query", None)
+                if grid_query_cfg is None:
+                    raise ValueError(
+                        "V10 requires p2g.grid_query learned-count config"
+                    )
+                backend_kwargs["gaussian_count_cfg"] = grid_query_cfg
             self.dynamic_backend = backend_cls(
                 self.dynamic_cfg,
                 cfg.gs_params,
@@ -160,7 +272,7 @@ class Point2Gaus(nn.Module):
                 "p2g.grid_query config block is required for the shared temporal fusion"
             )
         self.grid_temporal_agg = GridTemporalAggregator(
-            grid_query_cfg, dim=self.agg_mlp.out_dim,
+            grid_query_cfg, dim=trunk_dim,
             r_far=float(getattr(cfg, "r_far", 70.0)),
         )
 
@@ -171,7 +283,7 @@ class Point2Gaus(nn.Module):
                 raise ValueError("p2g.squery config block is required for anchor_mode='spherical'")
             self.squery_cfg = squery_cfg
             self.squery_head = SphericalQueryHead(
-                squery_cfg, dim=self.agg_mlp.out_dim,
+                squery_cfg, dim=trunk_dim,
                 r_far=float(getattr(cfg, "r_far", 70.0)),
                 ring_to_elevation_deg=getattr(
                     cfg, "ring_to_elevation_deg", None
@@ -193,21 +305,36 @@ class Point2Gaus(nn.Module):
                 self.squery_slot_head = GridSlotHead(
                     squery_cfg,
                     cfg.gs_params,
-                    dim=self.agg_mlp.out_dim,
+                    dim=trunk_dim,
                     router_dim=self.squery_head.router_dim,
                 )
         else:  # grid; validated by build_token_builder
             from .grid_query_head import GridSlotHead
 
             self.grid_slot_head = GridSlotHead(
-                grid_query_cfg, cfg.gs_params, dim=self.agg_mlp.out_dim,
+                grid_query_cfg, cfg.gs_params, dim=trunk_dim,
             )
 
     def train(self, mode: bool = True):
         super().train(mode)
         if getattr(self, "freeze_utonia", False):
             self.feature_extractor.eval()
+            if getattr(self, "utonia_lora_enabled", False):
+                set_active_lora_mode(self._active_utonia_lora_roots(), mode)
         return self
+
+    def _active_utonia_lora_roots(self):
+        """Modules executed by the configured early-exit encoder stage.
+
+        Adapters are installed throughout Utonia, but stages after the selected
+        feature stage stay frozen so DDP never sees trainable unused parameters.
+        """
+        roots = [self.feature_extractor.embedding]
+        roots.extend(
+            self.feature_extractor.enc[index]
+            for index in range(self.utonia_feature_stage + 1)
+        )
+        return roots
 
     def _validate_utonia_feature_stage(self):
         max_stage = len(self.feature_extractor.enc) - 1
@@ -244,6 +371,8 @@ class Point2Gaus(nn.Module):
         raise RuntimeError(f"Could not infer Utonia feature dim for stage {self.utonia_feature_stage}")
 
     def _forward_utonia_features(self, ptv3_input):
+        if self.utonia_lora_enabled:
+            ptv3_input = build_xyzi_utonia_input(ptv3_input)
         max_stage = len(self.feature_extractor.enc) - 1
         if self.utonia_feature_stage == max_stage:
             return self.feature_extractor(ptv3_input)
@@ -298,6 +427,13 @@ class Point2Gaus(nn.Module):
         pos_list = token_batch.positions
         ufeat_list = token_batch.utonia_features
         ifeat_list = token_batch.intensity_features
+        if self.utonia_lora_enabled and ifeat_list is not None:
+            raise RuntimeError(
+                "Utonia XYZI LoRA unexpectedly received separate intensity "
+                "features"
+            )
+        if not self.utonia_lora_enabled and ifeat_list is None:
+            raise RuntimeError("legacy fusion requires separate intensity features")
         gc_list = token_batch.grid_coords
         grid_seed_list = token_batch.grid_seeds
         raw_membership_list = token_batch.raw_memberships
@@ -318,7 +454,7 @@ class Point2Gaus(nn.Module):
 
         all_pos         = []
         all_ufeat       = []
-        all_ifeat       = []
+        all_ifeat       = [] if ifeat_list is not None else None
         all_gc          = []
         all_offset      = []
         all_frame_batch = []
@@ -339,7 +475,8 @@ class Point2Gaus(nn.Module):
 
             all_pos.append(pos_i)
             all_ufeat.append(ufeat_list[i])
-            all_ifeat.append(ifeat_list[i])
+            if all_ifeat is not None:
+                all_ifeat.append(ifeat_list[i])
             all_gc.append(gc_list[i])
             all_frame_batch.append(b)
             if self.dynamic_cfg is None:
@@ -355,7 +492,8 @@ class Point2Gaus(nn.Module):
 
         all_pos       = torch.cat(all_pos,   dim=0)   # (N_valid, 3)
         all_ufeat     = torch.cat(all_ufeat, dim=0)   # (N_valid, C_stage)
-        all_ifeat     = torch.cat(all_ifeat, dim=0)   # (N_valid, D)
+        if all_ifeat is not None:
+            all_ifeat = torch.cat(all_ifeat, dim=0)   # (N_valid, D)
         all_gc        = torch.cat(all_gc, dim=0)      # (N_valid, 3) token grid_coord
         new_offset    = torch.stack(all_offset)        # (n_frames,)
         frame_batch_idx = torch.tensor(
@@ -395,16 +533,21 @@ class Point2Gaus(nn.Module):
                 f"expected {self.utonia_feature_dim}, got {all_ufeat.shape[1]}"
             )
 
-        agg_feat_i = fuse_features(
-            self.utonia_adapter,
-            self.intensity_agg_mlp,
-            self.joint_refiner,
-            utonia_feature=all_ufeat,
-            intensity_feature=all_ifeat,
-            position=all_pos,
-            grid_coord=all_gc,
-            offset=new_offset,
-        )
+        if self.utonia_lora_enabled:
+            # Direct path: Utonia(XYZI)+LoRA -> temporal cross-attention.
+            # There is no adapter, concat/fusion MLP, or local token refiner.
+            agg_feat_i = all_ufeat
+        else:
+            agg_feat_i = fuse_features(
+                self.utonia_adapter,
+                self.intensity_agg_mlp,
+                self.joint_refiner,
+                utonia_feature=all_ufeat,
+                intensity_feature=all_ifeat,
+                position=all_pos,
+                grid_coord=all_gc,
+                offset=new_offset,
+            )
 
         if self.dynamic_cfg is not None:
             timestamps_sec = _input.get("timestamps_sec")
@@ -416,11 +559,12 @@ class Point2Gaus(nn.Module):
                 )
             dynamic_kwargs = {}
             if self._uses_motion_proposal:
-                # Utonia is frozen, but the shared descriptor projection below
-                # remains trainable. This preserves pretrained cross-frame
-                # semantic consistency instead of making correspondence depend
-                # on the jointly changing intensity/fusion/GS trunk.
+                # The matcher consumes the same frozen-base, LoRA-adapted
+                # Utonia token as temporal attention. Variant-specific matching
+                # then decides whether to project it or L2-normalize it directly.
                 dynamic_kwargs["motion_proposal_feature"] = all_ufeat
+            if self.dynamic_adaptive_count:
+                dynamic_kwargs["seed_delta_sensor"] = all_delta_sensor
             dynamic_out = self.dynamic_backend(
                 agg_feat_i,
                 all_pos,
@@ -433,13 +577,16 @@ class Point2Gaus(nn.Module):
                 window_duration_sec,
                 **dynamic_kwargs,
             )
+            routing_stats = dynamic_out.pop("routing_stats", None)
             return {
                 **dynamic_out,
                 "pose": pose,
                 "timestamps": _input["timestamps"],
                 "timestamps_sec": timestamps_sec,
                 "window_duration_sec": window_duration_sec,
-                "routing_stats": None,
+                "routing_stats": routing_stats,
+                # V10 learns K only from rendering through the opacity STE gate.
+                # No count-budget objective is constructed or returned.
                 "routing_budget_logits": None,
             }
 
