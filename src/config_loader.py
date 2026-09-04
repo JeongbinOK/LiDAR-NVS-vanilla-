@@ -32,6 +32,7 @@ DYNAMIC_VARIANT_V8 = "dynamic_2dgs_attention_velocity_v8"
 DYNAMIC_VARIANT_V9 = "dynamic_2dgs_attention_velocity_v9"
 DYNAMIC_VARIANT_V10 = "dynamic_2dgs_attention_velocity_v10"
 DYNAMIC_VARIANT_V11 = "dynamic_2dgs_attention_velocity_v11"
+DYNAMIC_VARIANT_V11_1 = "dynamic_2dgs_attention_velocity_v11_1"
 # The unsuffixed constant always names the current fresh-run baseline. Keep an
 # explicit constant for each predecessor so checkpoint semantics stay exact.
 DYNAMIC_VARIANT = DYNAMIC_VARIANT_V7_2
@@ -48,17 +49,22 @@ ATTENTION_VELOCITY_VARIANTS = (
     *_SELECTED_HEAD_ATTENTION_VELOCITY_VARIANTS,
     DYNAMIC_VARIANT_V10,
     DYNAMIC_VARIANT_V11,
+    DYNAMIC_VARIANT_V11_1,
 )
 # Both read correspondence out of temporal attention itself and route the
 # refined token through the learned_gumbel K={1,2,3} grid Gaussian head.
+# V11.1 deliberately does not: it emits exactly one Gaussian per token and owns
+# no router, so it keeps the fixed-count seed contract V3-V9 use.
 ADAPTIVE_COUNT_DYNAMIC_VARIANTS = (
     DYNAMIC_VARIANT_V10,
     DYNAMIC_VARIANT_V11,
 )
 # Head 0 alone carries the max-speed barrier and the coordinate readout; every
-# other head keeps 3D RoPE.
+# other head keeps 3D RoPE. V11.1 additionally splits the QK-Norm gain along
+# that same head boundary.
 BARRIER_MATCH_DYNAMIC_VARIANTS = (
     DYNAMIC_VARIANT_V11,
+    DYNAMIC_VARIANT_V11_1,
 )
 DYNAMIC_VARIANTS = (
     DYNAMIC_VARIANT_V1,
@@ -74,6 +80,7 @@ DYNAMIC_VARIANTS = (
     DYNAMIC_VARIANT_V9,
     DYNAMIC_VARIANT_V10,
     DYNAMIC_VARIANT_V11,
+    DYNAMIC_VARIANT_V11_1,
 )
 
 # V3 and later share the physical-time contract. V4/V5 add attention-derived
@@ -91,6 +98,7 @@ PHYSICAL_VELOCITY_VARIANTS = (
     DYNAMIC_VARIANT_V9,
     DYNAMIC_VARIANT_V10,
     DYNAMIC_VARIANT_V11,
+    DYNAMIC_VARIANT_V11_1,
 )
 
 WARPED_PROPOSAL_VELOCITY_VARIANTS = (
@@ -154,6 +162,9 @@ VARIANT_CONFIG_PATHS = {
     ),
     DYNAMIC_VARIANT_V11: (
         REPO_ROOT / "config" / "variants" / f"{DYNAMIC_VARIANT_V11}.yaml"
+    ),
+    DYNAMIC_VARIANT_V11_1: (
+        REPO_ROOT / "config" / "variants" / f"{DYNAMIC_VARIANT_V11_1}.yaml"
     ),
 }
 
@@ -425,7 +436,9 @@ def validate_experiment_config(config) -> None:
     if variant in DYNAMIC_VARIANTS:
         if str(OmegaConf.select(config, "p2g.anchor_mode", default="")) != "grid":
             raise ValueError(f"{variant} requires p2g.anchor_mode=grid")
-        if variant in ADAPTIVE_COUNT_DYNAMIC_VARIANTS and not lora_enabled:
+        if variant in (
+            *ADAPTIVE_COUNT_DYNAMIC_VARIANTS, *BARRIER_MATCH_DYNAMIC_VARIANTS,
+        ) and not lora_enabled:
             raise ValueError(
                 f"{_variant_label(variant)} requires p2g.utonia_lora.enable=true"
             )
@@ -676,7 +689,17 @@ def validate_experiment_config(config) -> None:
                     raise ValueError(
                         f"{label} requires dynamic_2dgs.temporal.num_heads >= 2"
                     )
-                _validate_adaptive_gaussian_count(config, label)
+                if variant in ADAPTIVE_COUNT_DYNAMIC_VARIANTS:
+                    _validate_adaptive_gaussian_count(config, label)
+                elif _has_path(config, "p2g.grid_query"):
+                    # V11.1 emits one Gaussian per occupied token through the
+                    # fixed-count seed contract. A grid_query block would be
+                    # read by nothing, so a stale one is rejected rather than
+                    # silently ignored.
+                    raise ValueError(
+                        f"{label} emits one Gaussian per token and must not "
+                        "configure p2g.grid_query"
+                    )
             elif variant == DYNAMIC_VARIANT_V6:
                 time_hidden_dim = int(OmegaConf.select(
                     config, "dynamic_2dgs.temporal.time_hidden_dim"
@@ -1335,6 +1358,7 @@ __all__ = [
     "DYNAMIC_VARIANT_V9",
     "DYNAMIC_VARIANT_V10",
     "DYNAMIC_VARIANT_V11",
+    "DYNAMIC_VARIANT_V11_1",
     "DYNAMIC_VARIANTS",
     "DURATION_OFFSET_VELOCITY_VARIANTS",
     "LEGACY_VARIANT",

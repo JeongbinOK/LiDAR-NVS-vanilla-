@@ -188,6 +188,7 @@ class Point2Gaus(nn.Module):
                 DYNAMIC_VARIANT_V9,
                 DYNAMIC_VARIANT_V10,
                 DYNAMIC_VARIANT_V11,
+                DYNAMIC_VARIANT_V11_1,
             )
             from .dynamic_gaussian import (
                 AttentionInitializedVelocityGaussianBackend,
@@ -195,6 +196,7 @@ class Point2Gaus(nn.Module):
                 DynamicGaussianBackend,
                 LayerWeightedAttentionVelocityGaussianBackend,
                 MaxSpeedBarrierVelocityGaussianBackend,
+                SingleGaussianBarrierVelocityGaussianBackend,
                 PhysicalVelocityGaussianBackend,
                 PostAttentionProposalVelocityGaussianBackend,
                 ProposalInitializedVelocityGaussianBackend,
@@ -235,6 +237,9 @@ class Point2Gaus(nn.Module):
                     LayerWeightedAttentionVelocityGaussianBackend
                 ),
                 DYNAMIC_VARIANT_V11: MaxSpeedBarrierVelocityGaussianBackend,
+                DYNAMIC_VARIANT_V11_1: (
+                    SingleGaussianBarrierVelocityGaussianBackend
+                ),
             }.get(self.dynamic_variant)
             if backend_cls is None:
                 raise ValueError(

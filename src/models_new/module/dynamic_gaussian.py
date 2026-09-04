@@ -1995,6 +1995,125 @@ class MaxSpeedBarrierLayerWeightedCrossAttention(
         }
 
 
+class GroupedHeadRMSNorm(nn.Module):
+    """RMSNorm over the head dimension with one learned gain per head *group*.
+
+    Under RMSNorm ``|q| = gamma_rms * sqrt(head_dim)`` holds exactly for every
+    head, so a single gain broadcast over all heads pins them to one logit
+    temperature by construction.  That is right when the heads share a job, and
+    wrong when one of them does not: V11.1's head 0 must reach a logit gap near
+    seven to make its coordinate readout metric, while the RoPE feature heads
+    want to keep averaging broadly.  Splitting the gain on exactly the boundary
+    the position encoding already uses lets head 0 sharpen on its own.
+
+    ``group_of_head[h]`` names the gain row head ``h`` reads.
+    """
+
+    def __init__(self, head_dim: int, group_of_head, eps: float = 1.0e-6):
+        super().__init__()
+        index = torch.as_tensor(list(group_of_head), dtype=torch.long)
+        if index.ndim != 1 or index.numel() < 1:
+            raise ValueError("group_of_head must list one group per head")
+        if int(index.min()) < 0:
+            raise ValueError("group_of_head entries must be non-negative")
+        self.head_dim = int(head_dim)
+        self.eps = float(eps)
+        self.num_groups = int(index.max()) + 1
+        # Ones is the RMSNorm identity, matching nn.RMSNorm's initialization.
+        self.weight = nn.Parameter(torch.ones(self.num_groups, self.head_dim))
+        self.register_buffer("group_of_head", index, persistent=False)
+
+    def forward(self, x):
+        if x.ndim < 2 or x.shape[-1] != self.head_dim:
+            raise ValueError(f"grouped RMSNorm expects (..., H, {self.head_dim})")
+        if x.shape[-2] != self.group_of_head.numel():
+            raise ValueError("grouped RMSNorm head count does not match config")
+        value = x.float()
+        normalized = value * torch.rsqrt(
+            value.square().mean(dim=-1, keepdim=True) + self.eps
+        )
+        return (normalized * self.weight[self.group_of_head]).to(x.dtype)
+
+    @torch.no_grad()
+    def group_gain_rms(self):
+        return [
+            float(self.weight[g].float().square().mean().sqrt())
+            for g in range(self.num_groups)
+        ]
+
+
+class GroupedGainBarrierCrossAttention(
+    MaxSpeedBarrierLayerWeightedCrossAttention
+):
+    """V11.1: V11's stack with QK-Norm's gain split on the head-0 boundary.
+
+    This is the only change to the temporal module.  Everything V11 does --
+    the max-speed barrier on head 0, the chunked explicit softmax, RoPE on
+    heads 1..H-1, and the parameter-only layer mixture -- is inherited
+    unmodified, so the two variants differ by one tensor shape.
+
+    Under RMSNorm ``|q| = gamma_rms * sqrt(head_dim)`` holds exactly for every
+    head, so a single gain broadcast over all heads pins them to one logit
+    temperature by construction.  Head 0 has a different job from the rest: its
+    probabilities are read as a coordinate, and a soft-argmax is only metric
+    when the mass is concentrated, which needs a logit gap near seven (measured
+    on V11: ~37.7 tokens inside a 2 m ball against ~3735 admitted candidates).
+    The RoPE feature heads have no such requirement and are free to keep
+    averaging broadly.  Splitting the gain on exactly the boundary the position
+    encoding already uses lets each side find its own temperature.
+
+    Measured on V11.1's first three epochs, the two groups do separate and the
+    direction depends on depth: head 0 runs up to 25% hotter than the RoPE
+    heads in layers 1-5 and up to 7% cooler in layers 8-11, while V11's single
+    shared gain sits above both.
+    """
+
+    def __init__(self, cfg, dim: int):
+        super().__init__(cfg, dim)
+        # Head 0 carries the barrier and the readout; heads 1..H-1 carry RoPE.
+        # The gain split follows that same boundary.
+        group_of_head = [1] * self.num_heads
+        group_of_head[self._MATCH_HEAD] = 0
+        self.q_norm = nn.ModuleList([
+            GroupedHeadRMSNorm(self.head_dim, group_of_head)
+            for _ in range(self.n_layers)
+        ])
+        self.k_norm = nn.ModuleList([
+            GroupedHeadRMSNorm(self.head_dim, group_of_head)
+            for _ in range(self.n_layers)
+        ])
+
+    @torch.no_grad()
+    def attention_temperature_stats(self):
+        """Per-group QK gains, so the match head can be watched on its own.
+
+        V11 could only report one bound for all twelve heads, which is precisely
+        the coupling this variant removes.
+        """
+        stats = {
+            "qk_motion_head_count": 1.0,
+            "barrier_speed_mps": self.barrier_speed_mps,
+            "barrier_weight": self.barrier_weight,
+        }
+        names = {0: "match", 1: "rope"}
+        bounds = {}
+        for layer in range(self.n_layers):
+            gq = self.q_norm[layer].group_gain_rms()
+            gk = self.k_norm[layer].group_gain_rms()
+            for group, (rms_q, rms_k) in enumerate(zip(gq, gk)):
+                tag = names.get(group, str(group))
+                stats[f"qk_gamma_q_{tag}_layer{layer}"] = rms_q
+                stats[f"qk_gamma_k_{tag}_layer{layer}"] = rms_k
+                bounds[tag] = max(
+                    bounds.get(tag, 0.0),
+                    rms_q * rms_k * self.head_dim * self.scale,
+                )
+        for tag, bound in bounds.items():
+            stats[f"qk_max_logit_bound_{tag}"] = bound
+        stats["qk_max_logit_bound"] = max(bounds.values()) if bounds else 0.0
+        return stats
+
+
 class GaussianAttributeHead(nn.Module):
     """V3 time-invariant 2DGS decoder driven only by the shared token feature."""
 
@@ -4550,6 +4669,117 @@ class MaxSpeedBarrierVelocityGaussianBackend(
         return self.velocity_head(refined, velocity_init)
 
 
+class SingleGaussianBarrierVelocityGaussianBackend(
+    PhysicalVelocityGaussianBackend
+):
+    """V11.1: V11's temporal stack over one Gaussian per occupied token.
+
+    Two things separate this from V11, and neither touches correspondence.
+
+    1. **The QK-Norm gain is split per head group** (see
+       :class:`GroupedGainBarrierCrossAttention`).
+
+    2. **The adaptive-K router is gone.**  V10 and V11 route ``LN(f')`` through
+       a hard Gumbel-Softmax over K={1,2,3} and run only the selected
+       K-specific joint head, so one token can emit up to three Gaussians that
+       all share its velocity.  Here every occupied token emits exactly one
+       Gaussian, seeded at its observed medoid, through the plain
+       :class:`GaussianAttributeHead` the fixed-count Dynamic variants (V3-V9)
+       already use.  There is no count predictor, no straight-through opacity
+       gate, no per-K gradient balancing, and no seed bank: the token count and
+       the Gaussian count are the same number, so a per-token velocity is also
+       a per-Gaussian velocity and the two never have to be reconciled.
+
+    Removing the router also removes an index-expansion that quietly weighted
+    every per-token diagnostic and every per-token regularizer by that token's
+    K.  ``velocity_l2`` and the motion statistics are now plain token means.
+    """
+
+    def __init__(self, cfg, gs_params, dim: int, offset_bound: float):
+        # Build the pieces directly rather than through the parent: its
+        # constructor would instantiate a full RoPE temporal stack that this
+        # variant replaces outright.
+        nn.Module.__init__(self)
+        self.cfg = cfg
+        self.dim = int(dim)
+        self.temporal = self._build_temporal(cfg)
+        self.time_reference_sec = float(
+            _cfg_get(cfg.temporal, "time_reference_sec", 1.0)
+        )
+        if self.time_reference_sec <= 0.0:
+            raise ValueError("time_reference_sec must be positive")
+        self.gaussian_head = GaussianAttributeHead(
+            _cfg_get(cfg, "gaussian_head", None),
+            gs_params,
+            self.dim,
+            offset_bound,
+        )
+        self.velocity_head = self._build_velocity_head(cfg)
+
+    def _build_temporal(self, cfg):
+        return GroupedGainBarrierCrossAttention(cfg.temporal, self.dim)
+
+    def _build_velocity_head(self, cfg):
+        """V8's head: ``[LN(f'), MLP(v_init; 3->32->32)] -> 96 -> 3``.
+
+        The refined feature carries head 0's attended *feature* channels, never
+        the metric coordinate expectation itself, so the offset head cannot see
+        what it is correcting unless the initializer is embedded explicitly.
+        """
+        return EmbeddedInitVelocityHead(cfg.motion, self.dim)
+
+    @staticmethod
+    def _signed_pair_delta_t(geometry):
+        local_frame = geometry["local_frame"]
+        if not bool(torch.all((local_frame == 0) | (local_frame == 1))):
+            raise ValueError(
+                "V11.1 attention velocity requires endpoint indices 0/1"
+            )
+        duration = geometry["duration_sec"]
+        if not bool(torch.all(torch.isfinite(duration) & (duration > 0.0))):
+            raise ValueError(
+                "V11.1 attention velocity requires positive finite duration"
+            )
+        return torch.where(local_frame == 0, duration, -duration)
+
+    def _temporal_refine(
+        self,
+        fused_feature,
+        geometry,
+        token_offset,
+        frame_batch_idx,
+        motion_proposal_feature=None,
+    ):
+        del motion_proposal_feature
+        return self.temporal(
+            fused_feature,
+            geometry["token_ref"],
+            token_offset,
+            frame_batch_idx,
+            self._temporal_coordinate(geometry),
+            geometry["duration_sec"],
+        )
+
+    def _predict_motion(self, refined, geometry, position, temporal_fields):
+        del position
+        pair_delta_t_sec = self._signed_pair_delta_t(geometry)
+        delta_p_init = temporal_fields["delta_p_init"]
+        velocity_init = delta_p_init / pair_delta_t_sec.unsqueeze(-1)
+        velocity_offset = self.velocity_head(refined, velocity_init)
+        velocity = velocity_init + velocity_offset
+        return velocity, {
+            "delta_p_match": temporal_fields["delta_p_match"],
+            "delta_p_init": delta_p_init,
+            "matched_position": temporal_fields["matched_position"],
+            "pair_delta_t_sec": pair_delta_t_sec,
+            "velocity_match": velocity_init,
+            "velocity_init": velocity_init,
+            "velocity_offset": velocity_offset,
+            "motion_layer_logits": temporal_fields["motion_layer_logits"],
+            "motion_layer_weights": temporal_fields["motion_layer_weights"],
+        }
+
+
 class ConsensusAttentionVelocityGaussianBackend(
     AttentionInitializedVelocityGaussianBackend
 ):
@@ -5087,7 +5317,10 @@ __all__ = [
     "LayerWeightedAttentionVelocityGaussianBackend",
     "LayerWeightedDistanceBiasCrossAttention",
     "MaxSpeedBarrierLayerWeightedCrossAttention",
+    "GroupedHeadRMSNorm",
+    "GroupedGainBarrierCrossAttention",
     "MaxSpeedBarrierVelocityGaussianBackend",
+    "SingleGaussianBarrierVelocityGaussianBackend",
     "EmbeddedInitDurationVelocityHead",
     "FeatureOnlyVelocityOffsetHead",
     "ParallelBidirectionalCrossAttention",

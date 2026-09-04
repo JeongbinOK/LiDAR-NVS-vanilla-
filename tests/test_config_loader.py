@@ -9,6 +9,7 @@ import torch
 from omegaconf import OmegaConf
 
 from src.config_loader import (
+    ADAPTIVE_COUNT_DYNAMIC_VARIANTS,
     DYNAMIC_VARIANT,
     DYNAMIC_VARIANT_V1,
     DYNAMIC_VARIANT_V3,
@@ -23,6 +24,7 @@ from src.config_loader import (
     DYNAMIC_VARIANT_V9,
     DYNAMIC_VARIANT_V10,
     DYNAMIC_VARIANT_V11,
+    DYNAMIC_VARIANT_V11_1,
     LEGACY_VARIANT,
     assert_model_variant_implemented,
     compose_fresh_config,
@@ -416,7 +418,71 @@ class ConfigLoaderTest(unittest.TestCase):
                     f"model.variant={DYNAMIC_VARIANT_V10}", override,
                 ]))
 
+    def test_v11_1_composes_the_single_gaussian_contract(self):
+        config, _source = compose_fresh_config(OmegaConf.from_dotlist([
+            f"model.variant={DYNAMIC_VARIANT_V11_1}",
+        ]))
+        temporal = config.dynamic_2dgs.temporal
+        # Everything V11 established is inherited unchanged.
+        self.assertEqual(temporal.position_encoding, "barrier_rope_split")
+        self.assertEqual(temporal.barrier_speed_mps, 30.0)
+        self.assertEqual(temporal.barrier_weight, 4.0)
+        self.assertEqual(temporal.rope_base, 100.0)
+        self.assertTrue(temporal.qk_norm)
+        self.assertEqual(config.dynamic_2dgs.regularization.velocity_l2.mode,
+                         "split_group_l2")
+        self.assertTrue(config.p2g.utonia_lora.enable)
+        # One Gaussian per token: no router is configured, and V11.1 is not on
+        # the adaptive-count list that would demand one.
+        self.assertIsNone(OmegaConf.select(config, "p2g.grid_query"))
+        self.assertNotIn(DYNAMIC_VARIANT_V11_1, ADAPTIVE_COUNT_DYNAMIC_VARIANTS)
+        self.assertIn(DYNAMIC_VARIANT_V11, ADAPTIVE_COUNT_DYNAMIC_VARIANTS)
+
+    def test_v11_1_rejects_a_stale_router_block(self):
+        """A grid_query block would be read by nothing, so it is an error."""
+        with self.assertRaises(ValueError) as raised:
+            compose_fresh_config(OmegaConf.from_dotlist([
+                f"model.variant={DYNAMIC_VARIANT_V11_1}",
+                "p2g.grid_query.count_mode=learned_gumbel",
+            ]))
+        self.assertIn("grid_query", str(raised.exception))
+        self.assertIn("V11.1", str(raised.exception))
+
+    def test_neither_barrier_variant_accepts_the_removed_gate_keys(self):
+        """The gate is gone from V11.1 as well, not just absent from V11."""
+        for variant in (DYNAMIC_VARIANT_V11, DYNAMIC_VARIANT_V11_1):
+            for key in (
+                "support_rho_m", "support_gate_lo", "support_gate_width",
+            ):
+                with self.subTest(variant=variant, key=key):
+                    with self.assertRaises(ValueError):
+                        compose_fresh_config(OmegaConf.from_dotlist([
+                            f"model.variant={variant}",
+                            f"dynamic_2dgs.temporal.{key}=1.0",
+                        ]))
+
+    def test_v11_1_validates_the_barrier_geometry(self):
+        for override, message in (
+            ("dynamic_2dgs.temporal.position_encoding=distance_bias",
+             "barrier_rope_split"),
+            ("dynamic_2dgs.temporal.num_heads=1", "num_heads"),
+            ("dynamic_2dgs.temporal.barrier_speed_mps=0.0",
+             "barrier_speed_mps"),
+            ("p2g.utonia_lora.enable=false", "utonia_lora"),
+        ):
+            with self.assertRaises(ValueError) as raised:
+                compose_fresh_config(OmegaConf.from_dotlist([
+                    f"model.variant={DYNAMIC_VARIANT_V11_1}", override,
+                ]))
+            self.assertIn(message, str(raised.exception))
+
     def test_barrier_variant_errors_name_the_variant_they_came_from(self):
+        with self.assertRaises(ValueError) as raised:
+            compose_fresh_config(OmegaConf.from_dotlist([
+                f"model.variant={DYNAMIC_VARIANT_V11_1}",
+                "dynamic_2dgs.temporal.qk_norm=false",
+            ]))
+        self.assertIn("V11.1", str(raised.exception))
         with self.assertRaises(ValueError) as raised:
             compose_fresh_config(OmegaConf.from_dotlist([
                 f"model.variant={DYNAMIC_VARIANT_V11}",

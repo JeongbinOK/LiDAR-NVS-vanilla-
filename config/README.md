@@ -350,6 +350,62 @@ offset-only reg `|v_offset|` also sits at 0.33-0.55 m/s in every such run, i.e.
 the prior pins the correction to near-nothing. Splitting bounds `v_init` directly
 while leaving the correction free to be worth what it explains.
 
+**V11.1** is V11 with two changes, neither of them inside correspondence.
+
+The first is `qk_norm` with **one gain per head group** instead of one shared by
+all twelve heads. Under RMSNorm `|q| = gamma_rms * sqrt(head_dim)` holds exactly
+for every head, so a shared gain pins every head to one logit temperature by
+construction. That is right when the heads share a job and wrong here: head 0
+needs a logit gap near 6.8 for its readout to be metric -- about 37.7 tokens sit
+inside a 2 m ball against about 3735 candidates the barrier admits -- while the
+RoPE feature heads want to keep averaging broadly. V10's shared gain climbed
+1.108 to 1.401 over five epochs with no plateau, i.e. something was demanding
+sharpness and every head was paying for it. The gain splits on exactly the
+head-0/heads-1..H-1 boundary the position encoding already uses, costing 864
+extra parameters, and `attention_temperature_stats` reports
+`qk_max_logit_bound_match` and `qk_max_logit_bound_rope` separately so the match
+head can finally be watched on its own.
+
+Three epochs of measurement say the split is doing real work, and that the two
+groups want opposite things at different depths. Ten of twelve layers diverge by
+more than 5%: head 0 runs 15-25% hotter than the RoPE heads in layers 1-5 (layer
+4: 1.308 against 1.045, a logit ceiling of 10.27 against 6.59) and 4-7% cooler in
+layers 8-11. Layer 4's RoPE gain barely moves at all across two epochs
+(1.037 -> 1.045) while its match gain goes 1.172 -> 1.308. V11's single shared
+gain sits *above both* at nearly every layer (layer mean 1.368 against 1.292 and
+1.215), which is what a compromise pulled by twelve summed gradients looks like.
+The divergence widens every epoch rather than converging back.
+
+The second change is that the **adaptive-K Gaussian router is removed**. V10 and
+V11 route `LN(f')` through a hard Gumbel-Softmax over K={1,2,3} and run only the
+selected K-specific joint head, so one token can emit up to three Gaussians that
+all share its velocity. V11.1 emits exactly one Gaussian per occupied token, at
+that token's observed medoid, through the plain `GaussianAttributeHead` the
+fixed-count Dynamic variants (V3-V9) already use -- so its variant config carries
+**no `p2g.grid_query` block at all**, and one is rejected rather than silently
+ignored. There is no count predictor, no straight-through opacity gate, no per-K
+gradient balancing and no seed bank. Token count and Gaussian count become the
+same number, which also removes an index expansion that quietly weighted every
+per-token diagnostic and every per-token regularizer by that token's K:
+`velocity_l2` and the motion statistics are now plain token means. Measured peak
+memory is unchanged (31.1 GiB against V11's 31.4 at 12 layers, `batch_size=2`).
+
+An **earlier V11.1 also gated the readout** by how much attention mass sat within
+`support_rho_m` of it, through a saturating ramp `clip((W - lo)/width, 0, 1)` with
+`lo` learned. That gate has been removed, and the reason generalizes. `lo`
+received gradient only from tokens inside the ramp, and that band is a sliding
+window that always sits on the least-supported tokens still open. Their render
+gradient always says "close me", and a token already closed is clamped, so it can
+never argue back -- the counterfactual is invisible to the optimizer. `lo`
+therefore climbed at a constant 0.033/epoch (0.006 -> 0.026 -> 0.059 -> 0.092,
+perfectly linear) while the statistic it thresholded grew far more slowly (W p90
+0.016 -> 0.026 -> 0.032). By epoch 3 the gate was shut on 98.4% of Gaussians and
+was discarding 92% of the matcher's displacement (`|v_init|` 0.049 m/s against an
+ungated `|v_match|` of 0.644), and V11.1 trailed V11 on depth, raydrop and
+chamfer at every epoch boundary. Abstention needs a *distribution-referenced*
+threshold -- a running quantile of the support statistic, say -- not an absolute
+one learned by gradient.
+
 `barrier_weight` stays at 4. Re-scoring V11's trained head-0 features at other
 weights shows a=0 to a=4 is decisive (mass beyond the radius 11.2% -> 0.85%,
 `|dp|` 8.5 m -> 2.26 m) and a=4 to a=64 changes nothing past the fourth decimal:

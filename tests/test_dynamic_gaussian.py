@@ -33,6 +33,9 @@ from src.models_new.module.dynamic_gaussian import (
     LayerWeightedDistanceBiasCrossAttention,
     MaxSpeedBarrierLayerWeightedCrossAttention,
     MaxSpeedBarrierVelocityGaussianBackend,
+    GroupedHeadRMSNorm,
+    GroupedGainBarrierCrossAttention,
+    SingleGaussianBarrierVelocityGaussianBackend,
     PhysicalVelocityGaussianBackend,
     PostAttentionProposalVelocityGaussianBackend,
     ProjectedDenseMotionProposal,
@@ -329,6 +332,23 @@ def v11_backend_cfg(dim=24):
         "zero_init": True,
         "residual_hidden_dim": 8,
     })
+    return cfg
+
+
+def v11_1_temporal_cfg(dim=24, heads=4, layers=3, match_chunk_size=2):
+    # V11.1's temporal config is V11's; only the QK gain's shape differs, and
+    # that is a module decision rather than a configured one.
+    return v11_temporal_cfg(
+        dim=dim, heads=heads, layers=layers,
+        match_chunk_size=match_chunk_size,
+    )
+
+
+def v11_1_backend_cfg(dim=24):
+    cfg = v11_backend_cfg(dim=dim)
+    cfg.temporal = v11_1_temporal_cfg(dim=dim)
+    cfg.motion.velocity_embedding_dim = 8
+    cfg.motion.detach_init_condition = True
     return cfg
 
 
@@ -3443,6 +3463,251 @@ class V11MaxSpeedBarrierAttentionTest(unittest.TestCase):
             )
         speed = float(fields["delta_p_init"][0].norm() / duration)
         self.assertLess(speed, 30.0)
+
+
+class V11_1GroupedGainSingleGaussianTest(unittest.TestCase):
+    """V11.1 = V11's stack, a two-group QK gain, one Gaussian per token."""
+
+    @staticmethod
+    def _forward_args(feature, position, first_frame_tokens, duration=0.8):
+        total = feature.shape[0]
+        time = torch.cat([
+            torch.zeros(first_frame_tokens),
+            torch.full((total - first_frame_tokens,), duration),
+        ])
+        return (
+            feature,
+            position,
+            torch.tensor([first_frame_tokens, total]),
+            torch.tensor([0, 0]),
+            time,
+            torch.full((total,), duration),
+        )
+
+    def test_the_gain_carries_one_row_per_head_group(self):
+        module = GroupedGainBarrierCrossAttention(
+            v11_1_temporal_cfg(layers=2), dim=24
+        )
+        for layer in range(2):
+            for norm in (module.q_norm[layer], module.k_norm[layer]):
+                self.assertIsInstance(norm, GroupedHeadRMSNorm)
+                self.assertEqual(norm.num_groups, 2)
+                self.assertEqual(
+                    tuple(norm.weight.shape), (2, module.head_dim)
+                )
+                # Group 0 is the match head; every RoPE head shares group 1.
+                self.assertEqual(
+                    norm.group_of_head.tolist(), [0, 1, 1, 1]
+                )
+
+    def test_a_uniform_gain_reproduces_the_v11_readout(self):
+        torch.manual_seed(0)
+        module = GroupedGainBarrierCrossAttention(
+            v11_1_temporal_cfg(layers=2), dim=24
+        ).eval()
+        reference = MaxSpeedBarrierLayerWeightedCrossAttention(
+            v11_temporal_cfg(layers=2), dim=24
+        ).eval()
+        state = module.state_dict()
+        collapsed = {}
+        for name, value in state.items():
+            if ".weight" in name and (
+                name.startswith("q_norm") or name.startswith("k_norm")
+            ):
+                # Both rows equal, so the split gain is the shared gain.
+                value = value[0]
+            collapsed[name] = value
+        reference.load_state_dict(collapsed, strict=True)
+
+        feature = torch.randn(9, 24)
+        position = torch.randn(9, 3) * 4.0
+        args = self._forward_args(feature, position, 4)
+        with torch.no_grad():
+            refined, fields = module(*args)
+            ref_refined, ref_fields = reference(*args)
+        # Not bitwise: nn.RMSNorm runs a fused kernel while the grouped gain
+        # does the same arithmetic with an explicit rsqrt and an index gather,
+        # so the two reduce in a different order. On a real 28,760-token batch
+        # the readouts agree to a relative 2.7e-06, against a 1.07 m response
+        # to actually scaling the match group's gain.
+        torch.testing.assert_close(refined, ref_refined)
+        self.assertEqual(sorted(fields), sorted(ref_fields))
+        for key in ("delta_p_init", "delta_p_match", "matched_position"):
+            torch.testing.assert_close(fields[key], ref_fields[key])
+
+    def test_each_group_moves_under_its_own_gradient(self):
+        torch.manual_seed(1)
+        module = GroupedGainBarrierCrossAttention(
+            v11_1_temporal_cfg(layers=1), dim=24
+        )
+        feature = torch.randn(8, 24, requires_grad=True)
+        position = torch.randn(8, 3) * 3.0
+        _refined, fields = module(*self._forward_args(feature, position, 4))
+        fields["delta_p_init"].square().sum().backward()
+        gain = module.q_norm[0].weight.grad
+        self.assertIsNotNone(gain)
+        self.assertEqual(tuple(gain.shape), (2, module.head_dim))
+        # The readout only passes through head 0, so only its row is charged
+        # by a displacement objective. That separation is the whole point.
+        self.assertGreater(float(gain[0].abs().sum()), 0.0)
+        self.assertEqual(float(gain[1].abs().sum()), 0.0)
+
+    def test_stats_report_the_two_groups_separately(self):
+        module = GroupedGainBarrierCrossAttention(
+            v11_1_temporal_cfg(layers=2), dim=24
+        )
+        with torch.no_grad():
+            module.q_norm[0].weight[0].mul_(2.0)
+        stats = module.attention_temperature_stats()
+        self.assertAlmostEqual(stats["qk_gamma_q_match_layer0"], 2.0, places=5)
+        self.assertAlmostEqual(stats["qk_gamma_q_rope_layer0"], 1.0, places=5)
+        self.assertGreater(
+            stats["qk_max_logit_bound_match"],
+            stats["qk_max_logit_bound_rope"],
+        )
+        self.assertEqual(
+            stats["qk_max_logit_bound"], stats["qk_max_logit_bound_match"]
+        )
+        # The gate is gone; nothing should still advertise it.
+        for name in stats:
+            self.assertNotIn("support", name)
+
+    def test_no_gate_field_survives_on_the_temporal_output(self):
+        torch.manual_seed(2)
+        module = GroupedGainBarrierCrossAttention(
+            v11_1_temporal_cfg(layers=1), dim=24
+        ).eval()
+        feature = torch.randn(8, 24)
+        position = torch.randn(8, 3) * 3.0
+        with torch.no_grad():
+            _refined, fields = module(*self._forward_args(feature, position, 4))
+        self.assertEqual(
+            set(fields),
+            {
+                "delta_p_match", "delta_p_init", "matched_position",
+                "motion_layer_logits", "motion_layer_weights",
+            },
+        )
+        # Nothing scales the readout any more, so the two are the same tensor.
+        torch.testing.assert_close(
+            fields["delta_p_init"], fields["delta_p_match"]
+        )
+        self.assertFalse(
+            any(hasattr(module, name) for name in (
+                "support_lo", "support_rho_m", "support_gate_width",
+            ))
+        )
+
+    def test_the_backend_emits_exactly_one_gaussian_per_token(self):
+        torch.manual_seed(3)
+        backend = SingleGaussianBarrierVelocityGaussianBackend(
+            v11_1_backend_cfg(dim=24), _gs_params(), dim=24, offset_bound=0.8,
+        ).eval()
+        self.assertIsInstance(
+            backend.temporal, GroupedGainBarrierCrossAttention
+        )
+        self.assertIsInstance(backend.gaussian_head, GaussianAttributeHead)
+        # No router, no seed bank, no per-K experts.
+        for name in ("count_predictor", "k_heads", "gaussian_output_norm"):
+            self.assertFalse(hasattr(backend, name))
+            self.assertFalse(hasattr(backend.gaussian_head, name))
+
+        tokens, first = 10, 5
+        feature = torch.randn(tokens, 24)
+        position = torch.randn(tokens, 3) * 4.0
+        with torch.no_grad():
+            out = backend(
+                feature,
+                position,
+                position.unsqueeze(1).clone(),
+                torch.tensor([first, tokens]),
+                torch.tensor([0, 0]),
+                [torch.eye(4).repeat(2, 1, 1)],
+                [torch.tensor([0.0, 1.0])],
+                [torch.tensor([0.0, 0.8])],
+                torch.tensor([0.8]),
+            )
+        item = out["batch_gaussians"][0]
+        self.assertEqual(item["position"].shape, (tokens, 3))
+        self.assertEqual(item["velocity"].shape, (tokens, 3))
+        # One Gaussian per token means the packing indices vanish entirely.
+        for name in ("selected_k", "gaussian_slot_index", "source_token_index"):
+            self.assertNotIn(name, item)
+        self.assertIsNone(out.get("routing_stats"))
+
+    def test_the_backend_publishes_the_v11_motion_fields(self):
+        torch.manual_seed(4)
+        backend = SingleGaussianBarrierVelocityGaussianBackend(
+            v11_1_backend_cfg(dim=24), _gs_params(), dim=24, offset_bound=0.8,
+        ).eval()
+        tokens, first, duration = 10, 5, 0.8
+        feature = torch.randn(tokens, 24)
+        position = torch.randn(tokens, 3) * 4.0
+        with torch.no_grad():
+            out = backend(
+                feature,
+                position,
+                position.unsqueeze(1).clone(),
+                torch.tensor([first, tokens]),
+                torch.tensor([0, 0]),
+                [torch.eye(4).repeat(2, 1, 1)],
+                [torch.tensor([0.0, 1.0])],
+                [torch.tensor([0.0, duration])],
+                torch.tensor([duration]),
+            )
+        item = out["batch_gaussians"][0]
+        for name in (
+            "velocity_init", "velocity_offset", "velocity_match",
+            "delta_p_init", "delta_p_match", "matched_position",
+            "motion_layer_weights",
+        ):
+            self.assertIn(name, item)
+        # Nothing is gated, so match and init agree and the prior has one value
+        # to charge rather than two.
+        torch.testing.assert_close(
+            item["velocity_match"], item["velocity_init"]
+        )
+        self.assertNotIn("velocity_init_ungated", item)
+        torch.testing.assert_close(
+            item["velocity"],
+            item["velocity_init"] + item["velocity_offset"],
+        )
+        # Frame 0 travels forward, frame 1 backward, over one endpoint interval.
+        signed = torch.where(
+            torch.arange(tokens) < first,
+            torch.full((tokens,), duration),
+            torch.full((tokens,), -duration),
+        )
+        torch.testing.assert_close(
+            item["velocity_init"],
+            item["delta_p_init"] / signed.unsqueeze(-1),
+        )
+
+    def test_zero_initialized_offset_starts_at_the_initializer(self):
+        torch.manual_seed(5)
+        backend = SingleGaussianBarrierVelocityGaussianBackend(
+            v11_1_backend_cfg(dim=24), _gs_params(), dim=24, offset_bound=0.8,
+        ).eval()
+        tokens, first = 8, 4
+        feature = torch.randn(tokens, 24)
+        position = torch.randn(tokens, 3) * 4.0
+        with torch.no_grad():
+            out = backend(
+                feature,
+                position,
+                position.unsqueeze(1).clone(),
+                torch.tensor([first, tokens]),
+                torch.tensor([0, 0]),
+                [torch.eye(4).repeat(2, 1, 1)],
+                [torch.tensor([0.0, 1.0])],
+                [torch.tensor([0.0, 0.8])],
+                torch.tensor([0.8]),
+            )
+        item = out["batch_gaussians"][0]
+        torch.testing.assert_close(
+            item["velocity_offset"], torch.zeros_like(item["velocity_offset"])
+        )
+        torch.testing.assert_close(item["velocity"], item["velocity_init"])
 
 
 class V8ConsensusAttentionTest(unittest.TestCase):
