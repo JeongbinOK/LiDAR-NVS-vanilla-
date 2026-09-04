@@ -5,7 +5,7 @@ import math
 import unittest
 import tempfile
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import numpy as np
 import torch
@@ -27,9 +27,12 @@ from src.models_new.module.dynamic_gaussian import (
     EmbeddedInitDurationVelocityHead,
     EmbeddedInitVelocityHead,
     FeatureOnlyVelocityOffsetHead,
+    GaussianAttributeHead,
     InitConditionedVelocityHead,
     LayerWeightedAttentionVelocityGaussianBackend,
     LayerWeightedDistanceBiasCrossAttention,
+    MaxSpeedBarrierLayerWeightedCrossAttention,
+    MaxSpeedBarrierVelocityGaussianBackend,
     PhysicalVelocityGaussianBackend,
     PostAttentionProposalVelocityGaussianBackend,
     ProjectedDenseMotionProposal,
@@ -98,6 +101,12 @@ def v7_temporal_cfg(dim=24, heads=4, layers=2):
         "rope_base": 100.0,
         "rope_position_scale": 2.0 * torch.pi / 5.0,
         "layer_scale_init": 0.1,
+    })
+
+
+def _gs_params():
+    return OmegaConf.create({
+        "shs": 32, "opacity": 1, "scaling": 2, "rotation": 4, "offset": 3,
     })
 
 
@@ -291,6 +300,38 @@ def v10_backend_cfg(dim=24):
     return cfg
 
 
+def v11_temporal_cfg(dim=24, heads=4, layers=3, match_chunk_size=2):
+    del dim
+    return OmegaConf.create({
+        "implementation": "auto",
+        "layers": layers,
+        "num_heads": heads,
+        "mlp_ratio": 2,
+        "use_time_embedding": True,
+        "time_embedding_dim": 8,
+        "time_frequencies": 4,
+        "time_reference_sec": 1.0,
+        "position_encoding": "barrier_rope_split",
+        "barrier_speed_mps": 30.0,
+        "barrier_weight": 4.0,
+        "match_chunk_size": match_chunk_size,
+        "rope_base": 100.0,
+        "rope_position_scale": 2.0 * math.pi / 5.0,
+        "qk_norm": True,
+        "layer_scale_init": 0.1,
+    })
+
+
+def v11_backend_cfg(dim=24):
+    cfg = backend_cfg(dim=dim)
+    cfg.temporal = v11_temporal_cfg(dim=dim)
+    cfg.motion = OmegaConf.create({
+        "zero_init": True,
+        "residual_hidden_dim": 8,
+    })
+    return cfg
+
+
 def v8_backend_cfg(dim=24):
     cfg = attention_backend_cfg(
         dim=dim, heads=4, motion_head_count=4
@@ -373,6 +414,41 @@ class DynamicGaussianTest(unittest.TestCase):
             losses,
             items,
             prefix=prefix,
+        )
+        return losses
+
+    @staticmethod
+    def _apply_split_velocity_l2(
+        inits, offsets, *, prefix="train", init_weight=0.01,
+        offset_weight=0.01, step=0,
+    ):
+        wrapper = SimpleNamespace(
+            _velocity_l2_cfg=OmegaConf.create({
+                "enabled": True,
+                "mode": "split_group_l2",
+                "init_weight": init_weight,
+                "offset_weight": offset_weight,
+                "warmup_steps": 0,
+                "ramp_steps": 0,
+            }),
+            _velocity_l2_mode="split_group_l2",
+            global_step=step,
+            _active_motion_items=ModelWrapper._active_motion_items,
+        )
+        wrapper._add_split_velocity_l2_prior = MethodType(
+            ModelWrapper._add_split_velocity_l2_prior, wrapper
+        )
+        losses = {"total": torch.zeros(())}
+        items = [
+            {
+                "velocity": init + offset,
+                "velocity_init": init,
+                "velocity_offset": offset,
+            }
+            for init, offset in zip(inits, offsets)
+        ]
+        ModelWrapper._add_velocity_l2_prior(
+            wrapper, losses, items, prefix=prefix
         )
         return losses
 
@@ -485,6 +561,146 @@ class DynamicGaussianTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires every active"):
             self._apply_velocity_l2(
                 [torch.zeros(1, 3)], mode="offset_l2"
+            )
+
+    def test_offset_group_l2_is_the_squared_norm_of_the_residual_only(self):
+        final_velocity = torch.tensor([[30.0, 0.0, 0.0]], requires_grad=True)
+        velocity_offset = torch.tensor([[3.0, 4.0, 0.0]], requires_grad=True)
+        losses = self._apply_velocity_l2(
+            [final_velocity],
+            offsets=[velocity_offset],
+            weight=0.01,
+            mode="offset_group_l2",
+        )
+        # mean(||v_offset||^2), i.e. exactly 3x offset_l2 at the same weight.
+        self.assertAlmostEqual(
+            float(losses["loss_velocity_l2"]), 25.0, places=5
+        )
+        component = self._apply_velocity_l2(
+            [torch.tensor([[30.0, 0.0, 0.0]])],
+            offsets=[torch.tensor([[3.0, 4.0, 0.0]])],
+            weight=0.01,
+            mode="offset_l2",
+        )
+        self.assertAlmostEqual(
+            float(losses["loss_velocity_l2"]),
+            3.0 * float(component["loss_velocity_l2"]),
+            places=5,
+        )
+        losses["total"].backward()
+        # v_init reaches the prior through no path at all.
+        self.assertIsNone(final_velocity.grad)
+        torch.testing.assert_close(
+            velocity_offset.grad, torch.tensor([[0.06, 0.08, 0.0]])
+        )
+
+    def test_offset_group_l2_pools_gaussians_not_components(self):
+        losses = self._apply_velocity_l2(
+            [torch.zeros(9, 3), torch.zeros(1, 3)],
+            offsets=[torch.zeros(9, 3), torch.full((1, 3), 2.0)],
+            mode="offset_group_l2",
+        )
+        self.assertAlmostEqual(float(losses["loss_velocity_l2"]), 1.2, places=5)
+
+    def test_split_group_l2_charges_init_and_offset_independently(self):
+        velocity_init = torch.tensor([[3.0, 4.0, 0.0]], requires_grad=True)
+        velocity_offset = torch.tensor([[0.0, 0.0, 2.0]], requires_grad=True)
+        losses = self._apply_split_velocity_l2(
+            [velocity_init], [velocity_offset],
+            init_weight=0.01, offset_weight=0.02,
+        )
+        self.assertAlmostEqual(
+            float(losses["loss_velocity_l2_init"]), 25.0, places=5
+        )
+        self.assertAlmostEqual(
+            float(losses["loss_velocity_l2_offset"]), 4.0, places=5
+        )
+        # loss_velocity_l2 stays raw and unweighted, as in every other mode;
+        # only `total` sees init_weight/offset_weight.
+        self.assertAlmostEqual(
+            float(losses["loss_velocity_l2"]), 25.0 + 4.0, places=5
+        )
+        self.assertAlmostEqual(
+            float(losses["total"]), 0.01 * 25.0 + 0.02 * 4.0, places=6
+        )
+        losses["total"].backward()
+        torch.testing.assert_close(
+            velocity_init.grad, torch.tensor([[0.06, 0.08, 0.0]])
+        )
+        torch.testing.assert_close(
+            velocity_offset.grad, torch.tensor([[0.0, 0.0, 0.08]])
+        )
+
+    def test_split_group_l2_has_no_cancellation_cross_term(self):
+        """An offset that merely negates v_init must not be free."""
+        opposed = torch.tensor([[-3.0, -4.0, 0.0]])
+        aligned = torch.tensor([[3.0, 4.0, 0.0]])
+        init = torch.tensor([[3.0, 4.0, 0.0]])
+        split_opposed = self._apply_split_velocity_l2(
+            [init], [opposed], init_weight=0.01, offset_weight=0.01
+        )
+        split_aligned = self._apply_split_velocity_l2(
+            [init], [aligned], init_weight=0.01, offset_weight=0.01
+        )
+        # Both offsets have the same magnitude, so the split prior is blind to
+        # the sign; only the render loss decides direction.
+        self.assertAlmostEqual(
+            float(split_opposed["total"]), float(split_aligned["total"]),
+            places=6,
+        )
+        # final_group_l2 on the sum instead rewards the cancelling offset.
+        total_opposed = self._apply_velocity_l2(
+            [init + opposed], weight=0.01, mode="final_group_l2"
+        )
+        total_aligned = self._apply_velocity_l2(
+            [init + aligned], weight=0.01, mode="final_group_l2"
+        )
+        self.assertLess(
+            float(total_opposed["loss_velocity_l2"]),
+            float(total_aligned["loss_velocity_l2"]),
+        )
+        self.assertAlmostEqual(
+            float(total_opposed["loss_velocity_l2"]), 0.0, places=6
+        )
+
+    def test_split_group_l2_reports_but_does_not_optimize_validation(self):
+        losses = self._apply_split_velocity_l2(
+            [torch.tensor([[3.0, 4.0, 0.0]])],
+            [torch.tensor([[1.0, 0.0, 0.0]])],
+            prefix="val",
+        )
+        self.assertIn("loss_velocity_l2_init", losses)
+        self.assertIn("loss_velocity_l2_offset", losses)
+        self.assertNotIn("wc_velocity_l2", losses)
+        self.assertEqual(float(losses["total"]), 0.0)
+
+    def test_split_group_l2_requires_both_velocity_fields(self):
+        wrapper = SimpleNamespace(
+            _velocity_l2_cfg=OmegaConf.create({
+                "enabled": True, "mode": "split_group_l2",
+                "init_weight": 0.01, "offset_weight": 0.01,
+                "warmup_steps": 0, "ramp_steps": 0,
+            }),
+            _velocity_l2_mode="split_group_l2",
+            global_step=0,
+            _active_motion_items=ModelWrapper._active_motion_items,
+        )
+        wrapper._add_split_velocity_l2_prior = MethodType(
+            ModelWrapper._add_split_velocity_l2_prior, wrapper
+        )
+        losses = {"total": torch.zeros(())}
+        with self.assertRaisesRegex(ValueError, "velocity_init"):
+            ModelWrapper._add_velocity_l2_prior(
+                wrapper,
+                losses,
+                [{"velocity": torch.zeros(1, 3)}],
+                prefix="train",
+            )
+
+    def test_offset_group_l2_requires_velocity_offset_field(self):
+        with self.assertRaisesRegex(ValueError, "requires every active"):
+            self._apply_velocity_l2(
+                [torch.zeros(1, 3)], mode="offset_group_l2"
             )
 
     def test_irregular_pair_keeps_normalized_and_physical_time(self):
@@ -2868,6 +3084,365 @@ class V10LayerWeightedAttentionTest(unittest.TestCase):
         self.assertIsNotNone(router_grad)
         self.assertGreater(float(router_grad.abs().sum()), 0.0)
         self.assertGreater(float(feature.grad.abs().sum()), 0.0)
+
+
+class V11MaxSpeedBarrierAttentionTest(unittest.TestCase):
+    @staticmethod
+    def _forward_args(feature, position, first_frame_tokens, duration=0.8):
+        total = feature.shape[0]
+        time = torch.cat([
+            torch.zeros(first_frame_tokens),
+            torch.full((total - first_frame_tokens,), duration),
+        ])
+        return (
+            feature,
+            position,
+            torch.tensor([first_frame_tokens, total]),
+            torch.tensor([0, 0]),
+            time,
+            torch.full((total,), duration),
+        )
+
+    def test_barrier_is_free_inside_the_reachable_radius(self):
+        module = MaxSpeedBarrierLayerWeightedCrossAttention(
+            v11_temporal_cfg(layers=1), dim=24
+        )
+        query = torch.zeros(1, 3)
+        # 0.5R, R, 1.5R, 2R and 3R at a 30 m radius (30 m/s over 1.0 s).
+        key = torch.tensor([
+            [15.0, 0.0, 0.0], [30.0, 0.0, 0.0], [45.0, 0.0, 0.0],
+            [60.0, 0.0, 0.0], [90.0, 0.0, 0.0],
+        ])
+        bias = module._barrier_bias(query, key, 30.0)
+        torch.testing.assert_close(
+            bias, torch.tensor([[0.0, 0.0, 1.0, 4.0, 16.0]])
+        )
+        # The radius follows the physical endpoint interval, not the distance.
+        halved = module._barrier_bias(query, key, 15.0)
+        torch.testing.assert_close(
+            halved, torch.tensor([[0.0, 4.0, 16.0, 36.0, 100.0]])
+        )
+
+    def test_fused_score_matches_the_reference_barrier_form(self):
+        """`(a/R^2) relu(d-R)^2` in the GEMM must equal `a relu(d/R-1)^2`."""
+        torch.manual_seed(13)
+        module = MaxSpeedBarrierLayerWeightedCrossAttention(
+            v11_temporal_cfg(layers=1), dim=24
+        )
+        query = torch.randn(5, module.head_dim)
+        key = torch.randn(7, module.head_dim)
+        value = torch.randn(7, module.head_dim + 3)
+        query_position = torch.randn(5, 3) * 40.0
+        key_position = torch.randn(7, 3) * 40.0
+        radius = 21.0
+
+        feature, matched = module._barrier_chunk(
+            query, key, value, query_position, key_position, radius
+        )
+        reference_score = (query @ key.transpose(0, 1)) * module.scale
+        reference_score = reference_score - module._barrier_bias(
+            query_position, key_position, radius
+        )
+        expected = torch.softmax(reference_score, dim=-1) @ value
+        torch.testing.assert_close(
+            feature, expected[..., :module.head_dim], atol=1.0e-5, rtol=1.0e-5
+        )
+        torch.testing.assert_close(
+            matched, expected[..., module.head_dim:], atol=1.0e-5, rtol=1.0e-5
+        )
+
+    def test_mixed_durations_within_a_frame_are_rejected(self):
+        module = MaxSpeedBarrierLayerWeightedCrossAttention(
+            v11_temporal_cfg(layers=1), dim=24
+        )
+        feature = torch.randn(6, 24)
+        position = torch.randn(6, 3)
+        duration = torch.tensor([0.8, 0.8, 0.5, 0.8, 0.8, 0.8])
+        with self.assertRaisesRegex(ValueError, "one endpoint interval"):
+            module(
+                feature,
+                position,
+                torch.tensor([3, 6]),
+                torch.tensor([0, 0]),
+                torch.tensor([0.0, 0.0, 0.0, 0.8, 0.8, 0.8]),
+                duration,
+            )
+
+    def test_match_head_readout_equals_an_explicit_biased_softmax(self):
+        torch.manual_seed(3)
+        module = MaxSpeedBarrierLayerWeightedCrossAttention(
+            v11_temporal_cfg(layers=1, match_chunk_size=4), dim=24
+        ).eval()
+        feature = torch.randn(9, 24)
+        position = torch.randn(9, 3) * 30.0
+
+        captured = {}
+        original = module._barrier_attention
+
+        def capture(query, key, value, query_position, key_position,
+                    q_count_values, k_count_values, frame_radius_values):
+            captured.update(
+                query=query, key=key, query_position=query_position,
+                key_position=key_position, q_counts=q_count_values,
+                k_counts=k_count_values, radii=frame_radius_values,
+            )
+            return original(
+                query, key, value, query_position, key_position,
+                q_count_values, k_count_values, frame_radius_values,
+            )
+
+        module._barrier_attention = capture
+        with torch.no_grad():
+            _refined, fields = module(
+                *self._forward_args(feature, position, 4, duration=0.7)
+            )
+
+        # Only head 0 ever reaches the coordinate readout.
+        self.assertEqual(tuple(captured["query"].shape), (9, module.head_dim))
+        start = 0
+        key_start = 0
+        # 30 m/s over the 0.7 s endpoint interval.
+        self.assertEqual(len(captured["radii"]), 2)
+        for radius in captured["radii"]:
+            self.assertAlmostEqual(radius, 21.0, places=4)
+        for q_count, k_count, radius in zip(
+            captured["q_counts"], captured["k_counts"], captured["radii"]
+        ):
+            rows = slice(start, start + q_count)
+            keys = slice(key_start, key_start + k_count)
+            query_position = captured["query_position"][rows]
+            key_position = captured["key_position"][keys]
+            score = (
+                captured["query"][rows] @ captured["key"][keys].transpose(0, 1)
+            ) * module.scale - 4.0 * torch.relu(
+                torch.cdist(query_position, key_position) / radius - 1.0
+            ).square()
+            expected = torch.softmax(score, dim=-1) @ key_position
+            torch.testing.assert_close(
+                fields["matched_position"][rows], expected, atol=1.0e-4,
+                rtol=1.0e-4,
+            )
+            start += q_count
+            key_start += k_count
+        torch.testing.assert_close(
+            fields["delta_p_init"], fields["matched_position"] - position
+        )
+
+    def test_query_chunking_changes_neither_output_nor_gradient(self):
+        reference = None
+        for chunk in (1, 3, 1000):
+            torch.manual_seed(7)
+            module = MaxSpeedBarrierLayerWeightedCrossAttention(
+                v11_temporal_cfg(layers=2, match_chunk_size=chunk), dim=24
+            ).train()
+            torch.manual_seed(11)
+            feature = torch.randn(11, 24, requires_grad=True)
+            position = torch.randn(11, 3) * 25.0
+            refined, fields = module(
+                *self._forward_args(feature, position, 5, duration=0.9)
+            )
+            (
+                refined.square().sum()
+                + fields["matched_position"].square().sum()
+            ).backward()
+            observed = (
+                refined.detach(),
+                fields["matched_position"].detach(),
+                feature.grad.clone(),
+                module.q_proj[0].weight.grad.clone(),
+            )
+            if reference is None:
+                reference = observed
+                continue
+            for expected, actual in zip(reference, observed):
+                torch.testing.assert_close(
+                    actual, expected, atol=1.0e-5, rtol=1.0e-4
+                )
+
+    def test_rope_covers_every_head_but_the_match_head(self):
+        module = MaxSpeedBarrierLayerWeightedCrossAttention(
+            v11_temporal_cfg(layers=2, heads=4), dim=24
+        ).eval()
+        self.assertEqual(module.rope_head_count, 3)
+        rotated_shapes = []
+        original_rotate = module.rope.rotate
+
+        def capture(x, angles):
+            rotated_shapes.append(tuple(x.shape))
+            return original_rotate(x, angles)
+
+        module.rope.rotate = capture
+        feature = torch.randn(6, 24)
+        position = torch.randn(6, 3) * 10.0
+        with torch.no_grad():
+            module(*self._forward_args(feature, position, 3))
+        # Two layers x (Q, K), each carrying heads 1..3 only.
+        self.assertEqual(len(rotated_shapes), 4)
+        for shape in rotated_shapes:
+            self.assertEqual(shape, (6, 3, module.head_dim))
+
+    def test_layer_mixture_is_uniform_scalars_that_receive_gradient(self):
+        torch.manual_seed(41)
+        module = MaxSpeedBarrierLayerWeightedCrossAttention(
+            v11_temporal_cfg(layers=3), dim=24
+        )
+        self.assertFalse(hasattr(module, "global_token"))
+        self.assertFalse(hasattr(module, "layer_score_mlp"))
+        self.assertEqual(tuple(module.layer_logits.shape), (3,))
+        torch.testing.assert_close(module.layer_logits, torch.zeros(3))
+
+        feature = torch.randn(7, 24, requires_grad=True)
+        position = torch.randn(7, 3) * 12.0
+        refined, fields = module(
+            *self._forward_args(feature, position, 3)
+        )
+        self.assertEqual(tuple(refined.shape), (7, 24))
+        # One shared mixture, broadcast to every token rather than predicted.
+        torch.testing.assert_close(
+            fields["motion_layer_weights"], torch.full((7, 3), 1.0 / 3.0)
+        )
+        torch.testing.assert_close(
+            fields["motion_layer_logits"], torch.zeros(7, 3)
+        )
+
+        loss = fields["matched_position"].square().sum() + refined.square().mean()
+        loss.backward()
+        self.assertGreater(float(feature.grad.abs().sum()), 0.0)
+        self.assertGreater(float(module.layer_logits.grad.abs().sum()), 0.0)
+        for layer in range(module.n_layers):
+            self.assertGreater(
+                float(module.q_proj[layer].weight.grad.abs().sum()), 0.0
+            )
+            self.assertGreater(
+                float(module.k_proj[layer].weight.grad.abs().sum()), 0.0
+            )
+
+    def test_layer_weights_select_a_single_layer_readout(self):
+        module = MaxSpeedBarrierLayerWeightedCrossAttention(
+            v11_temporal_cfg(layers=3), dim=24
+        )
+        with torch.no_grad():
+            module.layer_logits.copy_(torch.tensor([-20.0, 20.0, -20.0]))
+        layer_matches = torch.tensor([
+            [[1.0, 0.0, 0.0], [3.0, 0.0, 0.0], [5.0, 0.0, 0.0]],
+            [[2.0, 1.0, 0.0], [4.0, 1.0, 0.0], [6.0, 1.0, 0.0]],
+        ])
+        position = torch.tensor([[0.5, 0.0, 0.0], [1.0, 1.0, 0.0]])
+        matched, displacement, logits, weights = module._combine_layer_matches(
+            layer_matches, position
+        )
+        torch.testing.assert_close(matched, layer_matches[:, 1], atol=1.0e-6,
+                                   rtol=1.0e-6)
+        torch.testing.assert_close(displacement, matched - position)
+        torch.testing.assert_close(weights[:, 1], torch.ones(2), atol=1.0e-6,
+                                   rtol=1.0e-6)
+        torch.testing.assert_close(
+            logits, module.layer_logits.expand(2, -1)
+        )
+
+    def test_config_rejects_a_single_head_and_a_missing_barrier(self):
+        with self.assertRaises(ValueError):
+            MaxSpeedBarrierLayerWeightedCrossAttention(
+                v11_temporal_cfg(layers=1, heads=1), dim=24
+            )
+        no_qk_norm = v11_temporal_cfg(layers=1)
+        no_qk_norm.qk_norm = False
+        with self.assertRaises(ValueError):
+            MaxSpeedBarrierLayerWeightedCrossAttention(no_qk_norm, dim=24)
+        wrong_encoding = v11_temporal_cfg(layers=1)
+        wrong_encoding.position_encoding = "distance_bias"
+        with self.assertRaises(ValueError):
+            MaxSpeedBarrierLayerWeightedCrossAttention(wrong_encoding, dim=24)
+
+    def test_backend_shares_one_token_velocity_across_adaptive_gaussians(self):
+        torch.manual_seed(29)
+        gs_params = OmegaConf.create({
+            "shs": 32, "opacity": 1, "scaling": 2, "rotation": 4, "offset": 3,
+        })
+        backend = MaxSpeedBarrierVelocityGaussianBackend(
+            v11_backend_cfg(), gs_params, dim=24, offset_bound=0.8,
+            gaussian_count_cfg=v10_gaussian_count_cfg(),
+        ).eval()
+        self.assertIsInstance(
+            backend.temporal, MaxSpeedBarrierLayerWeightedCrossAttention
+        )
+        self.assertEqual(backend.gaussian_head.count_mode, "learned_gumbel")
+        self.assertEqual(backend.gaussian_head.k_max, 3)
+        # V11 conditions the offset on the initializer it corrects.
+        self.assertIsInstance(backend.velocity_head, EmbeddedInitVelocityHead)
+        self.assertEqual(backend.velocity_head.velocity_embedding_dim, 32)
+        self.assertTrue(backend.velocity_head.detach_init_condition)
+        encoder = backend.velocity_head.velocity_encoder
+        self.assertEqual(encoder[0].in_features, 3)
+        self.assertEqual(encoder[-1].out_features, 32)
+        self.assertEqual(
+            backend.velocity_head.motion_refiner[0].in_features, 24 + 32
+        )
+        with torch.no_grad():
+            backend.gaussian_head.count_predictor[-1].bias.copy_(
+                torch.tensor([-10.0, -10.0, 10.0])
+            )
+
+        n_per_frame = 4
+        feature = torch.randn(2 * n_per_frame, 24)
+        position = torch.randn(2 * n_per_frame, 3) * 2.0
+        seed, seed_delta = (
+            V10LayerWeightedAttentionTest._adaptive_seed_bank(position)
+        )
+        output = backend(
+            feature,
+            position,
+            seed,
+            torch.tensor([n_per_frame, 2 * n_per_frame]),
+            torch.tensor([0, 0]),
+            [torch.eye(4).repeat(2, 1, 1)],
+            [torch.tensor([0.0, 1.0])],
+            [torch.tensor([0.0, 0.8])],
+            torch.tensor([0.8]),
+            seed_delta_sensor=seed_delta,
+        )
+        item = output["batch_gaussians"][0]
+        self.assertTrue(torch.equal(item["selected_k"], torch.full((24,), 3)))
+        shared_velocity = item["velocity"].reshape(8, 3, 3)
+        torch.testing.assert_close(
+            shared_velocity, shared_velocity[:, :1].expand_as(shared_velocity)
+        )
+        # zero_init keeps a fresh run at v_total = v_init.
+        torch.testing.assert_close(
+            item["velocity_offset"], torch.zeros_like(item["velocity_offset"])
+        )
+        torch.testing.assert_close(
+            item["velocity"], item["velocity_init"] + item["velocity_offset"]
+        )
+        # v_init is the layer-mixed displacement over the signed interval.
+        torch.testing.assert_close(
+            item["velocity_init"] * item["pair_delta_t_sec"].unsqueeze(-1),
+            item["delta_p_init"],
+        )
+        stats = ModelWrapper._motion_proposal_statistics([item])
+        self.assertIn("motion_layer_weight_entropy_mean", stats)
+        for layer in range(3):
+            self.assertIn(f"motion_layer_weight_l{layer}_mean", stats)
+
+    def test_barrier_caps_v_init_near_the_configured_top_speed(self):
+        """A token with no reachable key still cannot outrun the barrier much."""
+        torch.manual_seed(5)
+        module = MaxSpeedBarrierLayerWeightedCrossAttention(
+            v11_temporal_cfg(layers=1), dim=24
+        ).eval()
+        duration = 1.0
+        # Frame 0 holds one query at the origin; frame 1 holds keys at 20 m
+        # (inside the 30 m radius) and 200 m (far outside it).
+        position = torch.tensor([
+            [0.0, 0.0, 0.0], [20.0, 0.0, 0.0], [200.0, 0.0, 0.0],
+        ])
+        feature = torch.randn(3, 24)
+        with torch.no_grad():
+            _refined, fields = module(
+                *self._forward_args(feature, position, 1, duration=duration)
+            )
+        speed = float(fields["delta_p_init"][0].norm() / duration)
+        self.assertLess(speed, 30.0)
 
 
 class V8ConsensusAttentionTest(unittest.TestCase):

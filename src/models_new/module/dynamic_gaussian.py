@@ -39,6 +39,10 @@ quadratic distance bias, averages all heads at every temporal layer, and uses a
 query-only global token to predict a per-frame softmax over those layer maps.
 Its refined token then drives the legacy hard-Gumbel-STE K={1,2,3} Gaussian
 router, while one token velocity is shared by every selected child Gaussian.
+V11 keeps that router and offset head but splits the position encoding across
+heads: head 0 alone carries correspondence and is biased by a max-speed soft
+barrier instead of RoPE, heads 1-11 keep metric 3D RoPE, and the twelve head-0
+coordinate readouts are mixed by a softmax over twelve plain learned scalars.
 """
 from __future__ import annotations
 
@@ -1515,6 +1519,472 @@ class LayerWeightedDistanceBiasCrossAttention(
             frame_logits,
             q_counts,
             position_ref,
+        )
+        return x, {
+            "delta_p_match": displacement,
+            "delta_p_init": displacement,
+            "matched_position": matched_position,
+            "motion_layer_logits": token_logits,
+            "motion_layer_weights": token_weights,
+        }
+
+
+class MaxSpeedBarrierLayerWeightedCrossAttention(
+    ParallelBidirectionalCrossAttention
+):
+    """V11 split position encoding with a parameter-only layer mixture.
+
+    Head 0 of every layer is the correspondence head, and is the only head whose
+    probabilities ever touch coordinates.  It carries no 3D RoPE.  Its position
+    encoding is instead one additive physical barrier on the logit,
+
+    ``bias_ij = -a * relu(||x_i - x_j|| / (v_max * |dt|) - 1)^2``,
+
+    which is exactly zero inside the radius a ``v_max`` object could cover over
+    the endpoint interval and grows quadratically outside it.  Unlike V10's
+    ``-(d/R)^2`` prior the hinge is not a bilinear form, so it cannot be folded
+    into extra Q/K channels; this head therefore runs as an explicit softmax,
+    chunked over queries and recomputed in backward.  Its V carries the ordinary
+    feature channels plus opposite-frame xyz, so one pass returns both the
+    feature update and ``W_l @ xyz``.
+
+    Heads ``1..H-1`` keep ordinary metric 3D RoPE and stay on varlen
+    FlashAttention.
+
+    ``v_init`` mixes the ``L`` head-0 coordinate expectations under
+    ``softmax(a_0..a_{L-1})`` over ``L`` plain learned scalars -- no global
+    token and no per-sample scorer -- so the mixture asks only which *depth*
+    resolves correspondence, starting from an exact uniform ``1/L``.
+    """
+
+    _MATCH_HEAD = 0
+
+    @staticmethod
+    def _frame_first(value, counts):
+        """The first token's value in every frame, one entry per frame."""
+        starts = torch.cumsum(counts, dim=0) - counts
+        return value[starts.long()]
+
+    def __init__(self, cfg, dim: int):
+        # Skip both parent constructors: the base class builds one RoPE across
+        # every head and a per-layer time_to_q/time_to_k pair this variant does
+        # not use.
+        nn.Module.__init__(self)
+        self.dim = int(dim)
+        self.num_heads = int(_cfg_get(cfg, "num_heads", 8))
+        self.n_layers = int(_cfg_get(cfg, "layers", 1))
+        self.mlp_ratio = float(_cfg_get(cfg, "mlp_ratio", 4.0))
+        self.implementation = str(
+            _cfg_get(cfg, "implementation", "flash_varlen")
+        ).lower()
+        self.use_time_embedding = bool(
+            _cfg_get(cfg, "use_time_embedding", True)
+        )
+        self.position_encoding = str(
+            _cfg_get(cfg, "position_encoding", "barrier_rope_split")
+        ).lower()
+        self.barrier_speed_mps = float(_cfg_get(cfg, "barrier_speed_mps", 30.0))
+        self.barrier_weight = float(_cfg_get(cfg, "barrier_weight", 4.0))
+        self.match_chunk_size = int(_cfg_get(cfg, "match_chunk_size", 1024))
+
+        if self.dim <= 0 or self.num_heads <= 0:
+            raise ValueError("V11 attention dimensions must be positive")
+        if self.dim % self.num_heads != 0:
+            raise ValueError("dynamic token dim must be divisible by num_heads")
+        if self.num_heads < 2:
+            raise ValueError(
+                "V11 needs one barrier match head plus at least one RoPE head"
+            )
+        if self.n_layers < 1:
+            raise ValueError("dynamic temporal layers must be at least one")
+        if self.mlp_ratio <= 0.0:
+            raise ValueError("dynamic temporal mlp_ratio must be positive")
+        if not self.use_time_embedding:
+            raise ValueError("V11 temporal attention requires time embedding")
+        if self.position_encoding != "barrier_rope_split":
+            raise ValueError(
+                "V11 temporal position_encoding must be 'barrier_rope_split'"
+            )
+        if self.barrier_speed_mps <= 0.0:
+            raise ValueError("V11 barrier_speed_mps must be positive")
+        if self.barrier_weight < 0.0:
+            raise ValueError("V11 barrier_weight must be non-negative")
+        if self.match_chunk_size <= 0:
+            raise ValueError("V11 match_chunk_size must be positive")
+
+        self.head_dim = self.dim // self.num_heads
+        if self.head_dim % 6 != 0:
+            raise ValueError(
+                "dynamic attention head dim must be divisible by 6 for 3D RoPE"
+            )
+        self.scale = self.head_dim ** -0.5
+        self.rope_head_count = self.num_heads - 1
+
+        rope_position_scale = _cfg_get(cfg, "rope_position_scale", None)
+        if rope_position_scale is None:
+            range_m = float(_cfg_get(cfg, "rope_range_m", 110.0))
+            rope_position_scale = math.pi / range_m
+        # Heads 1..H-1 only; head 0 reads geometry from the barrier instead.
+        self.rope = Rotary3D(
+            self.head_dim,
+            base=float(_cfg_get(cfg, "rope_base", 100.0)),
+            position_scale=float(rope_position_scale),
+        )
+
+        # Preserve the V5/V9 endpoint-time parameterization exactly:
+        # Fourier -> MLP(..., time_dim) -> bias-free Linear(time_dim, dim),
+        # added once to the fused token before layer one.
+        time_dim = int(_cfg_get(cfg, "time_embedding_dim", 64))
+        time_frequencies = int(_cfg_get(cfg, "time_frequencies", 8))
+        self.time_encoder = SinusoidalScalarEncoder(time_dim, time_frequencies)
+        self.time_to_feature = nn.Linear(time_dim, self.dim, bias=False)
+
+        self.qk_norm = bool(_cfg_get(cfg, "qk_norm", True))
+        if not self.qk_norm:
+            raise ValueError("V11 requires qk_norm=true")
+        self.q_norm = nn.ModuleList([
+            nn.RMSNorm(self.head_dim) for _ in range(self.n_layers)
+        ])
+        self.k_norm = nn.ModuleList([
+            nn.RMSNorm(self.head_dim) for _ in range(self.n_layers)
+        ])
+
+        hidden = int(self.dim * self.mlp_ratio)
+        self.input_norm = nn.ModuleList([
+            nn.LayerNorm(self.dim) for _ in range(self.n_layers)
+        ])
+        self.q_proj = nn.ModuleList([
+            nn.Linear(self.dim, self.dim) for _ in range(self.n_layers)
+        ])
+        self.k_proj = nn.ModuleList([
+            nn.Linear(self.dim, self.dim) for _ in range(self.n_layers)
+        ])
+        self.v_proj = nn.ModuleList([
+            nn.Linear(self.dim, self.dim) for _ in range(self.n_layers)
+        ])
+        self.out_proj = nn.ModuleList([
+            nn.Linear(self.dim, self.dim) for _ in range(self.n_layers)
+        ])
+        layer_scale_init = float(_cfg_get(cfg, "layer_scale_init", 0.1))
+        if not 0.0 < layer_scale_init <= 1.0:
+            raise ValueError("dynamic temporal layer_scale_init must be in (0,1]")
+        self.cross_layer_scale = nn.ParameterList([
+            nn.Parameter(torch.full((self.dim,), layer_scale_init))
+            for _ in range(self.n_layers)
+        ])
+        self.ffn_norm = nn.ModuleList([
+            nn.LayerNorm(self.dim) for _ in range(self.n_layers)
+        ])
+        self.ffn = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(self.dim, hidden),
+                nn.SiLU(),
+                nn.Linear(hidden, self.dim),
+            )
+            for _ in range(self.n_layers)
+        ])
+        for ffn in self.ffn:
+            nn.init.zeros_(ffn[-1].weight)
+            nn.init.zeros_(ffn[-1].bias)
+
+        # One scalar per layer, shared by every token and every sample. Zero
+        # init is an exact uniform 1/L mixture, and each logit's only gradient
+        # is the render loss' preference among the layers' coordinate readouts.
+        self.layer_logits = nn.Parameter(torch.zeros(self.n_layers))
+
+    @torch.no_grad()
+    def attention_temperature_stats(self):
+        """QK-Norm gain diagnostics next to the fixed barrier geometry.
+
+        The content logit is bounded by ``gamma_q * gamma_k * head_dim * scale``
+        while the barrier is a fixed constant, so watching the bound is also how
+        one sees the barrier being outgrown.
+        """
+        stats = {
+            "qk_motion_head_count": 1.0,
+            "barrier_speed_mps": self.barrier_speed_mps,
+            "barrier_weight": self.barrier_weight,
+        }
+        bound = 0.0
+        for layer in range(self.n_layers):
+            gq = self.q_norm[layer].weight.float()
+            gk = self.k_norm[layer].weight.float()
+            rms_q = float(gq.square().mean().sqrt())
+            rms_k = float(gk.square().mean().sqrt())
+            bound = max(bound, rms_q * rms_k * self.head_dim * self.scale)
+            stats[f"qk_gamma_q_layer{layer}"] = rms_q
+            stats[f"qk_gamma_k_layer{layer}"] = rms_k
+        stats["qk_max_logit_bound"] = bound
+        return stats
+
+    def _barrier_bias(self, query_position, key_position, radius):
+        """Reference form ``a * relu(d/R - 1)^2`` for one chunk of queries.
+
+        This is what the barrier *means*; :meth:`_barrier_chunk` evaluates the
+        algebraically identical ``(a/R^2) * relu(d - R)^2`` because that folds
+        into the score GEMM. Positions are input geometry rather than
+        parameters, so the barrier is a constant of the graph either way.
+        """
+        with torch.no_grad():
+            excess = torch.cdist(query_position, key_position)
+            excess = excess.div_(float(radius)).sub_(1.0).clamp_min_(0.0)
+            return excess.square_().mul_(self.barrier_weight)
+
+    def _barrier_chunk(
+        self, query, key, value, query_position, key_position, radius
+    ):
+        """One head-0 softmax over every opposite-frame key for this chunk.
+
+        ``radius`` is one Python scalar: a chunk never spans an endpoint pair,
+        and the barrier radius is that sample's physical interval. At these
+        sizes the ``N_q x N_k`` block is bandwidth-bound rather than
+        FLOP-bound, so the hinge is written as ``relu(d - R)^2`` and folded
+        into the score GEMM's ``beta * C`` accumulate. That leaves three
+        elementwise passes over the block instead of nine.
+        """
+        radius = float(radius)
+        with torch.no_grad():
+            excess = torch.cdist(
+                query_position, key_position
+            ).sub_(radius).relu_().square_()
+        score = torch.addmm(
+            excess,
+            query,
+            key.transpose(0, 1),
+            beta=-self.barrier_weight / (radius * radius),
+            alpha=self.scale,
+        )
+        probability = torch.softmax(score, dim=-1)
+        attended = probability @ value
+        return attended[..., :self.head_dim], attended[..., self.head_dim:]
+
+    def _barrier_attention(
+        self,
+        query,
+        key,
+        value,
+        query_position,
+        key_position,
+        q_count_values,
+        k_count_values,
+        frame_radius_values,
+    ):
+        """Head-0 feature update and ``W_l @ xyz``, chunked over queries.
+
+        Retaining every chunk's ``N_q x N_k`` probabilities across twelve layers
+        would dominate activation memory, so each chunk is recomputed in
+        backward exactly as V9's dense proposal does. The ragged layout and the
+        per-frame radius arrive as Python scalars the caller resolved once, so
+        no layer costs a host synchronization.
+        """
+        recompute = (
+            self.training
+            and torch.is_grad_enabled()
+            and (
+                query.requires_grad or key.requires_grad or value.requires_grad
+            )
+        )
+        feature_chunks = []
+        position_chunks = []
+        query_start = 0
+        key_start = 0
+        for q_count, k_count, radius in zip(
+            q_count_values, k_count_values, frame_radius_values
+        ):
+            if q_count <= 0 or k_count <= 0:
+                raise ValueError("V11 requires tokens in both endpoint frames")
+            keys = slice(key_start, key_start + k_count)
+            key_xyz = key_position[keys]
+            # Centering only improves the accuracy of the pairwise distance in
+            # global reference coordinates. It changes no distance and no
+            # displacement, because the readout adds the same origin back.
+            origin = 0.5 * (
+                query_position[query_start:query_start + q_count].mean(dim=0)
+                + key_xyz.mean(dim=0)
+            )
+            key_centered = key_xyz - origin
+            payload = torch.cat([value[keys], key_centered], dim=-1)
+            for start in range(0, q_count, self.match_chunk_size):
+                end = min(start + self.match_chunk_size, q_count)
+                rows = slice(query_start + start, query_start + end)
+                inputs = (
+                    query[rows],
+                    key[keys],
+                    payload,
+                    query_position[rows] - origin,
+                    key_centered,
+                    radius,
+                )
+                if recompute:
+                    chunk = checkpoint(
+                        self._barrier_chunk, *inputs, use_reentrant=False
+                    )
+                else:
+                    chunk = self._barrier_chunk(*inputs)
+                feature_chunks.append(chunk[0])
+                position_chunks.append(chunk[1] + origin)
+            query_start += q_count
+            key_start += k_count
+        return (
+            torch.cat(feature_chunks, dim=0),
+            torch.cat(position_chunks, dim=0),
+        )
+
+    def _combine_layer_matches(self, layer_matched_positions, position_ref):
+        """Mix the per-layer coordinate expectations under the layer softmax."""
+        if layer_matched_positions.ndim != 3:
+            raise ValueError("V11 layer matches must have shape (N,L,3)")
+        if layer_matched_positions.shape[1] != self.n_layers:
+            raise ValueError("V11 layer matches must cover every layer")
+        if layer_matched_positions.shape[-1] != 3:
+            raise ValueError("V11 layer matches must end in xyz")
+        if position_ref.shape != (layer_matched_positions.shape[0], 3):
+            raise ValueError("V11 positions must align with layer matches")
+        weights = torch.softmax(self.layer_logits.float(), dim=-1)
+        matched_position = (
+            weights.reshape(1, -1, 1) * layer_matched_positions.float()
+        ).sum(dim=1)
+        displacement = matched_position - position_ref.float()
+        token_count = int(layer_matched_positions.shape[0])
+        return (
+            matched_position,
+            displacement,
+            self.layer_logits.detach().expand(token_count, -1),
+            weights.detach().expand(token_count, -1),
+        )
+
+    def forward(
+        self,
+        feature,
+        position_ref,
+        token_offset,
+        frame_batch_idx,
+        token_time_coordinate,
+        token_duration_sec,
+    ):
+        n_tokens = int(feature.shape[0])
+        if feature.shape != (n_tokens, self.dim):
+            raise ValueError(f"V11 feature must be (N,{self.dim})")
+        if position_ref.shape != (n_tokens, 3):
+            raise ValueError("position_ref must align with V11 token features")
+        if token_time_coordinate.shape != (n_tokens,):
+            raise ValueError("V11 token time must provide one scalar per token")
+        if token_duration_sec.shape != (n_tokens,):
+            raise ValueError("V11 duration must provide one scalar per token")
+        if not bool(torch.all(
+            torch.isfinite(token_duration_sec) & (token_duration_sec > 0.0)
+        )):
+            raise ValueError("V11 requires positive finite durations")
+
+        q_counts, k_counts, memory_rows = self._frame_layout(
+            token_offset, frame_batch_idx
+        )
+        if int(q_counts.sum()) != n_tokens:
+            raise ValueError("token_offset does not cover all V11 tokens")
+        if bool(torch.any(q_counts <= 0)) or bool(torch.any(k_counts <= 0)):
+            raise ValueError("V11 requires tokens in both endpoint frames")
+
+        x = feature + self.time_to_feature(
+            self.time_encoder(token_time_coordinate)
+        ).to(feature.dtype)
+
+        query_position = position_ref.float()
+        key_position = position_ref[memory_rows].float()
+        q_angles = self.rope.angles(query_position)
+        k_angles = self.rope.angles(key_position)
+        # Resolve the ragged layout and the barrier radius to Python scalars
+        # once. Re-reading CUDA counts inside the layer loop would otherwise
+        # cost several synchronizing host round-trips per temporal layer.
+        q_count_values = [int(value) for value in q_counts.tolist()]
+        k_count_values = [int(value) for value in k_counts.tolist()]
+        frame_duration = self._frame_first(token_duration_sec, q_counts)
+        if not torch.equal(
+            torch.repeat_interleave(frame_duration, q_counts),
+            token_duration_sec,
+        ):
+            raise ValueError(
+                "V11 requires one endpoint interval per frame; the barrier "
+                "radius is a per-sample physical duration"
+            )
+        # What an object at the admissible top speed could cover over this
+        # sample's endpoint interval.
+        frame_radius_values = [
+            max(self.barrier_speed_mps * float(value), 1.0e-4)
+            for value in frame_duration.tolist()
+        ]
+
+        use_flash = (
+            x.is_cuda
+            and flash_attn is not None
+            and self.implementation in ("flash_varlen", "auto")
+        )
+        if (
+            x.is_cuda
+            and self.implementation == "flash_varlen"
+            and flash_attn is None
+        ):
+            raise RuntimeError(
+                "V11 temporal attention requested flash_varlen, but "
+                "flash_attn is unavailable"
+            )
+
+        layer_matched_positions = []
+        for layer in range(self.n_layers):
+            snapshot = x
+            conditioned = self.input_norm[layer](snapshot)
+            q = self.q_proj[layer](conditioned).reshape(
+                n_tokens, self.num_heads, self.head_dim
+            )
+            k = self.k_proj[layer](conditioned)[memory_rows].reshape(
+                n_tokens, self.num_heads, self.head_dim
+            )
+            v = self.v_proj[layer](conditioned)[memory_rows].reshape(
+                n_tokens, self.num_heads, self.head_dim
+            )
+            q = self.q_norm[layer](q).float()
+            k = self.k_norm[layer](k).float()
+            v = v.float()
+
+            match_attended, matched_position = self._barrier_attention(
+                q[:, self._MATCH_HEAD],
+                k[:, self._MATCH_HEAD],
+                v[:, self._MATCH_HEAD],
+                query_position,
+                key_position,
+                q_count_values,
+                k_count_values,
+                frame_radius_values,
+            )
+            layer_matched_positions.append(matched_position)
+
+            rope_head = slice(self._MATCH_HEAD + 1, None)
+            rope_attended_inputs = (
+                self.rope.rotate(q[:, rope_head], q_angles[:, None, :, :]),
+                self.rope.rotate(k[:, rope_head], k_angles[:, None, :, :]),
+                v[:, rope_head],
+                q_counts,
+                k_counts,
+            )
+            if use_flash:
+                rope_attended = self._flash_attention(*rope_attended_inputs)
+            else:
+                rope_attended = self._sdpa_attention(*rope_attended_inputs)
+
+            attended = torch.cat(
+                [match_attended.unsqueeze(1), rope_attended], dim=1
+            ).reshape(n_tokens, self.dim).to(snapshot.dtype)
+            x = snapshot + self.cross_layer_scale[layer] * self.out_proj[layer](
+                attended
+            )
+            x = x + self.ffn[layer](self.ffn_norm[layer](x))
+
+        (
+            matched_position,
+            displacement,
+            token_logits,
+            token_weights,
+        ) = self._combine_layer_matches(
+            torch.stack(layer_matched_positions, dim=1), position_ref
         )
         return x, {
             "delta_p_match": displacement,
@@ -3726,16 +4196,14 @@ class LayerWeightedAttentionVelocityGaussianBackend(
         nn.Module.__init__(self)
         self.cfg = cfg
         self.dim = int(dim)
-        self.temporal = LayerWeightedDistanceBiasCrossAttention(
-            cfg.temporal, self.dim
-        )
+        self.temporal = self._build_temporal(cfg)
         self.time_reference_sec = float(
             _cfg_get(cfg.temporal, "time_reference_sec", 1.0)
         )
         if self.time_reference_sec <= 0.0:
             raise ValueError("time_reference_sec must be positive")
         if gaussian_count_cfg is None:
-            raise ValueError("V10 requires adaptive Gaussian-count config")
+            raise ValueError("adaptive-K dynamic backend requires adaptive Gaussian-count config")
         from .grid_query_head import GridSlotHead
 
         self.gaussian_output_norm = nn.LayerNorm(self.dim)
@@ -3743,9 +4211,9 @@ class LayerWeightedAttentionVelocityGaussianBackend(
             gaussian_count_cfg, gs_params, dim=self.dim
         )
         if self.gaussian_head.count_mode != "learned_gumbel":
-            raise ValueError("V10 Gaussian count must use learned_gumbel")
+            raise ValueError("adaptive-K Gaussian count must use learned_gumbel")
         if self.gaussian_head.k_max != 3:
-            raise ValueError("V10 Gaussian count requires K_max=3")
+            raise ValueError("adaptive-K Gaussian count requires K_max=3")
         self.offset_bound = float(offset_bound)
         self.gaussian_param_names = [
             "shs", "opacity", "scaling", "rotation", "offset",
@@ -3755,16 +4223,27 @@ class LayerWeightedAttentionVelocityGaussianBackend(
         ]
         if self.gaussian_param_sizes[-2:] != [4, 3]:
             raise ValueError(
-                "V10 adaptive Gaussian head requires rotation=4 and offset=3"
+                "adaptive-K Gaussian head requires rotation=4 and offset=3"
             )
         if sum(self.gaussian_param_sizes) != self.gaussian_head.param_dim:
-            raise ValueError("V10 adaptive Gaussian parameter widths disagree")
+            raise ValueError("adaptive-K Gaussian parameter widths disagree")
         self._initialize_adaptive_gaussian_heads(
             _cfg_get(cfg, "gaussian_head", None)
         )
-        self.velocity_head = FeatureOnlyVelocityOffsetHead(
-            cfg.motion, self.dim
-        )
+        self.velocity_head = self._build_velocity_head(cfg)
+
+    def _build_temporal(self, cfg):
+        """The temporal module whose head probabilities become ``v_init``."""
+        return LayerWeightedDistanceBiasCrossAttention(cfg.temporal, self.dim)
+
+    def _build_velocity_head(self, cfg):
+        """The additive correction applied on top of ``v_init``."""
+        return FeatureOnlyVelocityOffsetHead(cfg.motion, self.dim)
+
+    def _velocity_offset(self, refined, velocity_init):
+        """V10 reads only the refined token; the initializer is not an input."""
+        del velocity_init
+        return self.velocity_head(refined)
 
     def _initialize_adaptive_gaussian_heads(self, cfg):
         """Give every K expert the existing dynamic-head output priors."""
@@ -3807,14 +4286,14 @@ class LayerWeightedAttentionVelocityGaussianBackend(
         )
         if tuple(seed_ref.shape) != expected_seed_shape:
             raise ValueError(
-                "V10 adaptive seed bank must have shape "
+                "adaptive-K seed bank must have shape "
                 f"{expected_seed_shape}, got {tuple(seed_ref.shape)}"
             )
         gaussian_feature = self.gaussian_output_norm(refined)
         delta_ref = geometry.get("seed_delta_ref")
         if delta_ref is None or tuple(delta_ref.shape) != expected_seed_shape:
             raise ValueError(
-                "V10 requires a transformed K-specific seed-delta bank"
+                "adaptive-K dynamic backend requires a transformed K-specific seed-delta bank"
             )
         raw_params, packing = self.gaussian_head(
             gaussian_feature,
@@ -3856,11 +4335,11 @@ class LayerWeightedAttentionVelocityGaussianBackend(
     def _signed_pair_delta_t(geometry):
         local_frame = geometry["local_frame"]
         if not bool(torch.all((local_frame == 0) | (local_frame == 1))):
-            raise ValueError("V10 attention velocity requires endpoint indices 0/1")
+            raise ValueError("adaptive-K attention velocity requires endpoint indices 0/1")
         duration = geometry["duration_sec"]
         if not bool(torch.all(torch.isfinite(duration) & (duration > 0.0))):
             raise ValueError(
-                "V10 attention velocity requires positive finite duration"
+                "adaptive-K attention velocity requires positive finite duration"
             )
         return torch.where(local_frame == 0, duration, -duration)
 
@@ -3887,7 +4366,7 @@ class LayerWeightedAttentionVelocityGaussianBackend(
         pair_delta_t_sec = self._signed_pair_delta_t(geometry)
         delta_p_init = temporal_fields["delta_p_init"]
         velocity_init = delta_p_init / pair_delta_t_sec.unsqueeze(-1)
-        velocity_offset = self.velocity_head(refined)
+        velocity_offset = self._velocity_offset(refined, velocity_init)
         velocity = velocity_init + velocity_offset
         return velocity, {
             "delta_p_match": temporal_fields["delta_p_match"],
@@ -3926,18 +4405,18 @@ class LayerWeightedAttentionVelocityGaussianBackend(
         )
         if tuple(seed_sensor.shape) != expected_seed_shape:
             raise ValueError(
-                "V10 requires the learned-count seed bank with shape "
+                "adaptive-K dynamic backend requires the learned-count seed bank with shape "
                 f"{expected_seed_shape}, got {tuple(seed_sensor.shape)}"
             )
         if seed_delta_sensor is None or tuple(
             seed_delta_sensor.shape
         ) != expected_seed_shape:
             raise ValueError(
-                "V10 requires a learned-count seed-delta bank with shape "
+                "adaptive-K dynamic backend requires a learned-count seed-delta bank with shape "
                 f"{expected_seed_shape}"
             )
         if token_position_sensor.shape != (fused_feature.shape[0], 3):
-            raise ValueError("V10 token positions must align with features")
+            raise ValueError("adaptive-K token positions must align with features")
 
         geometry = self._reference_geometry_and_time(
             token_position_sensor,
@@ -4037,6 +4516,38 @@ class LayerWeightedAttentionVelocityGaussianBackend(
             "batch": packed_batch,
             "routing_stats": routing_stats,
         }
+
+
+class MaxSpeedBarrierVelocityGaussianBackend(
+    LayerWeightedAttentionVelocityGaussianBackend
+):
+    """V11: V10's adaptive-K Gaussians behind a split-position-encoding stack.
+
+    Everything downstream of temporal refinement is V10's: the same
+    ``learned_gumbel`` K={1,2,3} router over ``LN(f')``, the same feature-only
+    ``v_offset``, and one token velocity index-expanded to every child Gaussian.
+    Only the temporal module changes. Correspondence now comes from head 0 of
+    each layer alone, under the max-speed soft barrier instead of RoPE, and the
+    twelve readouts are mixed by ``L`` plain learned scalars rather than by a
+    per-frame global token.
+    """
+
+    def _build_temporal(self, cfg):
+        return MaxSpeedBarrierLayerWeightedCrossAttention(
+            cfg.temporal, self.dim
+        )
+
+    def _build_velocity_head(self, cfg):
+        """V8's head: ``[LN(f'), MLP(v_init; 3->32->32)] -> 96 -> 3``.
+
+        The refined feature carries head 0's attended *feature* channels, never
+        the metric coordinate expectation itself, so the offset head cannot see
+        what it is correcting unless the initializer is embedded explicitly.
+        """
+        return EmbeddedInitVelocityHead(cfg.motion, self.dim)
+
+    def _velocity_offset(self, refined, velocity_init):
+        return self.velocity_head(refined, velocity_init)
 
 
 class ConsensusAttentionVelocityGaussianBackend(
@@ -4575,6 +5086,8 @@ __all__ = [
     "InitConditionedVelocityHead",
     "LayerWeightedAttentionVelocityGaussianBackend",
     "LayerWeightedDistanceBiasCrossAttention",
+    "MaxSpeedBarrierLayerWeightedCrossAttention",
+    "MaxSpeedBarrierVelocityGaussianBackend",
     "EmbeddedInitDurationVelocityHead",
     "FeatureOnlyVelocityOffsetHead",
     "ParallelBidirectionalCrossAttention",

@@ -22,6 +22,7 @@ from src.config_loader import (
     DYNAMIC_VARIANT_V8,
     DYNAMIC_VARIANT_V9,
     DYNAMIC_VARIANT_V10,
+    DYNAMIC_VARIANT_V11,
     LEGACY_VARIANT,
     assert_model_variant_implemented,
     compose_fresh_config,
@@ -414,6 +415,117 @@ class ConfigLoaderTest(unittest.TestCase):
                 compose_fresh_config(OmegaConf.from_dotlist([
                     f"model.variant={DYNAMIC_VARIANT_V10}", override,
                 ]))
+
+    def test_barrier_variant_errors_name_the_variant_they_came_from(self):
+        with self.assertRaises(ValueError) as raised:
+            compose_fresh_config(OmegaConf.from_dotlist([
+                f"model.variant={DYNAMIC_VARIANT_V11}",
+                "dynamic_2dgs.temporal.qk_norm=false",
+            ]))
+        self.assertIn("V11 ", str(raised.exception))
+
+    def test_v11_composes_split_position_encoding_contract(self):
+        config, source = compose_fresh_config(OmegaConf.from_dotlist([
+            f"model.variant={DYNAMIC_VARIANT_V11}",
+        ]))
+        temporal = config.dynamic_2dgs.temporal
+        self.assertEqual(config.model.variant, DYNAMIC_VARIANT_V11)
+        self.assertEqual(temporal.layers, 12)
+        self.assertEqual(temporal.num_heads, 12)
+        self.assertTrue(temporal.use_time_embedding)
+        self.assertEqual(temporal.position_encoding, "barrier_rope_split")
+        self.assertEqual(temporal.barrier_speed_mps, 30.0)
+        self.assertEqual(temporal.barrier_weight, 4.0)
+        self.assertGreater(temporal.match_chunk_size, 0)
+        self.assertEqual(temporal.rope_base, 100.0)
+        self.assertAlmostEqual(
+            2.0 * math.pi / temporal.rope_position_scale, 5.0
+        )
+        self.assertTrue(temporal.qk_norm)
+        # V10's global-token scorer and quadratic prior are both gone.
+        for removed in (
+            "layer_weight_hidden_dim", "distance_bias_speed_mps",
+            "motion_head_count", "tie_motion_qk_init",
+        ):
+            self.assertNotIn(removed, temporal)
+        self.assertNotIn("motion_proposal", config.dynamic_2dgs)
+        self.assertTrue(config.p2g.utonia_lora.enable)
+        self.assertEqual(config.p2g.utonia_lora.input_mode, "xyzi")
+        self.assertEqual(config.p2g.utonia_lora.rank, 16)
+        count = config.p2g.grid_query
+        self.assertEqual(count.count_mode, "learned_gumbel")
+        self.assertEqual(count.learned_count.K_max, 3)
+        self.assertEqual(count.learned_count.seed_mode, "range_quantile")
+        self.assertFalse(count.learned_count.budget.enable)
+        motion = config.dynamic_2dgs.motion
+        self.assertEqual(motion.residual_hidden_dim, 96)
+        self.assertEqual(motion.velocity_embedding_dim, 32)
+        self.assertTrue(motion.detach_init_condition)
+        prior = config.dynamic_2dgs.regularization.velocity_l2
+        self.assertEqual(prior.mode, "split_group_l2")
+        self.assertEqual(prior.init_weight, 0.01)
+        self.assertEqual(prior.offset_weight, 0.01)
+        self.assertNotIn("weight", prior)
+        self.assertEqual(config.loss.w_chamfer, 0.02)
+        self.assertEqual(config.loss.w_scale, 0.0)
+        self.assertIn(f"{DYNAMIC_VARIANT_V11}.yaml", source)
+
+    def test_v11_validates_barrier_and_rope_contract(self):
+        invalid = (
+            ("dynamic_2dgs.temporal.position_encoding=distance_bias",
+             "position_encoding"),
+            ("dynamic_2dgs.temporal.barrier_speed_mps=0", "barrier_speed_mps"),
+            ("dynamic_2dgs.temporal.barrier_weight=-1", "barrier_weight"),
+            ("dynamic_2dgs.temporal.match_chunk_size=0", "match_chunk_size"),
+            ("dynamic_2dgs.temporal.qk_norm=false", "qk_norm"),
+            ("dynamic_2dgs.temporal.use_time_embedding=false",
+             "use_time_embedding"),
+            ("p2g.utonia_lora.enable=false", "utonia_lora.enable=true"),
+            ("p2g.grid_query.learned_count.K_max=4", "K_max=3"),
+            ("p2g.grid_query.learned_count.budget.enable=true", "budget"),
+        )
+        for override, message in invalid:
+            with self.subTest(override=override), self.assertRaisesRegex(
+                ValueError, message
+            ):
+                compose_fresh_config(OmegaConf.from_dotlist([
+                    f"model.variant={DYNAMIC_VARIANT_V11}", override,
+                ]))
+
+    def test_v11_still_requires_a_rope_capable_head_width(self):
+        # Heads 1-11 keep 3D RoPE, so 432/16=27 is rejected where V10 allows it.
+        with self.assertRaisesRegex(ValueError, "divisible by six"):
+            compose_fresh_config(OmegaConf.from_dotlist([
+                f"model.variant={DYNAMIC_VARIANT_V11}",
+                "dynamic_2dgs.temporal.num_heads=16",
+            ]))
+
+    def test_v11_split_prior_requires_both_weights(self):
+        for override in (
+            "dynamic_2dgs.regularization.velocity_l2.init_weight=-1",
+            "dynamic_2dgs.regularization.velocity_l2.offset_weight=-1",
+        ):
+            with self.subTest(override=override), self.assertRaisesRegex(
+                ValueError, "split_group_l2"
+            ):
+                compose_fresh_config(OmegaConf.from_dotlist([
+                    f"model.variant={DYNAMIC_VARIANT_V11}", override,
+                ]))
+
+    def test_split_prior_weights_are_rejected_by_single_term_modes(self):
+        with self.assertRaisesRegex(ValueError, "split_group_l2"):
+            compose_fresh_config(OmegaConf.from_dotlist([
+                f"model.variant={DYNAMIC_VARIANT_V11}",
+                "dynamic_2dgs.regularization.velocity_l2.mode=final_group_l2",
+                "dynamic_2dgs.regularization.velocity_l2.weight=0.01",
+            ]))
+
+    def test_v11_rejects_v10_only_temporal_keys(self):
+        with self.assertRaisesRegex(ValueError, "Unsupported keys"):
+            compose_fresh_config(OmegaConf.from_dotlist([
+                f"model.variant={DYNAMIC_VARIANT_V11}",
+                "dynamic_2dgs.temporal.layer_weight_hidden_dim=96",
+            ]))
 
     def test_v9_rejects_v7_2_top4_matcher_keys(self):
         for key in ("match_count=4", "ste_surrogate=dense_softmax"):

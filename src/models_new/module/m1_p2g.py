@@ -108,10 +108,10 @@ class Point2Gaus(nn.Module):
             self.utonia_coord_scale, self.utonia_input_grid_size, self.utonia_stride_factor
         )
         if self.dynamic_cfg is not None:
-            from src.config_loader import DYNAMIC_VARIANT_V10
+            from src.config_loader import ADAPTIVE_COUNT_DYNAMIC_VARIANTS
 
             self.dynamic_adaptive_count = (
-                self.dynamic_variant == DYNAMIC_VARIANT_V10
+                self.dynamic_variant in ADAPTIVE_COUNT_DYNAMIC_VARIANTS
             )
         else:
             self.dynamic_adaptive_count = False
@@ -187,12 +187,14 @@ class Point2Gaus(nn.Module):
                 DYNAMIC_VARIANT_V8,
                 DYNAMIC_VARIANT_V9,
                 DYNAMIC_VARIANT_V10,
+                DYNAMIC_VARIANT_V11,
             )
             from .dynamic_gaussian import (
                 AttentionInitializedVelocityGaussianBackend,
                 ConsensusAttentionVelocityGaussianBackend,
                 DynamicGaussianBackend,
                 LayerWeightedAttentionVelocityGaussianBackend,
+                MaxSpeedBarrierVelocityGaussianBackend,
                 PhysicalVelocityGaussianBackend,
                 PostAttentionProposalVelocityGaussianBackend,
                 ProposalInitializedVelocityGaussianBackend,
@@ -210,7 +212,9 @@ class Point2Gaus(nn.Module):
             # branch but runs it after temporal refinement on the refined
             # feature, so it needs no raw pre-attention Utonia stream. V10 reads
             # every head at every temporal layer and learns a global-token
-            # softmax over the resulting dense coordinate expectations.
+            # softmax over the resulting dense coordinate expectations. V11
+            # keeps that adaptive-K backend but reads head 0 only, under a
+            # max-speed barrier, and mixes layers with plain learned scalars.
             backend_cls = {
                 DYNAMIC_VARIANT_V1: DynamicGaussianBackend,
                 DYNAMIC_VARIANT_V3: PhysicalVelocityGaussianBackend,
@@ -230,6 +234,7 @@ class Point2Gaus(nn.Module):
                 DYNAMIC_VARIANT_V10: (
                     LayerWeightedAttentionVelocityGaussianBackend
                 ),
+                DYNAMIC_VARIANT_V11: MaxSpeedBarrierVelocityGaussianBackend,
             }.get(self.dynamic_variant)
             if backend_cls is None:
                 raise ValueError(
@@ -244,11 +249,12 @@ class Point2Gaus(nn.Module):
             backend_kwargs = {}
             if self._uses_motion_proposal:
                 backend_kwargs["proposal_dim"] = self.utonia_feature_dim
-            if self.dynamic_variant == DYNAMIC_VARIANT_V10:
+            if self.dynamic_adaptive_count:
                 grid_query_cfg = getattr(cfg, "grid_query", None)
                 if grid_query_cfg is None:
                     raise ValueError(
-                        "V10 requires p2g.grid_query learned-count config"
+                        f"{self.dynamic_variant} requires p2g.grid_query "
+                        "learned-count config"
                     )
                 backend_kwargs["gaussian_count_cfg"] = grid_query_cfg
             self.dynamic_backend = backend_cls(
@@ -585,8 +591,8 @@ class Point2Gaus(nn.Module):
                 "timestamps_sec": timestamps_sec,
                 "window_duration_sec": window_duration_sec,
                 "routing_stats": routing_stats,
-                # V10 learns K only from rendering through the opacity STE gate.
-                # No count-budget objective is constructed or returned.
+                # V10/V11 learn K only from rendering through the opacity STE
+                # gate. No count-budget objective is constructed or returned.
                 "routing_budget_logits": None,
             }
 

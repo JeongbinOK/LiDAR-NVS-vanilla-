@@ -51,6 +51,8 @@ GLOBAL_REDUCED_LOSS_KEYS = {
     "budget_expected_mean_k",
     "budget_violation",
     "loss_velocity_l2",
+    "loss_velocity_l2_init",
+    "loss_velocity_l2_offset",
 }
 
 ADAPTIVE_BUDGET_LOG_KEYS = {
@@ -189,14 +191,26 @@ class ModelWrapper(LightningModule):
             mode = str(getattr(self._velocity_l2_cfg, "mode", "final_l2")).lower()
             if mode not in (
                 "final_l2", "final_group_l2", "final_group_l1", "offset_l2",
+                "offset_group_l2", "split_group_l2",
             ):
                 raise ValueError(
                     "velocity_l2.mode must be 'final_l2', 'final_group_l2', "
-                    "'final_group_l1', or 'offset_l2'; "
-                    f"got {mode!r}"
+                    "'final_group_l1', 'offset_l2', 'offset_group_l2', or "
+                    f"'split_group_l2'; got {mode!r}"
                 )
             self._velocity_l2_mode = mode
             self._wandb_loss_keys.add("loss_velocity_l2")
+            if mode == "split_group_l2":
+                for name in ("init_weight", "offset_weight"):
+                    value = getattr(self._velocity_l2_cfg, name, None)
+                    if value is None or float(value) < 0.0:
+                        raise ValueError(
+                            "velocity_l2.mode='split_group_l2' requires a "
+                            f"non-negative velocity_l2.{name}"
+                        )
+                self._wandb_loss_keys.update({
+                    "loss_velocity_l2_init", "loss_velocity_l2_offset",
+                })
 
     def on_save_checkpoint(self, checkpoint) -> None:
         """Bind the resolved experiment config immutably to each checkpoint."""
@@ -337,7 +351,10 @@ class ModelWrapper(LightningModule):
         non-vanishing restoring force near zero. All three act on the rendered
         final velocity. ``offset_l2`` instead computes the mean squared
         components of the learned V6 residual, leaving the
-        correspondence-derived initialization unregularized.
+        correspondence-derived initialization unregularized, and
+        ``offset_group_l2`` is that same residual under ``final_group_l2``'s
+        squared-norm reduction: ``mean(||v_offset||_2^2)``, three times the
+        strength of ``offset_l2`` at the same weight.
 
         The raw term is logged in every mode, but only train adds it to the
         optimized total, so validation totals stay a pure reconstruction score.
@@ -348,15 +365,18 @@ class ModelWrapper(LightningModule):
 
         mode = getattr(self, "_velocity_l2_mode", "final_l2")
         active = self._active_motion_items(gaussians)
+        if mode == "split_group_l2":
+            self._add_split_velocity_l2_prior(losses, active, prefix=prefix)
+            return
         if active:
-            if mode == "offset_l2":
+            if mode in ("offset_l2", "offset_group_l2"):
                 missing = [
                     index for index, item in enumerate(active)
                     if "velocity_offset" not in item
                 ]
                 if missing:
                     raise ValueError(
-                        "velocity_l2.mode='offset_l2' requires every active "
+                        f"velocity_l2.mode={mode!r} requires every active "
                         "Gaussian item to provide velocity_offset; missing at "
                         f"active item indices {missing}"
                     )
@@ -370,7 +390,7 @@ class ModelWrapper(LightningModule):
             if mode in ("final_l2", "offset_l2"):
                 local_sum = velocity.square().sum()
                 local_count = velocity.numel()
-            elif mode == "final_group_l2":
+            elif mode in ("final_group_l2", "offset_group_l2"):
                 # Same squared numerator as final_l2 over one count per
                 # Gaussian: exactly mean(||v||^2), i.e. 3x final_l2 for a
                 # three-component velocity.
@@ -398,6 +418,72 @@ class ModelWrapper(LightningModule):
             int(getattr(cfg, "ramp_steps", 0)),
         )
         weighted = raw_loss * effective_weight
+        losses["wc_velocity_l2"] = weighted.detach()
+        losses["total"] = losses["total"] + weighted
+
+    def _add_split_velocity_l2_prior(self, losses, active, *, prefix):
+        """Independent squared-norm priors on ``v_init`` and ``v_offset``.
+
+        Penalizing ``||v_init + v_offset||^2`` pays the correction to point
+        backwards: the cross term ``2<v_init, v_offset>`` is minimized by
+        cancellation rather than by being right. V5's residual head became a
+        pure shrink operator under exactly that objective
+        (median cos(init, offset) = -0.997). Charging each magnitude on its own
+        removes the cross term, so the offset is only worth what it explains,
+        while ``init_weight`` still bounds the matcher directly -- which
+        ``offset_l2`` alone did not, and V6's background ``|v_init|`` then grew
+        to 5.8 m/s, past the real vehicles it was supposed to track.
+
+        ``loss_velocity_l2`` stays what it is in every other mode: the raw,
+        unweighted magnitude, here the sum of the two component means. Only
+        ``total`` sees the weights, because two different weights cannot factor
+        out of the sum. That keeps the one wandb-visible number comparable in
+        kind and scale across variants.
+        """
+        cfg = self._velocity_l2_cfg
+        raw = {}
+        for name, field in (
+            ("init", "velocity_init"), ("offset", "velocity_offset"),
+        ):
+            if active:
+                missing = [
+                    index for index, item in enumerate(active)
+                    if field not in item
+                ]
+                if missing:
+                    raise ValueError(
+                        "velocity_l2.mode='split_group_l2' requires every "
+                        f"active Gaussian item to provide {field}; missing at "
+                        f"active item indices {missing}"
+                    )
+                value = torch.cat([item[field] for item in active], dim=0)
+                local_sum = value.square().sum()
+                local_count = value.shape[0]
+            else:
+                # Keep a local graph edge while still entering the same
+                # all-reduce as ranks that received occupied tokens.
+                local_sum = losses["total"] * 0.0
+                local_count = 0
+            raw[name], _global_count = distributed_token_mean(
+                local_sum, local_count
+            )
+            losses[f"loss_velocity_l2_{name}"] = raw[name]
+
+        losses["loss_velocity_l2"] = raw["init"] + raw["offset"]
+
+        if prefix != "train":
+            return
+        # Each term keeps its own weight; the schedule is a shared 0->1 ramp.
+        schedule = budget_weight_at_step(
+            1.0,
+            int(self.global_step),
+            int(getattr(cfg, "warmup_steps", 0)),
+            int(getattr(cfg, "ramp_steps", 0)),
+        )
+        weighted = schedule * (
+            float(getattr(cfg, "init_weight", 0.0)) * raw["init"]
+            + float(getattr(cfg, "offset_weight", 0.0)) * raw["offset"]
+        )
         losses["wc_velocity_l2"] = weighted.detach()
         losses["total"] = losses["total"] + weighted
 

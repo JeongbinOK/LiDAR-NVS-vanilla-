@@ -22,12 +22,13 @@ python main.py model.variant=dynamic_2dgs_attention_velocity_v7_2
 python main.py model.variant=dynamic_2dgs_attention_velocity_v8
 python main.py model.variant=dynamic_2dgs_attention_velocity_v9
 python main.py model.variant=dynamic_2dgs_attention_velocity_v10
+python main.py model.variant=dynamic_2dgs_attention_velocity_v11
 ```
 
 This `/4d` worktree defaults to `dynamic_2dgs_attention_velocity_v7_2` for a
 fresh run. `bbox_rigid_v1` is the historical box-routed model. V1 through V7.1,
-V8, V9, and V10 remain available for exact checkpoint reconstruction and controlled
-A/B runs.
+V8, V9, V10, and V11 remain available for exact checkpoint reconstruction and
+controlled A/B runs.
 V4/V5 reuse temporal cross-attention heads for velocity initialization. V6 does
 not: it adds an independent, time-free Siamese motion proposal before temporal
 cross-attention and uses the latter only for feature refinement. Its overlay
@@ -35,8 +36,8 @@ defaults to `device=[0]` and `data.bbox_json_path=null`; both remain ordinary
 CLI-overridable runtime settings.
 
 Dynamic V1-V9 emit one observed-medoid-seeded Gaussian per occupied endpoint
-token; V10 selects one to three range-quantile-seeded Gaussians. V3 through V6,
-V7.2, V8, V9, and V10 embed
+token; V10 and V11 select one to three range-quantile-seeded Gaussians. V3
+through V6, V7.2, V8, V9, V10, and V11 embed
 `time_coordinate = relative_seconds / time_reference_sec`, where
 `time_reference_sec=1.0` is fixed across samples. An irregular 0.8-second pair
 therefore supplies endpoint coordinates `[0, 0.8]`, rather than `[0, 1]`. Its
@@ -264,6 +265,53 @@ V10 regularizes `v_total=v_init+v_offset` with
 `0.01 * mean(||v_total||_2^2)`, keeps Chamfer at `0.02`, and sets the scale-loss
 weight to zero.
 
+V11 keeps V10's whole post-attention stack -- the same `learned_gumbel`
+K={1,2,3} router over `LN(f')`, the same feature-only `v_offset`, one token
+velocity index-expanded to every child Gaussian, and the same LoRA requirement --
+and changes only how correspondence is produced inside temporal attention.
+
+Its position encoding is split across heads. Head 0 is the sole correspondence
+head and is the only head whose probabilities touch coordinates; it carries no
+RoPE. Its logit instead takes one additive max-speed soft barrier,
+
+`bias_ij = -a * relu(||x_i - x_j|| / (v_max * |dt|) - 1)^2`, with
+`v_max = 30 m/s` and `a = 4`.
+
+The bias is exactly zero inside the radius `R = v_max * dt` a top-speed object
+could cover over the physical endpoint interval, and grows quadratically outside
+it: 0 at `R`, 1 logit at `1.5R`, 4 at `2R`, and 16 at `3R`. Because `v_init` is
+the readout displacement divided by that same interval, the barrier is a soft
+cap on `v_init` at `v_max`. QK-Norm holds the content logit spread near +-1 at
+initialization, so `a=4` is decisive at `2R` -- the same penalty V10's `-(d/R)^2`
+charges there -- while leaving everything inside `R` free, which V10's prior does
+not. Heads 1-11 keep ordinary metric 3D RoPE at `base=100` and
+`1.2566 rad/m` (`2*pi/scale = 5 m` for the highest-frequency band).
+
+The hinge is not a bilinear form, so unlike V10's quadratic it cannot be encoded
+in extra Q/K channels. Head 0 therefore runs an explicit softmax, chunked over
+`match_chunk_size` query rows and recomputed in backward the way V9's dense
+proposal is; heads 1-11 stay on varlen FlashAttention. Head 0's V carries the
+ordinary feature channels plus opposite-frame xyz, so one pass returns both its
+feature update and `W_l @ xyz`. `match_chunk_size` trades attention recompute
+against peak `N_q x N_k` score memory and never changes the result.
+
+`v_init` mixes the twelve head-0 coordinate expectations under `softmax(a_l)`
+over twelve plain learned scalars. Unlike V10 there is no query-only global token
+and no per-sample scorer MLP: the mixture is shared by every token and every
+sample, so it can only learn which *depth* resolves correspondence, starting from
+an exact uniform 1/12.
+
+V11's offset head is V8's rather than V10's feature-only one. Head 0's attended
+*feature* channels never carry the metric coordinate expectation itself, so the
+correction cannot see what it is correcting unless the initializer is embedded:
+`e_v = Linear(3,32) -> SiLU -> Linear(32,32)` on a detached `v_init`, then
+`Linear(96,3)(SiLU(Linear(432+32,96)([LN(f'), e_v])))`. The output Linear is still
+zero-initialized, so a fresh run starts at `v_total = v_init`, and detaching keeps
+`v_init + v_offset` the only route from the offset loss back into correspondence.
+
+V11 keeps Chamfer at `0.02` and the scale-loss weight at zero, and regularizes
+with `velocity_l2.mode=split_group_l2` at `init_weight = offset_weight = 0.01`.
+
 `velocity_l2.mode` selects the magnitude prior for every variant:
 
 - `final_l2` -- `mean(v_x^2, v_y^2, v_z^2)`, the historical STORM-calibrated
@@ -275,6 +323,38 @@ weight to zero.
   force near zero.
 - `offset_l2` -- `final_l2` applied to the learned residual only, leaving the
   correspondence initializer unregularized.
+- `offset_group_l2` -- `final_group_l2` applied to that same residual:
+  `mean(||v_offset||_2^2)`, three times `offset_l2` at an equal weight.
+- `split_group_l2` -- `init_weight * mean(||v_init||_2^2) + offset_weight *
+  mean(||v_offset||_2^2)`, charged independently. It takes `init_weight` and
+  `offset_weight` instead of `weight`, and both are rejected by every other mode.
+  Only the optimized total sees those weights: `loss_velocity_l2` stays the raw
+  unweighted magnitude (here `mean(||v_init||^2) + mean(||v_offset||^2)`) so the
+  one wandb-visible number remains comparable across variants, and
+  `loss_velocity_l2_init` / `loss_velocity_l2_offset` log the two means beside it.
+
+In every mode `loss_velocity_l2` is the raw term; the weighted contribution
+(`wc_velocity_l2`) is computed for the total but is not sent to wandb.
+
+The three families fail in opposite directions, which is why V11 splits them.
+Charging the *sum* makes the cross term `2<v_init, v_offset>` payable by
+cancellation rather than by being right: V5's residual became a pure shrink
+operator at median `cos(init, offset) = -0.997`, and the V8 `finall2` run ended at
+`|v_init| = 13.4`, `|v_offset| = 13.0`, `|v_total| = 0.50` m/s -- an offset that
+existed only to erase its own initializer. Charging *only the offset* removes that
+incentive but leaves the matcher unbounded, and then `v_init` is worth exactly
+what the matcher is worth: 0.9-1.8 m/s under V6/V7/V7.1's descriptor matchers,
+4.5 under V7.2's, and **64.3 m/s** under V8's broken Top-K readout -- the same
+architecture as the `finall2` run above, differing only in this key. Under
+offset-only reg `|v_offset|` also sits at 0.33-0.55 m/s in every such run, i.e.
+the prior pins the correction to near-nothing. Splitting bounds `v_init` directly
+while leaving the correction free to be worth what it explains.
+
+`barrier_weight` stays at 4. Re-scoring V11's trained head-0 features at other
+weights shows a=0 to a=4 is decisive (mass beyond the radius 11.2% -> 0.85%,
+`|dp|` 8.5 m -> 2.26 m) and a=4 to a=64 changes nothing past the fourth decimal:
+the residual mass sits just outside the radius, where the hinge is near zero by
+construction and no weight reaches it.
 
 For V3-V6, the fixed time reference only conditions network features; it is not the
 sample-dependent endpoint duration and is not used to reinterpret renderer

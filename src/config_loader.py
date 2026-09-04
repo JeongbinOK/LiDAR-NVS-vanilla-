@@ -31,12 +31,14 @@ DYNAMIC_VARIANT_V7_2 = "dynamic_2dgs_attention_velocity_v7_2"
 DYNAMIC_VARIANT_V8 = "dynamic_2dgs_attention_velocity_v8"
 DYNAMIC_VARIANT_V9 = "dynamic_2dgs_attention_velocity_v9"
 DYNAMIC_VARIANT_V10 = "dynamic_2dgs_attention_velocity_v10"
+DYNAMIC_VARIANT_V11 = "dynamic_2dgs_attention_velocity_v11"
 # The unsuffixed constant always names the current fresh-run baseline. Keep an
 # explicit constant for each predecessor so checkpoint semantics stay exact.
 DYNAMIC_VARIANT = DYNAMIC_VARIANT_V7_2
 # V4/V5 use a dense coordinate expectation from selected attention heads. V8
 # reuses selected final-layer heads with a consensus readout; V10 reads every
-# head at every layer and therefore has no `motion_head_count` config key.
+# head at every layer and therefore has no `motion_head_count` config key. V11
+# reads head 0 at every layer, so its match head is fixed rather than configured.
 _SELECTED_HEAD_ATTENTION_VELOCITY_VARIANTS = (
     DYNAMIC_VARIANT_V4,
     DYNAMIC_VARIANT_V5,
@@ -45,6 +47,18 @@ _SELECTED_HEAD_ATTENTION_VELOCITY_VARIANTS = (
 ATTENTION_VELOCITY_VARIANTS = (
     *_SELECTED_HEAD_ATTENTION_VELOCITY_VARIANTS,
     DYNAMIC_VARIANT_V10,
+    DYNAMIC_VARIANT_V11,
+)
+# Both read correspondence out of temporal attention itself and route the
+# refined token through the learned_gumbel K={1,2,3} grid Gaussian head.
+ADAPTIVE_COUNT_DYNAMIC_VARIANTS = (
+    DYNAMIC_VARIANT_V10,
+    DYNAMIC_VARIANT_V11,
+)
+# Head 0 alone carries the max-speed barrier and the coordinate readout; every
+# other head keeps 3D RoPE.
+BARRIER_MATCH_DYNAMIC_VARIANTS = (
+    DYNAMIC_VARIANT_V11,
 )
 DYNAMIC_VARIANTS = (
     DYNAMIC_VARIANT_V1,
@@ -59,6 +73,7 @@ DYNAMIC_VARIANTS = (
     DYNAMIC_VARIANT_V8,
     DYNAMIC_VARIANT_V9,
     DYNAMIC_VARIANT_V10,
+    DYNAMIC_VARIANT_V11,
 )
 
 # V3 and later share the physical-time contract. V4/V5 add attention-derived
@@ -75,6 +90,7 @@ PHYSICAL_VELOCITY_VARIANTS = (
     DYNAMIC_VARIANT_V8,
     DYNAMIC_VARIANT_V9,
     DYNAMIC_VARIANT_V10,
+    DYNAMIC_VARIANT_V11,
 )
 
 WARPED_PROPOSAL_VELOCITY_VARIANTS = (
@@ -135,6 +151,9 @@ VARIANT_CONFIG_PATHS = {
     ),
     DYNAMIC_VARIANT_V10: (
         REPO_ROOT / "config" / "variants" / f"{DYNAMIC_VARIANT_V10}.yaml"
+    ),
+    DYNAMIC_VARIANT_V11: (
+        REPO_ROOT / "config" / "variants" / f"{DYNAMIC_VARIANT_V11}.yaml"
     ),
 }
 
@@ -321,6 +340,74 @@ def _load_variant_overlay(variant: str) -> tuple[DictConfig, Path]:
     return overlay, path
 
 
+def _validate_adaptive_gaussian_count(config, label: str) -> None:
+    """Shared learned_gumbel K={1,2,3} router contract for V10 and V11."""
+
+    count_path = "p2g.grid_query"
+    _reject_unknown_keys(
+        config,
+        count_path,
+        {"count_mode", "grad_balance", "learned_count"},
+    )
+    if str(OmegaConf.select(
+        config, f"{count_path}.count_mode"
+    )).lower() != "learned_gumbel":
+        raise ValueError(
+            f"{label} requires p2g.grid_query.count_mode=learned_gumbel"
+        )
+    if str(OmegaConf.select(
+        config, f"{count_path}.grad_balance"
+    )).lower() not in ("sqrt_k", "none"):
+        raise ValueError(
+            f"{label} grid_query.grad_balance must be 'sqrt_k' or 'none'"
+        )
+    learned_path = f"{count_path}.learned_count"
+    _reject_unknown_keys(
+        config,
+        learned_path,
+        {"K_max", "tau", "seed_mode", "grad_balance_scope", "budget", "logging"},
+    )
+    if int(OmegaConf.select(config, f"{learned_path}.K_max")) != 3:
+        raise ValueError(f"{label} requires grid_query.learned_count.K_max=3")
+    if float(OmegaConf.select(config, f"{learned_path}.tau")) <= 0.0:
+        raise ValueError(f"{label} grid_query.learned_count.tau must be positive")
+    if str(OmegaConf.select(
+        config, f"{learned_path}.seed_mode"
+    )).lower() != "range_quantile":
+        raise ValueError(
+            f"{label} grid_query.learned_count.seed_mode must be "
+            "'range_quantile'"
+        )
+    if str(OmegaConf.select(
+        config, f"{learned_path}.grad_balance_scope"
+    )).lower() not in ("output", "token"):
+        raise ValueError(
+            f"{label} learned_count.grad_balance_scope must be "
+            "'output' or 'token'"
+        )
+    budget_path = f"{learned_path}.budget"
+    _reject_unknown_keys(config, budget_path, {"enable"})
+    if bool(OmegaConf.select(config, f"{budget_path}.enable")):
+        raise ValueError(f"{label} does not use a routing budget loss")
+    logging_path = f"{learned_path}.logging"
+    _reject_unknown_keys(
+        config, logging_path, {"enable", "interval", "range_edges_m"}
+    )
+    if int(OmegaConf.select(config, f"{logging_path}.interval")) <= 0:
+        raise ValueError(
+            f"{label} learned_count.logging.interval must be positive"
+        )
+
+
+def _variant_label(variant: str) -> str:
+    """Short human label ("V7.2", "V10") for a registered variant identifier."""
+
+    head, separator, tail = variant.rpartition("_v")
+    if head and separator and tail.replace("_", "").isdigit():
+        return "V" + tail.replace("_", ".")
+    return variant
+
+
 def validate_experiment_config(config) -> None:
     missing = [key for key in _REQUIRED_ROOTS if key not in config]
     if missing:
@@ -338,8 +425,10 @@ def validate_experiment_config(config) -> None:
     if variant in DYNAMIC_VARIANTS:
         if str(OmegaConf.select(config, "p2g.anchor_mode", default="")) != "grid":
             raise ValueError(f"{variant} requires p2g.anchor_mode=grid")
-        if variant == DYNAMIC_VARIANT_V10 and not lora_enabled:
-            raise ValueError("V10 requires p2g.utonia_lora.enable=true")
+        if variant in ADAPTIVE_COUNT_DYNAMIC_VARIANTS and not lora_enabled:
+            raise ValueError(
+                f"{_variant_label(variant)} requires p2g.utonia_lora.enable=true"
+            )
         if OmegaConf.select(config, "dynamic_2dgs", default=None) is None:
             raise ValueError(f"{variant} requires a dynamic_2dgs config block")
         trunk_dim = _configured_p2g_trunk_dim(
@@ -390,6 +479,15 @@ def validate_experiment_config(config) -> None:
                     "time_embedding_dim", "time_reference_sec",
                     "position_encoding", "distance_bias_speed_mps", "qk_norm",
                     "layer_weight_hidden_dim", "layer_scale_init",
+                }
+            elif variant in BARRIER_MATCH_DYNAMIC_VARIANTS:
+                temporal_keys = {
+                    "implementation", "layers", "num_heads", "mlp_ratio",
+                    "use_time_embedding", "time_frequencies",
+                    "time_embedding_dim", "time_reference_sec",
+                    "position_encoding", "barrier_speed_mps", "barrier_weight",
+                    "match_chunk_size", "rope_base", "rope_position_scale",
+                    "qk_norm", "layer_scale_init",
                 }
             else:
                 temporal_keys = {
@@ -530,75 +628,55 @@ def validate_experiment_config(config) -> None:
                     raise ValueError(
                         "V10 temporal.layer_weight_hidden_dim must be positive"
                     )
-                count_path = "p2g.grid_query"
-                _reject_unknown_keys(
-                    config,
-                    count_path,
-                    {"count_mode", "grad_balance", "learned_count"},
-                )
-                if str(OmegaConf.select(
-                    config, f"{count_path}.count_mode"
-                )).lower() != "learned_gumbel":
+                _validate_adaptive_gaussian_count(config, "V10")
+            elif variant in BARRIER_MATCH_DYNAMIC_VARIANTS:
+                label = _variant_label(variant)
+                temporal_path = "dynamic_2dgs.temporal"
+                if not bool(OmegaConf.select(
+                    config, f"{temporal_path}.use_time_embedding"
+                )):
                     raise ValueError(
-                        "V10 requires p2g.grid_query.count_mode=learned_gumbel"
+                        f"{label} requires dynamic_2dgs.temporal."
+                        "use_time_embedding=true"
                     )
                 if str(OmegaConf.select(
-                    config, f"{count_path}.grad_balance"
-                )).lower() not in ("sqrt_k", "none"):
+                    config, f"{temporal_path}.position_encoding"
+                )).lower() != "barrier_rope_split":
                     raise ValueError(
-                        "V10 grid_query.grad_balance must be 'sqrt_k' or 'none'"
-                    )
-                learned_path = f"{count_path}.learned_count"
-                _reject_unknown_keys(
-                    config,
-                    learned_path,
-                    {
-                        "K_max", "tau", "seed_mode", "grad_balance_scope",
-                        "budget", "logging",
-                    },
-                )
-                if int(OmegaConf.select(
-                    config, f"{learned_path}.K_max"
-                )) != 3:
-                    raise ValueError(
-                        "V10 requires grid_query.learned_count.K_max=3"
+                        f"{label} temporal.position_encoding must be "
+                        "'barrier_rope_split'"
                     )
                 if float(OmegaConf.select(
-                    config, f"{learned_path}.tau"
+                    config, f"{temporal_path}.barrier_speed_mps"
                 )) <= 0.0:
                     raise ValueError(
-                        "V10 grid_query.learned_count.tau must be positive"
+                        f"{label} temporal.barrier_speed_mps must be positive"
                     )
-                if str(OmegaConf.select(
-                    config, f"{learned_path}.seed_mode"
-                )).lower() != "range_quantile":
+                if float(OmegaConf.select(
+                    config, f"{temporal_path}.barrier_weight"
+                )) < 0.0:
                     raise ValueError(
-                        "V10 grid_query.learned_count.seed_mode must be "
-                        "'range_quantile'"
+                        f"{label} temporal.barrier_weight must be non-negative"
                     )
-                if str(OmegaConf.select(
-                    config, f"{learned_path}.grad_balance_scope"
-                )).lower() not in ("output", "token"):
-                    raise ValueError(
-                        "V10 learned_count.grad_balance_scope must be "
-                        "'output' or 'token'"
-                    )
-                budget_path = f"{learned_path}.budget"
-                _reject_unknown_keys(config, budget_path, {"enable"})
-                if bool(OmegaConf.select(config, f"{budget_path}.enable")):
-                    raise ValueError("V10 does not use a routing budget loss")
-                logging_path = f"{learned_path}.logging"
-                _reject_unknown_keys(
-                    config,
-                    logging_path,
-                    {"enable", "interval", "range_edges_m"},
-                )
                 if int(OmegaConf.select(
-                    config, f"{logging_path}.interval"
+                    config, f"{temporal_path}.match_chunk_size"
                 )) <= 0:
                     raise ValueError(
-                        "V10 learned_count.logging.interval must be positive"
+                        f"{label} temporal.match_chunk_size must be positive"
                     )
+                if not bool(OmegaConf.select(
+                    config, f"{temporal_path}.qk_norm"
+                )):
+                    raise ValueError(f"{label} requires temporal.qk_norm=true")
+                # Head 0 is the match head; every remaining head keeps 3D RoPE,
+                # so V11 still needs at least one of each.
+                if int(OmegaConf.select(
+                    config, f"{temporal_path}.num_heads"
+                )) < 2:
+                    raise ValueError(
+                        f"{label} requires dynamic_2dgs.temporal.num_heads >= 2"
+                    )
+                _validate_adaptive_gaussian_count(config, label)
             elif variant == DYNAMIC_VARIANT_V6:
                 time_hidden_dim = int(OmegaConf.select(
                     config, "dynamic_2dgs.temporal.time_hidden_dim"
@@ -877,6 +955,12 @@ def validate_experiment_config(config) -> None:
                 DYNAMIC_VARIANT_V10,
             ):
                 motion_keys.add("residual_hidden_dim")
+            elif variant in BARRIER_MATCH_DYNAMIC_VARIANTS:
+                # V11's offset head embeds v_init the way V8's does.
+                motion_keys.update({
+                    "residual_hidden_dim", "velocity_embedding_dim",
+                    "detach_init_condition",
+                })
             elif variant == DYNAMIC_VARIANT_V8:
                 motion_keys.update({
                     "detach_init_condition", "velocity_embedding_dim",
@@ -906,6 +990,7 @@ def validate_experiment_config(config) -> None:
                     *REFINED_PROPOSAL_VELOCITY_VARIANTS,
                     DYNAMIC_VARIANT_V8,
                     DYNAMIC_VARIANT_V10,
+                    *BARRIER_MATCH_DYNAMIC_VARIANTS,
                 )
                 and _has_path(config, "dynamic_2dgs.motion.residual_hidden_dim")
             ):
@@ -982,18 +1067,38 @@ def validate_experiment_config(config) -> None:
                 _reject_unknown_keys(
                     config,
                     "dynamic_2dgs.regularization.velocity_l2",
-                    {"enabled", "weight", "warmup_steps", "ramp_steps", "mode"},
+                    {
+                        "enabled", "weight", "warmup_steps", "ramp_steps",
+                        "mode", "init_weight", "offset_weight",
+                    },
                 )
-                mode = OmegaConf.select(
-                    config, "dynamic_2dgs.regularization.velocity_l2.mode"
-                )
+                velocity_l2_path = "dynamic_2dgs.regularization.velocity_l2"
+                mode = OmegaConf.select(config, f"{velocity_l2_path}.mode")
                 if mode is not None and str(mode) not in (
                     "final_l2", "final_group_l2", "final_group_l1", "offset_l2",
+                    "offset_group_l2", "split_group_l2",
                 ):
                     raise ValueError(
                         "dynamic_2dgs.regularization.velocity_l2.mode must be "
-                        "'final_l2', 'final_group_l2', 'final_group_l1', or "
-                        "'offset_l2'"
+                        "'final_l2', 'final_group_l2', 'final_group_l1', "
+                        "'offset_l2', 'offset_group_l2', or 'split_group_l2'"
+                    )
+                if str(mode) == "split_group_l2":
+                    for name in ("init_weight", "offset_weight"):
+                        value = OmegaConf.select(
+                            config, f"{velocity_l2_path}.{name}"
+                        )
+                        if value is None or float(value) < 0.0:
+                            raise ValueError(
+                                "velocity_l2.mode='split_group_l2' requires a "
+                                f"non-negative velocity_l2.{name}"
+                            )
+                elif _has_path(config, f"{velocity_l2_path}.init_weight") or (
+                    _has_path(config, f"{velocity_l2_path}.offset_weight")
+                ):
+                    raise ValueError(
+                        "velocity_l2.init_weight/offset_weight apply only to "
+                        "mode='split_group_l2'"
                     )
 
 
@@ -1229,6 +1334,7 @@ __all__ = [
     "DYNAMIC_VARIANT_V8",
     "DYNAMIC_VARIANT_V9",
     "DYNAMIC_VARIANT_V10",
+    "DYNAMIC_VARIANT_V11",
     "DYNAMIC_VARIANTS",
     "DURATION_OFFSET_VELOCITY_VARIANTS",
     "LEGACY_VARIANT",
