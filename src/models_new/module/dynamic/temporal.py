@@ -1563,6 +1563,175 @@ class MaxSpeedBarrierLayerWeightedCrossAttention(
         }
 
 
+class FinalFeatureBarrierCrossAttention(
+    MaxSpeedBarrierLayerWeightedCrossAttention
+):
+    """V11.2: uniform-RoPE flash refinement with one barrier readout at the end.
+
+    V11 splits its heads because head 0 has to double as the correspondence
+    head: it drops 3D RoPE, carries the max-speed barrier instead, and reads
+    opposite-frame coordinates at every layer.  That barrier is a hinge on
+    Euclidean distance rather than a bilinear form, so it cannot be folded into
+    Q/K channels and head 0 has to run an explicit chunked softmax while heads
+    1..H-1 stay on varlen FlashAttention.
+
+    V11.2 forms ``v_init`` *after* the stack, so nothing inside it needs to
+    read coordinates.  Head 0 therefore carries ordinary 3D RoPE like every
+    other head, the barrier leaves the layer loop entirely, and all ``H`` heads
+    go through one FlashAttention call per layer.  On an A100 at 7.5k tokens
+    per frame this is about 40% off the module's forward and backward.
+
+    Correspondence is then read once, from the complete final feature ``f'``,
+    by one dedicated head:
+
+    ``match_input_norm(f') -> match_q_proj/match_k_proj -> qk RMSNorm``.
+
+    That head is a structural copy of a single V11 readout head: the same
+    ``LayerNorm(dim) -> Linear(dim, head_dim) -> RMSNorm(head_dim)`` chain at
+    the same width.  PyTorch initializes ``Linear`` from ``fan_in``, which is
+    ``dim`` for both, so it starts from the identical distribution as head 0's
+    rows of V11's ``Linear(dim, dim)``.  Its dense softmax keeps V11's exact
+    barrier, chunking and backward recomputation; this is the one place in the
+    variant where geometry enters a probability.
+
+    Against V11 this moves two things at once, which the experiment intends:
+    where correspondence is read, and whether the layer stack still needs a
+    geometric prior of its own once it no longer produces correspondence.
+    """
+
+    def __init__(self, cfg, dim: int):
+        super().__init__(cfg, dim)
+        # Every head is a RoPE head here. V11's layer mixture had one scalar
+        # per layer to weight per-layer coordinate readouts; there are no
+        # per-layer readouts left to weight, so the parameter goes rather than
+        # sitting in the checkpoint collecting no gradient.
+        del self.layer_logits
+        self.rope_head_count = self.num_heads
+        # The one readout head, appended after the layer stack.
+        self.match_input_norm = nn.LayerNorm(self.dim)
+        self.match_q_proj = nn.Linear(self.dim, self.head_dim)
+        self.match_k_proj = nn.Linear(self.dim, self.head_dim)
+        self.match_q_norm = nn.RMSNorm(self.head_dim)
+        self.match_k_norm = nn.RMSNorm(self.head_dim)
+
+    @torch.no_grad()
+    def attention_temperature_stats(self):
+        """Per-layer QK gains, plus the readout head that faces the barrier.
+
+        The inherited per-layer keys stay comparable to a V11 run even though
+        head 0 now carries RoPE, because they describe the same projections.
+        ``qk_motion_head_count`` is corrected to zero: no layer head reads
+        coordinates any more. The readout's own bound is what races the fixed
+        barrier, so it is reported separately.
+        """
+        stats = super().attention_temperature_stats()
+        stats["qk_motion_head_count"] = 0.0
+        gamma_q = float(self.match_q_norm.weight.float().square().mean().sqrt())
+        gamma_k = float(self.match_k_norm.weight.float().square().mean().sqrt())
+        stats["qk_match_gamma_q"] = gamma_q
+        stats["qk_match_gamma_k"] = gamma_k
+        stats["qk_match_logit_bound"] = (
+            gamma_q * gamma_k * self.head_dim * self.scale
+        )
+        return stats
+
+    def _final_match_descriptors(self, refined, memory_rows):
+        """Project ``f'`` through this variant's own head-width readout."""
+        conditioned = self.match_input_norm(refined)
+        query = self.match_q_norm(self.match_q_proj(conditioned))
+        # Gather before the norm exactly as the layer stack does; RMSNorm is
+        # per row, so the order is a readability choice, not a numerical one.
+        key = self.match_k_norm(self.match_k_proj(conditioned)[memory_rows])
+        return query.float(), key.float()
+
+    def forward(
+        self,
+        feature,
+        position_ref,
+        token_offset,
+        frame_batch_idx,
+        token_time_coordinate,
+        token_duration_sec,
+    ):
+        n_tokens = int(feature.shape[0])
+        if token_time_coordinate.shape != (n_tokens,):
+            raise ValueError("V11 token time must provide one scalar per token")
+        layout = self._prepare_forward(
+            feature, position_ref, token_offset, frame_batch_idx,
+            token_duration_sec,
+        )
+        q_counts = layout["q_counts"]
+        k_counts = layout["k_counts"]
+        memory_rows = layout["memory_rows"]
+
+        x = feature + self.time_to_feature(
+            self.time_encoder(token_time_coordinate)
+        ).to(feature.dtype)
+
+        query_position = position_ref.float()
+        key_position = position_ref[memory_rows].float()
+        q_angles = self.rope.angles(query_position)
+        k_angles = self.rope.angles(key_position)
+        use_flash = self._use_flash(x)
+
+        for layer in range(self.n_layers):
+            snapshot = x
+            conditioned = self.input_norm[layer](snapshot)
+            q = self.q_proj[layer](conditioned).reshape(
+                n_tokens, self.num_heads, self.head_dim
+            )
+            k = self.k_proj[layer](conditioned)[memory_rows].reshape(
+                n_tokens, self.num_heads, self.head_dim
+            )
+            v = self.v_proj[layer](conditioned)[memory_rows].reshape(
+                n_tokens, self.num_heads, self.head_dim
+            )
+            # One call over every head: no head is held out of the kernel.
+            attended_inputs = (
+                self.rope.rotate(
+                    self.q_norm[layer](q).float(), q_angles[:, None, :, :]
+                ),
+                self.rope.rotate(
+                    self.k_norm[layer](k).float(), k_angles[:, None, :, :]
+                ),
+                v.float(),
+                q_counts,
+                k_counts,
+            )
+            if use_flash:
+                attended = self._flash_attention(*attended_inputs)
+            else:
+                attended = self._sdpa_attention(*attended_inputs)
+
+            attended = attended.reshape(n_tokens, self.dim).to(snapshot.dtype)
+            x = snapshot + self.cross_layer_scale[layer] * self.out_proj[layer](
+                attended
+            )
+            x = x + self.ffn[layer](self.ffn_norm[layer](x))
+
+        query, key = self._final_match_descriptors(x, memory_rows)
+        # The barrier softmax is V11's, chunked and recomputed in backward. The
+        # feature payload is zero because this attention is a coordinate
+        # readout only; probability still multiplies the real opposite-frame
+        # key coordinates inside ``_barrier_attention``.
+        _unused_feature, matched_position = self._barrier_attention(
+            query,
+            key,
+            key.new_zeros(key.shape),
+            query_position,
+            key_position,
+            layout["q_count_values"],
+            layout["k_count_values"],
+            layout["frame_radius_values"],
+        )
+        displacement = matched_position.float() - query_position
+        return x, {
+            "delta_p_match": displacement,
+            "delta_p_init": displacement,
+            "matched_position": matched_position,
+        }
+
+
 class GroupedHeadRMSNorm(nn.Module):
     """RMSNorm over the head dimension with one learned gain per head *group*.
 
@@ -1685,6 +1854,7 @@ __all__ = [
     "TimeConditionedParallelCrossAttention",
     "LayerWeightedDistanceBiasCrossAttention",
     "MaxSpeedBarrierLayerWeightedCrossAttention",
+    "FinalFeatureBarrierCrossAttention",
     "GroupedHeadRMSNorm",
     "GroupedGainBarrierCrossAttention",
  ]

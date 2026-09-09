@@ -61,6 +61,9 @@ _BACKEND_CLASS = {
     "dynamic_2dgs_attention_velocity_v11_1": (
         "SingleGaussianBarrierVelocityGaussianBackend"
     ),
+    "dynamic_2dgs_attention_velocity_v11_2": (
+        "FinalFeatureBarrierVelocityGaussianBackend"
+    ),
 }
 
 _PROPOSAL_VARIANTS = {
@@ -114,6 +117,12 @@ _PRE_REFACTOR_MANIFEST = {
     "dynamic_2dgs_attention_velocity_v11_1": (
         "faa47cf242bad2189a94", "7fbbbd9820a3046f0aa3"
     ),
+    # V11.2 keeps V11's layer parameters in V11's order, drops the layer
+    # mixture scalar it no longer has readouts to weight, and appends one
+    # correspondence readout head.
+    "dynamic_2dgs_attention_velocity_v11_2": (
+        "4c40f14d3df7daad233b", "00d8592912ab2b795fa1"
+    ),
 }
 
 
@@ -137,6 +146,8 @@ def _load_dynamic_module_without_renderer():
 _DYNAMIC = _load_dynamic_module_without_renderer()
 _SEMANTIC_MODULE_BY_EXPORT = {
     "DynamicGaussianBackend": "backends",
+    "FinalFeatureBarrierCrossAttention": "temporal",
+    "FinalFeatureBarrierVelocityGaussianBackend": "backends",
     "ConsensusAttentionMotionMatcher": "attention_matching",
     "GaussianAttributeHead": "heads",
     "StraightThroughTop4MotionProposal": "motion_proposals",
@@ -220,6 +231,7 @@ class DynamicCheckpointCompatibilityTest(unittest.TestCase):
         for variant in (
             "dynamic_2dgs_attention_velocity_v10",
             "dynamic_2dgs_attention_velocity_v11",
+            "dynamic_2dgs_attention_velocity_v11_2",
         ):
             with self.subTest(variant=variant):
                 config, _source = compose_fresh_config(

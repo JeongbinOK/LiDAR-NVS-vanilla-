@@ -22,7 +22,11 @@ from omegaconf import OmegaConf
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
-from src.config_loader import DYNAMIC_VARIANTS, compose_fresh_config
+from src.config_loader import (
+    DYNAMIC_VARIANTS,
+    DYNAMIC_VARIANT_V11_2,
+    compose_fresh_config,
+)
 from tests.test_checkpoint_compatibility import (
     _BACKEND_CLASS,
     _PROPOSAL_VARIANTS,
@@ -32,6 +36,12 @@ from tests.test_checkpoint_compatibility import (
 DIM = 144
 BASELINE_COMMIT = "a44d941a236948b1d9248936deaf2616d12de453"
 OUTPUT_FIELDS = ("position", "shs", "opacity", "scaling", "rotation", "velocity")
+# V11.2 was introduced after BASELINE_COMMIT. Its V11-identical state schema
+# is covered by test_checkpoint_compatibility; there is no historical forward
+# implementation at this commit to compare against.
+HISTORICAL_PARITY_VARIANTS = tuple(
+    variant for variant in DYNAMIC_VARIANTS if variant != DYNAMIC_VARIANT_V11_2
+)
 
 
 def _load_modules():
@@ -145,7 +155,7 @@ def _optional_gradients_match(left, right):
 def main():
     head_module, current_module = _load_modules()
     report = {}
-    for variant in DYNAMIC_VARIANTS:
+    for variant in HISTORICAL_PARITY_VARIANTS:
         positional, head_kwargs, current_kwargs, adaptive = _constructor_inputs(
             variant
         )

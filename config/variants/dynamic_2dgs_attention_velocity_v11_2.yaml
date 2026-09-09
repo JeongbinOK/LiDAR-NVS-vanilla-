@@ -1,0 +1,175 @@
+# Bbox-free Dynamic 2DGS V11.2.
+#
+# V11 with correspondence moved out of the layer stack. Every configured value
+# below is identical to V11 except model.variant (and the derived exp_name);
+# the parameters added and removed are described here rather than configured.
+#
+# V11 splits its heads because head 0 doubles as the correspondence head. It
+# drops 3D RoPE, carries the 30 m/s weight-4 hinge barrier instead, and reads
+# opposite-frame coordinates at every layer. That barrier is a hinge on
+# Euclidean distance, not a bilinear form, so it cannot be folded into Q/K
+# channels: head 0 has to run an explicit chunked softmax while heads 1-11 stay
+# on varlen FlashAttention.
+#
+# V11.2 builds v_init after the stack, so nothing inside it reads coordinates.
+# Head 0 carries ordinary 3D RoPE like every other head, the barrier leaves the
+# layer loop, and all twelve heads go through one FlashAttention call per
+# layer. Measured on one A100 at 7.5k tokens/frame, batch 2, forward and
+# backward of the temporal module alone: 1,034 ms -> 645 ms and 13.67 ->
+# 12.84 GiB, about 38% faster.
+#
+# Correspondence is read once, from the complete final feature f', by one
+# dedicated head: LayerNorm(432) shared by q and k, then Linear(432,36) each,
+# then RMSNorm(36) each. That is the same chain and width as a single V11
+# readout head, and PyTorch initializes Linear from fan_in, which is 432 for
+# both, so it starts from V11's own distribution. Its dense softmax keeps
+# V11's exact barrier, chunking and backward recomputation, and reads
+# opposite-frame key coordinates before subtracting the query coordinate. This
+# is the only place in the variant where geometry enters a probability.
+#
+# The head owns its 32,112 parameters -- 0.12% of the temporal stack -- rather
+# than borrowing layer 11's q_proj/k_proj rows. Borrowing costs nothing, but it
+# asks one projection to serve both layer 11's attention over its pre-FFN input
+# and this readout over the post-FFN output. V11's layer-mixture scalar is
+# dropped: there are no per-layer readouts left to weight.
+#
+# Against V11 this moves two things: where correspondence is read, and whether
+# the layer stack still needs a geometric prior of its own once it no longer
+# produces correspondence. Frozen stage-3 XYZI LoRA, adaptive K={1,2,3}, the
+# embedded detached v_init offset, signed physical duration, child-velocity
+# sharing, and all loss weights stay exactly V11.
+model:
+  variant: dynamic_2dgs_attention_velocity_v11_2
+
+device: [0]
+
+exp_name: ${model.variant}-bs-${train.batch_size}
+
+p2g:
+  anchor_mode: grid
+  freeze_utonia: true
+  utonia_feature_stage: 3
+  utonia_lora:
+    enable: true
+    input_mode: xyzi
+    rank: 16
+    alpha: 16
+    dropout: 0.0
+  # Inactive compatibility values; V11.2 validation requires LoRA above.
+  agg_mlp:
+    hidden_dim: 1024
+    hidden_layers: 2
+    out_dim: 576
+  joint_refiner:
+    num_heads: 12
+    rope_base: 10.0
+    rope_position_scale: 4.0
+  # V10's post-refinement K-adaptive grid head, unchanged. The router chooses
+  # exactly one of K={1,2,3} with hard Gumbel-Softmax STE; only the selected
+  # K-specific Gaussian head executes in the forward pass.
+  grid_query:
+    count_mode: learned_gumbel
+    grad_balance: sqrt_k
+    learned_count:
+      K_max: 3
+      tau: 1.0
+      seed_mode: range_quantile
+      grad_balance_scope: token
+      budget:
+        enable: false
+      logging:
+        enable: true
+        interval: 20
+        range_edges_m: [0, 10, 20, 30, 40, 60, 80, 110]
+
+data:
+  mode: bbox
+  bbox_json_path: null
+
+dynamic_2dgs:
+  temporal:
+    implementation: flash_varlen
+    layers: 12
+    num_heads: 12
+    mlp_ratio: 4
+
+    # V5 physical endpoint-time conditioning before layer one, as in V9/V10.
+    use_time_embedding: true
+    time_embedding_dim: 64
+    time_frequencies: 8
+    time_reference_sec: 1.0
+
+    position_encoding: barrier_rope_split
+
+    # The final readout's barrier; no layer carries one. The hinge is not a
+    # bilinear form, so it cannot be folded into extra Q/K channels and the
+    # readout runs an explicit chunked softmax. At init QK-Norm holds the
+    # content logit spread near +-1, so a=4 makes the barrier decisive well
+    # before it saturates: 0 inside R, 1 logit at 1.5R, 4 at 2R (matching what
+    # V10's quadratic charges at the same distance), and 16 at 3R. R = 30 m at
+    # the nominal 1.0 s endpoint interval.
+    barrier_speed_mps: 30.0
+    barrier_weight: 4.0
+    # Query rows per readout softmax chunk. Each chunk is recomputed in
+    # backward, so this trades peak N_q x N_k score memory against kernel-launch
+    # and chunk-boundary overhead; it never changes the result. At the ~7.5k
+    # tokens/frame a nuScenes sweep produces this is two chunks per frame and
+    # ~120 MB per transient score block. V11 paid this once per layer; V11.2
+    # pays it once per forward.
+    match_chunk_size: 4096
+
+    # All twelve heads, head 0 included. 2*pi/scale = 5 m for the
+    # highest-frequency 3D RoPE band.
+    rope_base: 100.0
+    rope_position_scale: 1.2566370614359172
+
+    qk_norm: true
+    layer_scale_init: 0.1
+
+  gaussian_head:
+    # These priors initialize every slot of each K-specific joint head.
+    initial_opacity: 0.2
+    initial_scale_m: 0.3
+
+  motion:
+    # The offset head is conditioned on the initializer it corrects:
+    #   e_v = Linear(3,32) -> SiLU -> Linear(32,32)
+    #   v_offset = Linear(96,3)(SiLU(Linear(432+32,96)([LN(f'), e_v])))
+    # head 0's attended feature channels carry no metric coordinate, so without
+    # this embedding the head cannot see what it is correcting. The zero output
+    # initialization still starts a fresh run at v_total = v_init.
+    zero_init: true
+    residual_hidden_dim: 96
+    velocity_embedding_dim: 32
+    # The conditioning copy is detached, so v_init + v_offset stays the only
+    # route from the offset loss back into correspondence. Every init-conditioned
+    # head in this repo does the same; flip it here to open the second path.
+    detach_init_condition: true
+
+  regularization:
+    small_motion:
+      enabled: false
+      weight: 0.005
+      epsilon_m: 0.001
+      warmup_steps: 300
+      ramp_steps: 1700
+
+    velocity_l2:
+      enabled: true
+      # w_i * mean(||v_init||_2^2) + w_o * mean(||v_offset||_2^2), charged
+      # independently. Penalizing the sum instead would pay the offset to point
+      # backwards through the cross term -- V5's residual collapsed to a pure
+      # shrink operator at cos(init, offset) = -0.997 under exactly that form.
+      # Regularizing only the offset (V6/V7) removes the shrink incentive but
+      # leaves v_init unbounded, and V6's background |v_init| then grew to
+      # 5.8 m/s, past the vehicles it was meant to track.
+      mode: split_group_l2
+      init_weight: 0.01
+      offset_weight: 0.01
+      warmup_steps: 0
+      ramp_steps: 0
+
+# Keep the requested reconstruction/scale objective explicit in this variant.
+loss:
+  w_chamfer: 0.02
+  w_scale: 0.0

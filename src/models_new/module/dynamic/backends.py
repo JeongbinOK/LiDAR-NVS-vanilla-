@@ -21,6 +21,7 @@ from .motion_proposals import (
     StraightThroughTop4MotionProposal,
 )
 from .temporal import (
+    FinalFeatureBarrierCrossAttention,
     GroupedGainBarrierCrossAttention,
     LayerWeightedDistanceBiasCrossAttention,
     MaxSpeedBarrierLayerWeightedCrossAttention,
@@ -510,23 +511,22 @@ class AttentionInitializedVelocityGaussianBackend(PhysicalVelocityGaussianBacken
         }
 
 class LayerMixtureMotionMixin:
-    """The correspondence-to-velocity contract V10, V11 and V11.1 all share.
+    """The correspondence-to-velocity contract of the late attention variants.
 
-    The temporal module mixes one coordinate readout per layer and returns the
-    displacement alongside the refined feature. Dividing that displacement by
-    the signed endpoint interval turns both source frames into one forward-time
-    ``v_init``, and the variant's own offset head corrects it. Only how the
-    readout is *produced* differs between the three, and that lives entirely in
-    the temporal module each one builds.
+    The temporal module returns a coordinate-readout displacement beside the
+    refined feature. Dividing it by the signed endpoint interval turns both
+    source frames into one forward-time ``v_init``, and the variant's offset
+    head corrects it. V10/V11/V11.1 mix layer maps; V11.2 replaces only that
+    readout with a final-feature map.
     """
 
     def _velocity_offset(self, refined, velocity_init):
         """The additive correction applied on top of ``v_init``.
 
-        V10's offset head reads only the refined token; V11 and V11.1 embed the
-        initializer they are correcting, because head 0's attended feature
-        channels never carry the metric coordinate expectation itself. The head
-        declares which it is, so no backend has to restate it.
+        V10's offset head reads only the refined token; V11, V11.1, and V11.2
+        embed the initializer they are correcting, because head 0's attended
+        feature channels never carry the metric coordinate expectation itself.
+        The head declares which it is, so no backend has to restate it.
         """
         if self.velocity_head.reads_velocity_init:
             return self.velocity_head(refined, velocity_init)
@@ -557,7 +557,7 @@ class LayerMixtureMotionMixin:
         velocity_init = delta_p_init / pair_delta_t_sec.unsqueeze(-1)
         velocity_offset = self._velocity_offset(refined, velocity_init)
         velocity = velocity_init + velocity_offset
-        return velocity, {
+        motion_fields = {
             "delta_p_match": temporal_fields["delta_p_match"],
             "delta_p_init": delta_p_init,
             "matched_position": temporal_fields["matched_position"],
@@ -565,9 +565,15 @@ class LayerMixtureMotionMixin:
             "velocity_match": velocity_init,
             "velocity_init": velocity_init,
             "velocity_offset": velocity_offset,
-            "motion_layer_logits": temporal_fields["motion_layer_logits"],
-            "motion_layer_weights": temporal_fields["motion_layer_weights"],
         }
+        # V10/V11/V11.1 genuinely use the layer mixture and keep their exact
+        # diagnostics. V11.2 reads correspondence from final f' instead, so it
+        # deliberately publishes neither a dormant logit nor a misleading
+        # layer-weight chart.
+        for name in ("motion_layer_logits", "motion_layer_weights"):
+            if name in temporal_fields:
+                motion_fields[name] = temporal_fields[name]
+        return velocity, motion_fields
 
 class LayerWeightedAttentionVelocityGaussianBackend(
     LayerMixtureMotionMixin, PhysicalVelocityGaussianBackend
@@ -898,6 +904,21 @@ class MaxSpeedBarrierVelocityGaussianBackend(
         what it is correcting unless the initializer is embedded explicitly.
         """
         return EmbeddedInitVelocityHead(cfg.motion, self.dim)
+
+
+class FinalFeatureBarrierVelocityGaussianBackend(
+    MaxSpeedBarrierVelocityGaussianBackend
+):
+    """V11.2: V11 with correspondence recomputed from complete final ``f'``.
+
+    Adaptive K, Gaussian construction, the embedded velocity offset, physical
+    signed-duration conversion, and child-velocity sharing are inherited from
+    V11 without modification.
+    """
+
+    def _build_temporal(self, cfg):
+        return FinalFeatureBarrierCrossAttention(cfg.temporal, self.dim)
+
 
 class SingleGaussianBarrierVelocityGaussianBackend(
     LayerMixtureMotionMixin, PhysicalVelocityGaussianBackend
@@ -1412,6 +1433,7 @@ __all__ = [
     "LayerMixtureMotionMixin",
     "LayerWeightedAttentionVelocityGaussianBackend",
     "MaxSpeedBarrierVelocityGaussianBackend",
+    "FinalFeatureBarrierVelocityGaussianBackend",
     "SingleGaussianBarrierVelocityGaussianBackend",
     "ConsensusAttentionVelocityGaussianBackend",
     "ProposalInitializedVelocityGaussianBackend",

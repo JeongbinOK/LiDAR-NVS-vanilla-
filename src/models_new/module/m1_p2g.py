@@ -202,11 +202,13 @@ class Point2Gaus(nn.Module):
                 DYNAMIC_VARIANT_V10,
                 DYNAMIC_VARIANT_V11,
                 DYNAMIC_VARIANT_V11_1,
+                DYNAMIC_VARIANT_V11_2,
             )
             from .dynamic_gaussian import (
                 AttentionInitializedVelocityGaussianBackend,
                 ConsensusAttentionVelocityGaussianBackend,
                 DynamicGaussianBackend,
+                FinalFeatureBarrierVelocityGaussianBackend,
                 LayerWeightedAttentionVelocityGaussianBackend,
                 MaxSpeedBarrierVelocityGaussianBackend,
                 SingleGaussianBarrierVelocityGaussianBackend,
@@ -230,6 +232,10 @@ class Point2Gaus(nn.Module):
             # softmax over the resulting dense coordinate expectations. V11
             # keeps that adaptive-K backend but reads head 0 only, under a
             # max-speed barrier, and mixes layers with plain learned scalars.
+            # V11.2 moves correspondence out of the stack entirely: every
+            # layer head gets RoPE so the loop is one FlashAttention call, and
+            # one dedicated readout head builds the initializer from the
+            # complete final feature under V11's barrier.
             backend_cls = {
                 DYNAMIC_VARIANT_V1: DynamicGaussianBackend,
                 DYNAMIC_VARIANT_V3: PhysicalVelocityGaussianBackend,
@@ -252,6 +258,9 @@ class Point2Gaus(nn.Module):
                 DYNAMIC_VARIANT_V11: MaxSpeedBarrierVelocityGaussianBackend,
                 DYNAMIC_VARIANT_V11_1: (
                     SingleGaussianBarrierVelocityGaussianBackend
+                ),
+                DYNAMIC_VARIANT_V11_2: (
+                    FinalFeatureBarrierVelocityGaussianBackend
                 ),
             }.get(self.dynamic_variant)
             if backend_cls is None:
@@ -607,8 +616,8 @@ class Point2Gaus(nn.Module):
                 "timestamps_sec": timestamps_sec,
                 "window_duration_sec": window_duration_sec,
                 "routing_stats": routing_stats,
-                # V10/V11 learn K only from rendering through the opacity STE
-                # gate. No count-budget objective is constructed or returned.
+                # V10/V11/V11.2 learn K only from rendering through the opacity
+                # STE gate. No count-budget objective is constructed or returned.
                 "routing_budget_logits": None,
             }
 

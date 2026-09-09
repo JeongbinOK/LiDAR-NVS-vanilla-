@@ -30,12 +30,14 @@ python main.py model.variant=dynamic_2dgs_attention_velocity_v8
 python main.py model.variant=dynamic_2dgs_attention_velocity_v9
 python main.py model.variant=dynamic_2dgs_attention_velocity_v10
 python main.py model.variant=dynamic_2dgs_attention_velocity_v11
+python main.py model.variant=dynamic_2dgs_attention_velocity_v11_1
+python main.py model.variant=dynamic_2dgs_attention_velocity_v11_2
 ```
 
 This `/4d` worktree defaults to `dynamic_2dgs_attention_velocity_v7_2` for a
 fresh run. `bbox_rigid_v1` is the historical box-routed model. V1 through V7.1,
-V8, V9, V10, and V11 remain available for exact checkpoint reconstruction and
-controlled A/B runs.
+V8, V9, V10, V11, V11.1, and V11.2 remain available for exact checkpoint
+reconstruction and controlled A/B runs.
 V4/V5 reuse temporal cross-attention heads for velocity initialization. V6 does
 not: it adds an independent, time-free Siamese motion proposal before temporal
 cross-attention and uses the latter only for feature refinement. Its overlay
@@ -43,10 +45,10 @@ defaults to `device=[0]` and `data.bbox_json_path=null`; both remain ordinary
 CLI-overridable runtime settings.
 
 Dynamic V1-V9 and V11.1 emit a fixed number of Gaussians per occupied endpoint
-token, one observed-medoid seed by default; V10 and V11 let a router select one
-to three range-quantile-seeded Gaussians instead. `p2g.grid_query` chooses
-between the two and sets the fixed count -- see "Gaussians per token" below. V3
-through V6, V7.2, V8, V9, V10, and V11 embed
+token, one observed-medoid seed by default; V10, V11, and V11.2 let a router
+select one to three range-quantile-seeded Gaussians instead. `p2g.grid_query`
+chooses between the two and sets the fixed count -- see "Gaussians per token"
+below. V3 through V6, V7.2, V8, V9, V10, V11, and V11.2 embed
 `time_coordinate = relative_seconds / time_reference_sec`, where
 `time_reference_sec=1.0` is fixed across samples. An irregular 0.8-second pair
 therefore supplies endpoint coordinates `[0, 0.8]`, rather than `[0, 1]`. Its
@@ -275,9 +277,9 @@ V10 regularizes `v_total=v_init+v_offset` with
 weight to zero.
 
 V11 keeps V10's whole post-attention stack -- the same `learned_gumbel`
-K={1,2,3} router over `LN(f')`, the same feature-only `v_offset`, one token
-velocity index-expanded to every child Gaussian, and the same LoRA requirement --
-and changes only how correspondence is produced inside temporal attention.
+K={1,2,3} router over `LN(f')`, one token velocity index-expanded to every
+child Gaussian, and the same LoRA requirement -- and changes only how
+correspondence is produced inside temporal attention.
 
 Its position encoding is split across heads. Head 0 is the sole correspondence
 head and is the only head whose probabilities touch coordinates; it carries no
@@ -320,6 +322,60 @@ zero-initialized, so a fresh run starts at `v_total = v_init`, and detaching kee
 
 V11 keeps Chamfer at `0.02` and the scale-loss weight at zero, and regularizes
 with `velocity_l2.mode=split_group_l2` at `init_weight = offset_weight = 0.01`.
+
+**V11.2** takes V11 and moves correspondence out of the layer stack. Every
+configured value is identical to V11 except `model.variant` and the `exp_name`
+derived from it. What changes is which parameters exist and where geometry
+enters a probability.
+
+V11 splits its heads because head 0 doubles as the correspondence head: it
+drops 3D RoPE, carries the barrier instead, and reads opposite-frame
+coordinates at every layer. The barrier is a hinge on Euclidean distance rather
+than a bilinear form, so it cannot be folded into Q/K channels, and head 0 has
+to run an explicit chunked softmax while heads 1-11 stay on varlen
+FlashAttention.
+
+V11.2 builds `v_init` after the stack, so nothing inside it reads coordinates.
+Head 0 carries ordinary 3D RoPE like every other head, the barrier leaves the
+layer loop, and all twelve heads go through one FlashAttention call per layer.
+Measured on one A100 at 7.5k tokens per frame, batch 2, forward and backward of
+the temporal module alone, this cuts 1,034 ms to 645 ms and 13.67 GiB to 12.84
+GiB.
+
+Correspondence is read once, from the complete final feature `f'` including
+layer 11's FFN, by one dedicated head: `LayerNorm(432)` shared by q and k, then
+`Linear(432, 36)` for each, then `RMSNorm(36)` for each. That is the same chain
+and the same width as a single V11 readout head, and PyTorch initializes
+`Linear` from `fan_in`, which is 432 for both, so it starts from V11's own
+distribution. For every query it scores every opposite-frame key as
+`q @ k * 36^-0.5 - 4 * relu(distance / (30 * duration_sec) - 1)^2`, keeping
+V11's query chunking and backward recomputation. Dense softmax probability
+multiplies the opposite-frame key coordinates to obtain `matched_position`;
+only then is the query coordinate subtracted to obtain displacement, and the
+downstream signed endpoint duration converts that displacement to `v_init`.
+This readout is the only place in the variant where geometry enters a
+probability.
+
+The head owns its 32,112 parameters, 0.12% of the temporal stack, rather than
+borrowing the head-0 rows of `q_proj[-1]`/`k_proj[-1]`. Borrowing costs nothing
+and keeps the parameter count at V11's, but it asks one projection to serve
+both layer 11's attention over its *pre*-FFN input and this readout over the
+*post*-FFN output, two input distributions no V11 readout ever spans. V11's
+`layer_logits` is dropped in the other direction: there are no per-layer
+readouts left for it to weight, so it would sit in the checkpoint collecting no
+gradient. V11's remaining layer parameters keep V11's names, shapes and order.
+
+The readout's gain is logged as `qk_match_gamma_q`/`qk_match_gamma_k` and
+`qk_match_logit_bound`, separate from V11's comparable per-layer keys, so its
+race against the fixed barrier stays visible. `qk_motion_head_count` reads zero
+here because no layer head touches coordinates. V11.2 publishes no
+layer-mixture diagnostics.
+
+Against V11 this moves two things on purpose: where correspondence is read, and
+whether the layer stack still needs a geometric prior of its own once it no
+longer produces correspondence. Adaptive K, token-velocity sharing, the
+detached embedded-init offset, split regularizer, Chamfer, and scale-loss
+contracts are inherited unchanged from V11.
 
 `velocity_l2.mode` selects the magnitude prior for every variant:
 
@@ -385,11 +441,12 @@ gain sits *above both* at nearly every layer (layer mean 1.368 against 1.292 and
 1.215), which is what a compromise pulled by twelve summed gradients looks like.
 The divergence widens every epoch rather than converging back.
 
-The second change is that the **adaptive-K Gaussian router is removed**. V10 and
-V11 route `LN(f')` through a hard Gumbel-Softmax over K={1,2,3} and run only the
-selected K-specific joint head, so one token can emit up to three Gaussians that
-all share its velocity. V11.1 instead uses the fixed-count contract described
-under "Gaussians per token" below, and its shipped overlay carries no
+The second change is that the **adaptive-K Gaussian router is removed**. V10,
+V11, and V11.2 route `LN(f')` through a hard Gumbel-Softmax over K={1,2,3} and
+run only the selected K-specific joint head, so one token can emit up to three
+Gaussians that all share its velocity. V11.1 instead uses the fixed-count
+contract described under "Gaussians per token" below, and its shipped overlay
+carries no
 `p2g.grid_query` block, which means one Gaussian per occupied token at that
 token's observed medoid. There is no count predictor, no straight-through
 opacity gate, no per-K gradient balancing and no seed bank. Token count and
@@ -512,8 +569,9 @@ Measured on one A100 at `batch_size=2` with a single temporal layer, V11.1 emits
 
 **Learned count (`count_mode: learned_gumbel`).** The refined token routes
 through the grid `GridSlotHead` and a hard Gumbel-Softmax over K={1,2,3} picks
-one K-specific joint head per token. Only V10 and V11 have this head; asking any
-other variant for it is rejected at config time rather than silently ignored.
+one K-specific joint head per token. Only V10, V11, and V11.2 have this head;
+asking any other variant for it is rejected at config time rather than silently
+ignored.
 The seed geometry it consumes is the K-specific candidate bank, not the padded
 fixed-count seed set, so the two contracts cannot be mixed.
 

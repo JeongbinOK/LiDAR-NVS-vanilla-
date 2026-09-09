@@ -9,6 +9,8 @@ import torch
 from omegaconf import OmegaConf
 
 from src.config_loader import (
+    ATTENTION_VELOCITY_VARIANTS,
+    BARRIER_MATCH_DYNAMIC_VARIANTS,
     ROUTER_CAPABLE_DYNAMIC_VARIANTS,
     DYNAMIC_VARIANT,
     DYNAMIC_VARIANT_V1,
@@ -25,7 +27,9 @@ from src.config_loader import (
     DYNAMIC_VARIANT_V10,
     DYNAMIC_VARIANT_V11,
     DYNAMIC_VARIANT_V11_1,
+    DYNAMIC_VARIANT_V11_2,
     LEGACY_VARIANT,
+    PHYSICAL_VELOCITY_VARIANTS,
     assert_model_variant_implemented,
     compose_fresh_config,
     load_checkpoint_config,
@@ -443,6 +447,40 @@ class ConfigLoaderTest(unittest.TestCase):
         self.assertNotIn(DYNAMIC_VARIANT_V11_1, ROUTER_CAPABLE_DYNAMIC_VARIANTS)
         self.assertIn(DYNAMIC_VARIANT_V11, ROUTER_CAPABLE_DYNAMIC_VARIANTS)
 
+    def test_v11_2_is_value_identical_to_v11_and_keeps_adaptive_k(self):
+        v11, _source = compose_fresh_config(OmegaConf.from_dotlist([
+            f"model.variant={DYNAMIC_VARIANT_V11}",
+        ]))
+        v11_2, source = compose_fresh_config(OmegaConf.from_dotlist([
+            f"model.variant={DYNAMIC_VARIANT_V11_2}",
+        ]))
+        left = OmegaConf.to_container(v11, resolve=False)
+        right = OmegaConf.to_container(v11_2, resolve=False)
+        self.assertNotEqual(left["model"]["variant"], right["model"]["variant"])
+        self.assertNotEqual(v11.exp_name, v11_2.exp_name)
+        left["model"]["variant"] = right["model"]["variant"]
+        self.assertEqual(left, right)
+        self.assertIn(f"{DYNAMIC_VARIANT_V11_2}.yaml", source)
+
+        for group in (
+            ATTENTION_VELOCITY_VARIANTS,
+            BARRIER_MATCH_DYNAMIC_VARIANTS,
+            PHYSICAL_VELOCITY_VARIANTS,
+            ROUTER_CAPABLE_DYNAMIC_VARIANTS,
+        ):
+            self.assertIn(DYNAMIC_VARIANT_V11_2, group)
+        count = v11_2.p2g.grid_query
+        self.assertEqual(count.count_mode, "learned_gumbel")
+        self.assertEqual(count.learned_count.K_max, 3)
+        self.assertEqual(count.learned_count.seed_mode, "range_quantile")
+        self.assertFalse(count.learned_count.budget.enable)
+
+        with self.assertRaisesRegex(ValueError, "K_max=3"):
+            compose_fresh_config(OmegaConf.from_dotlist([
+                f"model.variant={DYNAMIC_VARIANT_V11_2}",
+                "p2g.grid_query.learned_count.K_max=4",
+            ]))
+
     def test_v11_1_rejects_a_router_its_backend_cannot_run(self):
         """V11.1 has no count router, so asking for one is an error."""
         with self.assertRaises(ValueError) as raised:
@@ -497,7 +535,11 @@ class ConfigLoaderTest(unittest.TestCase):
 
     def test_neither_barrier_variant_accepts_the_removed_gate_keys(self):
         """The gate is gone from V11.1 as well, not just absent from V11."""
-        for variant in (DYNAMIC_VARIANT_V11, DYNAMIC_VARIANT_V11_1):
+        for variant in (
+            DYNAMIC_VARIANT_V11,
+            DYNAMIC_VARIANT_V11_1,
+            DYNAMIC_VARIANT_V11_2,
+        ):
             for key in (
                 "support_rho_m", "support_gate_lo", "support_gate_width",
             ):

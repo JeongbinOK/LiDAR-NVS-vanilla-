@@ -193,7 +193,7 @@ def _validate_dynamic_gaussian_count(config, variant, label: str) -> None:
 
 
 def _validate_adaptive_gaussian_count(config, label: str) -> None:
-    """Shared learned_gumbel K={1,2,3} router contract for V10 and V11."""
+    """Shared learned_gumbel K={1,2,3} router contract for router variants."""
 
     count_path = "p2g.grid_query"
     _reject_unknown_keys(
@@ -500,7 +500,7 @@ def validate_experiment_config(config) -> None:
                 )):
                     raise ValueError(f"{label} requires temporal.qk_norm=true")
                 # Head 0 is the match head; every remaining head keeps 3D RoPE,
-                # so V11 still needs at least one of each.
+                # so every barrier-match variant needs at least one of each.
                 if int(OmegaConf.select(
                     config, f"{temporal_path}.num_heads"
                 )) < 2:
@@ -737,7 +737,7 @@ def validate_experiment_config(config) -> None:
             ):
                 motion_keys.add("residual_hidden_dim")
             elif variant in BARRIER_MATCH_DYNAMIC_VARIANTS:
-                # V11's offset head embeds v_init the way V8's does.
+                # Barrier-match offset heads embed v_init the way V8's does.
                 motion_keys.update({
                     "residual_hidden_dim", "velocity_embedding_dim",
                     "detach_init_condition",

@@ -27,6 +27,8 @@ from src.models_new.module.dynamic_gaussian import (
     EmbeddedInitDurationVelocityHead,
     EmbeddedInitVelocityHead,
     FeatureOnlyVelocityOffsetHead,
+    FinalFeatureBarrierCrossAttention,
+    FinalFeatureBarrierVelocityGaussianBackend,
     GaussianAttributeHead,
     InitConditionedVelocityHead,
     LayerWeightedAttentionVelocityGaussianBackend,
@@ -333,6 +335,17 @@ def v11_backend_cfg(dim=24):
         "residual_hidden_dim": 8,
     })
     return cfg
+
+
+def v11_2_temporal_cfg(dim=24, heads=4, layers=3, match_chunk_size=2):
+    return v11_temporal_cfg(
+        dim=dim, heads=heads, layers=layers,
+        match_chunk_size=match_chunk_size,
+    )
+
+
+def v11_2_backend_cfg(dim=24):
+    return v11_backend_cfg(dim=dim)
 
 
 def v11_1_temporal_cfg(dim=24, heads=4, layers=3, match_chunk_size=2):
@@ -3523,6 +3536,377 @@ class V11MaxSpeedBarrierAttentionTest(unittest.TestCase):
             )
         speed = float(fields["delta_p_init"][0].norm() / duration)
         self.assertLess(speed, 30.0)
+
+
+class V11_2FinalFeatureBarrierAttentionTest(unittest.TestCase):
+    """V11.2 changes only the source of V11's coordinate readout."""
+
+    @staticmethod
+    def _forward_args(feature, position, first_frame_tokens, duration=0.8):
+        return V11MaxSpeedBarrierAttentionTest._forward_args(
+            feature, position, first_frame_tokens, duration
+        )
+
+    def test_432d_readout_head_mirrors_one_v11_readout_head(self):
+        torch.manual_seed(101)
+        module = FinalFeatureBarrierCrossAttention(
+            v11_2_temporal_cfg(heads=12, layers=1), dim=432
+        )
+        # Same chain and same widths as V11's LN -> head-0 rows -> RMSNorm.
+        self.assertEqual(module.head_dim, 36)
+        self.assertEqual(module.match_input_norm.normalized_shape, (432,))
+        self.assertEqual(module.match_q_proj.in_features, 432)
+        self.assertEqual(module.match_q_proj.out_features, 36)
+        self.assertEqual(module.match_k_proj.in_features, 432)
+        self.assertEqual(module.match_k_proj.out_features, 36)
+        self.assertIsNotNone(module.match_q_proj.bias)
+        self.assertIsNotNone(module.match_k_proj.bias)
+        self.assertEqual(tuple(module.match_q_norm.weight.shape), (36,))
+        self.assertEqual(tuple(module.match_k_norm.weight.shape), (36,))
+
+        # Linear draws from fan_in, which is 432 for both the readout head and
+        # V11's Linear(432,432), so the head starts at V11's own scale.
+        bound = 432 ** -0.5
+        for projection in (module.match_q_proj, module.match_k_proj):
+            self.assertLessEqual(float(projection.weight.abs().max()), bound)
+            self.assertLessEqual(float(projection.bias.abs().max()), bound)
+            self.assertGreater(float(projection.weight.abs().max()), 0.5 * bound)
+        torch.testing.assert_close(
+            module.match_q_norm.weight, torch.ones(36)
+        )
+        torch.testing.assert_close(
+            module.match_k_norm.weight, torch.ones(36)
+        )
+
+        refined = torch.randn(5, 432)
+        memory_rows = torch.tensor([3, 4, 3, 0, 1])
+        query, key = module._final_match_descriptors(refined, memory_rows)
+        conditioned = module.match_input_norm(refined)
+        torch.testing.assert_close(
+            query, module.match_q_norm(module.match_q_proj(conditioned)).float()
+        )
+        torch.testing.assert_close(
+            key,
+            module.match_k_norm(
+                module.match_k_proj(conditioned)[memory_rows]
+            ).float(),
+        )
+
+    def test_state_schema_adds_the_readout_head_and_drops_layer_logits(self):
+        torch.manual_seed(102)
+        v11 = MaxSpeedBarrierLayerWeightedCrossAttention(
+            v11_temporal_cfg(layers=2), dim=24
+        )
+        torch.manual_seed(102)
+        v11_2 = FinalFeatureBarrierCrossAttention(
+            v11_2_temporal_cfg(layers=2), dim=24
+        )
+        v11_names = [name for name, _p in v11.named_parameters()]
+        v11_2_names = [name for name, _p in v11_2.named_parameters()]
+        # V11's layer mixture weighted one coordinate readout per layer. V11.2
+        # has no per-layer readouts, so the scalar is removed rather than left
+        # in the checkpoint collecting no gradient.
+        self.assertIn("layer_logits", v11_names)
+        self.assertNotIn("layer_logits", v11_2_names)
+        self.assertFalse(hasattr(v11_2, "layer_logits"))
+
+        added = [n for n in v11_2_names if n.startswith("match_")]
+        self.assertEqual(added, [
+            "match_input_norm.weight", "match_input_norm.bias",
+            "match_q_proj.weight", "match_q_proj.bias",
+            "match_k_proj.weight", "match_k_proj.bias",
+            "match_q_norm.weight", "match_k_norm.weight",
+        ])
+        # Everything else is V11's stack, in V11's order, appended to.
+        self.assertEqual(
+            [n for n in v11_2_names if not n.startswith("match_")],
+            [n for n in v11_names if n != "layer_logits"],
+        )
+        head_dim, dim = v11_2.head_dim, v11_2.dim
+        self.assertEqual(
+            sum(p.numel() for n, p in v11_2.named_parameters()
+                if n.startswith("match_")),
+            2 * dim + 2 * (head_dim * dim + head_dim) + 2 * head_dim,
+        )
+        # One readout head, not one per layer: depth must not grow it.
+        deeper = FinalFeatureBarrierCrossAttention(
+            v11_2_temporal_cfg(layers=5), dim=24
+        )
+        self.assertEqual(
+            [n for n in deeper.state_dict() if n.startswith("match_")],
+            [n for n in v11_2.state_dict() if n.startswith("match_")],
+        )
+
+    def test_readout_head_gain_is_reported_next_to_v11s_layer_gains(self):
+        torch.manual_seed(107)
+        module = FinalFeatureBarrierCrossAttention(
+            v11_2_temporal_cfg(layers=2), dim=24
+        )
+        stats = module.attention_temperature_stats()
+        for name in ("qk_gamma_q_layer0", "qk_gamma_q_layer1",
+                     "qk_max_logit_bound", "barrier_weight"):
+            self.assertIn(name, stats)
+        self.assertAlmostEqual(stats["qk_match_gamma_q"], 1.0, places=5)
+        self.assertAlmostEqual(stats["qk_match_gamma_k"], 1.0, places=5)
+        self.assertAlmostEqual(
+            stats["qk_match_logit_bound"], module.head_dim ** 0.5, places=4
+        )
+        with torch.no_grad():
+            module.match_q_norm.weight.mul_(3.0)
+        self.assertAlmostEqual(
+            module.attention_temperature_stats()["qk_match_logit_bound"],
+            3.0 * module.head_dim ** 0.5, places=4,
+        )
+
+    def test_every_layer_head_carries_rope_and_no_layer_reads_coordinates(self):
+        """The layer stack is plain all-head RoPE cross-attention.
+
+        V11 holds head 0 out of the kernel to give it the barrier. V11.2 reads
+        correspondence after the stack, so nothing inside needs geometry beyond
+        RoPE and every head goes through one attention call.
+        """
+        torch.manual_seed(103)
+        module = FinalFeatureBarrierCrossAttention(
+            v11_2_temporal_cfg(heads=4, layers=3), dim=24
+        ).eval()
+        self.assertEqual(module.rope_head_count, module.num_heads)
+        feature = torch.randn(9, 24)
+        position = torch.randn(9, 3) * 3.0
+        args = self._forward_args(feature, position, 4)
+
+        barrier_calls = []
+        original_barrier = module._barrier_attention
+        original_combine = module._combine_layer_matches
+
+        def counting_barrier(*call_args, **call_kwargs):
+            barrier_calls.append(call_args[0].shape)
+            return original_barrier(*call_args, **call_kwargs)
+
+        def forbidden_combine(*_args, **_kwargs):
+            raise AssertionError("V11.2 must not mix per-layer readouts")
+
+        module._barrier_attention = counting_barrier
+        module._combine_layer_matches = forbidden_combine
+        with torch.no_grad():
+            refined, fields = module(*args)
+        # Exactly one barrier softmax per forward: the final readout.
+        self.assertEqual(len(barrier_calls), 1)
+        self.assertEqual(barrier_calls[0], (9, module.head_dim))
+        self.assertEqual(
+            set(fields), {"delta_p_match", "delta_p_init", "matched_position"}
+        )
+
+        # Reference layer stack: RoPE on all heads, one SDPA call per layer.
+        module._barrier_attention = original_barrier
+        module._combine_layer_matches = original_combine
+        q_counts, k_counts, memory_rows = module._frame_layout(args[2], args[3])
+        q_angles = module.rope.angles(position.float())
+        k_angles = module.rope.angles(position[memory_rows].float())
+        with torch.no_grad():
+            x = feature + module.time_to_feature(
+                module.time_encoder(args[4])
+            ).to(feature.dtype)
+            for layer in range(module.n_layers):
+                c = module.input_norm[layer](x)
+                shape = (9, module.num_heads, module.head_dim)
+                q = module.q_norm[layer](
+                    module.q_proj[layer](c).reshape(shape)
+                ).float()
+                k = module.k_norm[layer](
+                    module.k_proj[layer](c)[memory_rows].reshape(shape)
+                ).float()
+                v = module.v_proj[layer](c)[memory_rows].reshape(shape).float()
+                attended = module._sdpa_attention(
+                    module.rope.rotate(q, q_angles[:, None, :, :]),
+                    module.rope.rotate(k, k_angles[:, None, :, :]),
+                    v, q_counts, k_counts,
+                ).reshape(9, 24).to(x.dtype)
+                x = x + module.cross_layer_scale[layer] * module.out_proj[
+                    layer
+                ](attended)
+                x = x + module.ffn[layer](module.ffn_norm[layer](x))
+        torch.testing.assert_close(refined, x, atol=0.0, rtol=0.0)
+
+    def test_layer_stack_differs_from_v11_because_head0_gained_rope(self):
+        """The refinement is deliberately no longer bit-identical to V11.
+
+        V11.2 moves two things at once, and this pins the second: with head 0
+        on RoPE the barrier is gone from the layer loop, so f' must differ.
+        """
+        torch.manual_seed(109)
+        v11 = MaxSpeedBarrierLayerWeightedCrossAttention(
+            v11_temporal_cfg(layers=3), dim=24
+        ).eval()
+        v11_2 = FinalFeatureBarrierCrossAttention(
+            v11_2_temporal_cfg(layers=3), dim=24
+        ).eval()
+        shared = {
+            name: value for name, value in v11.state_dict().items()
+            if name != "layer_logits"
+        }
+        incompatible = v11_2.load_state_dict(shared, strict=False)
+        self.assertEqual(incompatible.unexpected_keys, [])
+        self.assertTrue(all(
+            key.startswith("match_") for key in incompatible.missing_keys
+        ))
+        feature = torch.randn(9, 24)
+        position = torch.randn(9, 3) * 3.0
+        args = self._forward_args(feature, position, 4)
+        with torch.no_grad():
+            refined_v11, fields_v11 = v11(*args)
+            refined_v11_2, fields_v11_2 = v11_2(*args)
+        self.assertGreater(
+            float((refined_v11_2 - refined_v11).abs().max()), 1.0e-4
+        )
+        self.assertIn("motion_layer_weights", fields_v11)
+        self.assertNotIn("motion_layer_weights", fields_v11_2)
+
+    def test_final_readout_is_exact_barrier_softmax_over_key_coordinates(self):
+        torch.manual_seed(104)
+        module = FinalFeatureBarrierCrossAttention(
+            v11_2_temporal_cfg(layers=2, match_chunk_size=2), dim=24
+        ).eval()
+        feature = torch.randn(9, 24)
+        position = torch.randn(9, 3) * 20.0
+        duration = 0.7
+        args = self._forward_args(feature, position, 4, duration)
+        with torch.no_grad():
+            refined, fields = module(*args)
+            q_counts, k_counts, memory_rows = module._frame_layout(
+                args[2], args[3]
+            )
+            query, key = module._final_match_descriptors(
+                refined, memory_rows
+            )
+
+        key_position = position[memory_rows]
+        query_start = 0
+        key_start = 0
+        radius = module.barrier_speed_mps * duration
+        for q_count_tensor, k_count_tensor in zip(q_counts, k_counts):
+            q_count = int(q_count_tensor)
+            k_count = int(k_count_tensor)
+            rows = slice(query_start, query_start + q_count)
+            keys = slice(key_start, key_start + k_count)
+            score = query[rows] @ key[keys].transpose(0, 1) * module.scale
+            score = score - module.barrier_weight * torch.relu(
+                torch.cdist(position[rows], key_position[keys]) / radius - 1.0
+            ).square()
+            probability = torch.softmax(score, dim=-1)
+            expected_position = probability @ key_position[keys]
+            torch.testing.assert_close(
+                fields["matched_position"][rows], expected_position,
+                atol=1.0e-4, rtol=1.0e-4,
+            )
+            query_start += q_count
+            key_start += k_count
+        torch.testing.assert_close(
+            fields["delta_p_init"], fields["matched_position"] - position
+        )
+        torch.testing.assert_close(
+            fields["delta_p_match"], fields["delta_p_init"]
+        )
+
+    def test_final_feature_and_readout_head_receive_correspondence_gradient(self):
+        torch.manual_seed(105)
+        module = FinalFeatureBarrierCrossAttention(
+            v11_2_temporal_cfg(layers=2), dim=24
+        ).train()
+        feature = torch.randn(8, 24, requires_grad=True)
+        position = torch.randn(8, 3) * 4.0
+        refined, fields = module(
+            *self._forward_args(feature, position, 4)
+        )
+        refined.retain_grad()
+        fields["matched_position"].square().sum().backward()
+        self.assertGreater(float(refined.grad.abs().sum()), 0.0)
+        self.assertGreater(float(feature.grad.abs().sum()), 0.0)
+        for name, parameter in module.named_parameters():
+            if name.startswith("match_"):
+                self.assertIsNotNone(parameter.grad, name)
+                self.assertGreater(float(parameter.grad.abs().sum()), 0.0, name)
+        # V11's layer-mixture scalar does not exist here at all.
+        self.assertFalse(hasattr(module, "layer_logits"))
+
+    def test_readout_path_touches_no_layer_parameter_of_its_own(self):
+        """Layer 11's Q/K see correspondence only through the trunk.
+
+        The readout owns its projection, so a gradient taken on the descriptor
+        path alone must leave every temporal-layer parameter untouched. That is
+        what separates "f' is a worse source" from "layer 11's weights were
+        split across two jobs".
+        """
+        torch.manual_seed(108)
+        module = FinalFeatureBarrierCrossAttention(
+            v11_2_temporal_cfg(layers=2), dim=24
+        ).train()
+        refined = torch.randn(8, 24)
+        memory_rows = torch.tensor([4, 5, 6, 7, 0, 1, 2, 3])
+        query, key = module._final_match_descriptors(refined, memory_rows)
+        (query.square().sum() + key.square().sum()).backward()
+        for name, parameter in module.named_parameters():
+            if name.startswith("match_"):
+                self.assertIsNotNone(parameter.grad, name)
+                self.assertGreater(float(parameter.grad.abs().sum()), 0.0, name)
+            else:
+                self.assertIsNone(parameter.grad, name)
+
+    def test_backend_keeps_embedded_offset_and_child_velocity_sharing(self):
+        torch.manual_seed(106)
+        backend = FinalFeatureBarrierVelocityGaussianBackend(
+            v11_2_backend_cfg(), _gs_params(), dim=24, offset_bound=0.8,
+            gaussian_count_cfg=v10_gaussian_count_cfg(),
+        ).eval()
+        self.assertIsInstance(
+            backend.temporal, FinalFeatureBarrierCrossAttention
+        )
+        self.assertIsInstance(backend.velocity_head, EmbeddedInitVelocityHead)
+        self.assertTrue(backend.velocity_head.detach_init_condition)
+        self.assertEqual(backend.gaussian_head.count_mode, "learned_gumbel")
+        with torch.no_grad():
+            backend.gaussian_head.count_predictor[-1].bias.copy_(
+                torch.tensor([-10.0, -10.0, 10.0])
+            )
+
+        tokens, first, duration = 8, 4, 0.8
+        feature = torch.randn(tokens, 24)
+        position = torch.randn(tokens, 3) * 2.0
+        seed, seed_delta = V10LayerWeightedAttentionTest._adaptive_seed_bank(
+            position
+        )
+        with torch.no_grad():
+            output = backend(
+                feature,
+                position,
+                seed,
+                torch.tensor([first, tokens]),
+                torch.tensor([0, 0]),
+                [torch.eye(4).repeat(2, 1, 1)],
+                [torch.tensor([0.0, 1.0])],
+                [torch.tensor([0.0, duration])],
+                torch.tensor([duration]),
+                seed_delta_sensor=seed_delta,
+            )
+        item = output["batch_gaussians"][0]
+        self.assertTrue(torch.equal(item["selected_k"], torch.full((24,), 3)))
+        shared_velocity = item["velocity"].reshape(tokens, 3, 3)
+        torch.testing.assert_close(
+            shared_velocity, shared_velocity[:, :1].expand_as(shared_velocity)
+        )
+        torch.testing.assert_close(
+            item["velocity_offset"], torch.zeros_like(item["velocity_offset"])
+        )
+        torch.testing.assert_close(
+            item["velocity"], item["velocity_init"] + item["velocity_offset"]
+        )
+        torch.testing.assert_close(
+            item["velocity_init"] * item["pair_delta_t_sec"].unsqueeze(-1),
+            item["delta_p_init"],
+        )
+        self.assertNotIn("motion_layer_logits", item)
+        self.assertNotIn("motion_layer_weights", item)
+        stats = ModelWrapper._motion_proposal_statistics([item])
+        self.assertFalse(any("motion_layer" in name for name in stats))
 
 
 class V11_1GroupedGainSingleGaussianTest(unittest.TestCase):
