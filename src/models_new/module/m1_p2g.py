@@ -19,13 +19,22 @@ from .anchor_modes import (
     build_spherical_gaussian_seeds,
 )
 from .builders import build_token_builder
-from .builders.common import UtoniaGridMapper
+from .builders.common import GridSeedConfig, UtoniaGridMapper
 from .feature_fusion import build_feature_fusion, fuse_features
 from .gaussian_assembly import (
     assemble_batch_gaussians,
     gradient_scale_identity,
     refresh_coord_ref_after_offset,
 )
+
+
+def _uses_learned_count(cfg) -> bool:
+    """Whether ``p2g.grid_query`` asks the router to predict the count."""
+    grid_query = getattr(cfg, "grid_query", None)
+    if grid_query is None:
+        return False
+    count_mode = str(getattr(grid_query, "count_mode", "legacy")).lower()
+    return count_mode in GridSeedConfig.LEARNED_COUNT_MODES
 
 
 class Point2Gaus(nn.Module):
@@ -107,20 +116,24 @@ class Point2Gaus(nn.Module):
         self.grid_mapper = UtoniaGridMapper(
             self.utonia_coord_scale, self.utonia_input_grid_size, self.utonia_stride_factor
         )
-        if self.dynamic_cfg is not None:
-            from src.config_loader import ADAPTIVE_COUNT_DYNAMIC_VARIANTS
-
-            self.dynamic_adaptive_count = (
-                self.dynamic_variant in ADAPTIVE_COUNT_DYNAMIC_VARIANTS
-            )
-        else:
-            self.dynamic_adaptive_count = False
+        # p2g.grid_query decides how many Gaussians a token becomes: absent or
+        # count_mode=legacy gives every token the same K_max (default one),
+        # while a learned count_mode hands the decision to the router. Nothing
+        # about that choice is pinned to the variant name.
+        self.dynamic_adaptive_count = (
+            self.dynamic_cfg is not None and _uses_learned_count(cfg)
+        )
         self.anchor_mode, self.anchor_builder = build_token_builder(
             cfg,
-            one_seed_per_token=(
+            fixed_count_seeds=(
                 self.dynamic_cfg is not None
                 and not self.dynamic_adaptive_count
             ),
+        )
+        self.dynamic_gaussians_per_token = (
+            self.anchor_builder.grid_seed_config.gaussians_per_token
+            if self.dynamic_cfg is not None and not self.dynamic_adaptive_count
+            else 1
         )
 
         self.agg_mlp = cfg.agg_mlp
@@ -255,13 +268,11 @@ class Point2Gaus(nn.Module):
             if self._uses_motion_proposal:
                 backend_kwargs["proposal_dim"] = self.utonia_feature_dim
             if self.dynamic_adaptive_count:
-                grid_query_cfg = getattr(cfg, "grid_query", None)
-                if grid_query_cfg is None:
-                    raise ValueError(
-                        f"{self.dynamic_variant} requires p2g.grid_query "
-                        "learned-count config"
-                    )
-                backend_kwargs["gaussian_count_cfg"] = grid_query_cfg
+                backend_kwargs["gaussian_count_cfg"] = cfg.grid_query
+            else:
+                backend_kwargs["gaussians_per_token"] = (
+                    self.dynamic_gaussians_per_token
+                )
             self.dynamic_backend = backend_cls(
                 self.dynamic_cfg,
                 cfg.gs_params,

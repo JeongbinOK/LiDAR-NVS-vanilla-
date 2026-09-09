@@ -158,6 +158,16 @@ def parse_args():
         action="store_true",
         help="run the requested steps and report CUDA peaks without overfit assertions",
     )
+    parser.add_argument(
+        "--override",
+        nargs="*",
+        default=[],
+        metavar="KEY=VALUE",
+        help=(
+            "extra OmegaConf dot-list overrides, e.g. "
+            "p2g.grid_query.K_max=2 p2g.grid_query.exp=1"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -181,6 +191,7 @@ def main():
         "data.bbox_json_path=null",
         "logger.enable=false",
         f"dynamic_2dgs.temporal.layers={args.attention_layers}",
+        *args.override,
     ])
     cfg, _ = compose_fresh_config(cli)
     dataset = NuScenesNVSDataset(cfg.data, split=args.split)

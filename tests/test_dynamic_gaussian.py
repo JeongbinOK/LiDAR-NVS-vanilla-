@@ -955,7 +955,7 @@ class DynamicGaussianTest(unittest.TestCase):
         self.assertTrue(torch.allclose(actual_q, expected_q, atol=1.0e-6))
         self.assertTrue(torch.allclose(actual_k, expected_k, atol=1.0e-6))
 
-    def _backend_output(self):
+    def _backend_output(self, gaussians_per_token=1):
         torch.manual_seed(11)
         gs_params = OmegaConf.create({
             "shs": 32,
@@ -965,7 +965,8 @@ class DynamicGaussianTest(unittest.TestCase):
             "offset": 3,
         })
         backend = PhysicalVelocityGaussianBackend(
-            backend_cfg(), gs_params, dim=24, offset_bound=0.8
+            backend_cfg(), gs_params, dim=24, offset_bound=0.8,
+            gaussians_per_token=gaussians_per_token,
         )
         feature = torch.randn(5, 24)
         token = torch.tensor([
@@ -975,7 +976,9 @@ class DynamicGaussianTest(unittest.TestCase):
             [0.1, 0.0, 0.0],
             [1.1, 0.0, 0.0],
         ])
-        seed = (token + torch.tensor([0.02, 0.01, 0.0])).unsqueeze(1)
+        seed = (token + torch.tensor([0.02, 0.01, 0.0])).unsqueeze(1).expand(
+            -1, gaussians_per_token, -1
+        ).contiguous()
         pose = [torch.eye(4).repeat(2, 1, 1)]
         output = backend(
             feature,
@@ -1010,6 +1013,63 @@ class DynamicGaussianTest(unittest.TestCase):
         ))
         self.assertTrue(torch.equal(item["velocity"], torch.zeros_like(item["velocity"])))
         self.assertEqual(int(output["batch"].numel()), 5)
+
+    def test_config_sets_how_many_gaussians_a_token_becomes(self):
+        """p2g.grid_query.K_max is the per-token Gaussian count, not a cap."""
+        backend, output = self._backend_output(gaussians_per_token=3)
+        item = output["batch_gaussians"][0]
+        self.assertEqual(backend.gaussians_per_token, 3)
+        self.assertEqual(item["position"].shape, (15, 3))
+        self.assertEqual(item["shs"].shape, (15, 32))
+        self.assertEqual(item["rotation"].shape, (15, 4))
+        self.assertEqual(int(output["batch"].numel()), 15)
+        # One head per attribute, three slots wide.
+        self.assertEqual(backend.gaussian_head.heads["shs"].out_features, 96)
+
+    def test_slot_rows_stay_token_major_so_per_token_fields_line_up(self):
+        _backend, output = self._backend_output(gaussians_per_token=3)
+        item = output["batch_gaussians"][0]
+        # Token 0-2 come from frame 0 at t=0; tokens 3-4 from frame 1 at 0.87.
+        self.assertTrue(torch.allclose(
+            item["source_time_sec"],
+            torch.tensor([0.0] * 9 + [0.87] * 6),
+        ))
+        velocity = item["velocity"].reshape(5, 3, 3)
+        self.assertTrue(torch.allclose(
+            velocity, velocity[:, :1].expand_as(velocity)
+        ))
+
+    def test_identical_seeds_separate_through_independent_slot_offsets(self):
+        """Every slot starts at the same seed but owns its own offset rows."""
+        backend, output = self._backend_output(gaussians_per_token=3)
+        offset_head = backend.gaussian_head.heads["offset"]
+        self.assertEqual(offset_head.out_features, 9)
+        position = output["batch_gaussians"][0]["position"].reshape(5, 3, 3)
+        # Zero-initialized offsets leave all three slots on the shared seed.
+        self.assertTrue(torch.allclose(
+            position, position[:, :1].expand_as(position)
+        ))
+        # Once a slot's own rows move, only that slot's Gaussian moves.
+        with torch.no_grad():
+            offset_head.bias.copy_(torch.tensor(
+                [0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.5, 0.0]
+            ))
+        _raw, offset, _feature = backend.gaussian_head(torch.zeros(2, 24))
+        offset = offset.reshape(2, 3, 3)
+        self.assertTrue(torch.allclose(offset[:, 0], torch.zeros(2, 3)))
+        self.assertFalse(torch.allclose(offset[:, 1], offset[:, 2]))
+
+    def test_every_slot_starts_at_the_identity_quaternion(self):
+        gs_params = OmegaConf.create({
+            "shs": 4, "opacity": 1, "scaling": 2, "rotation": 4, "offset": 3,
+        })
+        head = GaussianAttributeHead(
+            None, gs_params, dim=8, offset_bound=0.8, gaussians_per_token=3
+        )
+        self.assertTrue(torch.equal(
+            head.heads["rotation"].bias,
+            torch.tensor([1.0, 0.0, 0.0, 0.0] * 3),
+        ))
 
     def test_v4_signed_displacement_gives_both_frames_forward_velocity(self):
         gs_params = OmegaConf.create({

@@ -36,8 +36,9 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-from .common import (
-    GridSeedData,
+from .grid_seed_config import resolve_grid_seed_config
+from .grid_seeds import GridSeedData
+from .token_aggregation import (
     RawTokenMembership,
     aggregate_points_to_cells_with_membership,
     aggregate_points_to_cells_with_seeds,
@@ -63,85 +64,15 @@ class OccupiedTokenBatch:
 
 
 class OccupiedGridTokenBuilder(nn.Module):
-    def __init__(self, cfg, *, one_seed_per_token=False):
+    def __init__(self, cfg, *, fixed_count_seeds=False):
         super().__init__()
         self.cfg = cfg
         self.anchor_mode = str(getattr(cfg, "anchor_mode", "spherical")).lower()
         self.grid_seed_config = None
-        if self.anchor_mode == "grid" and one_seed_per_token:
-            # Fixed-count Dynamic 2DGS variants own this contract: one observed
-            # medoid seed for every occupied token. V10 passes false here and
-            # reuses the learned GridSlotHead seed bank instead.
-            self.grid_seed_config = ("legacy", 1, 1, 1, None)
-        elif self.anchor_mode == "grid":
-            grid_query = getattr(cfg, "grid_query", None)
-            if grid_query is None:
-                raise ValueError("p2g.grid_query config block is required for anchor_mode='grid'")
-            count_mode = str(
-                getattr(grid_query, "count_mode", "legacy")
-            ).lower()
-            if count_mode == "legacy":
-                k_max = getattr(grid_query, "K_max", None)
-                points_per_gaussian = getattr(
-                    grid_query, "points_per_gaussian", None
-                )
-                if k_max is None or points_per_gaussian is None:
-                    raise ValueError(
-                        "p2g.grid_query.K_max and points_per_gaussian are "
-                        "required for legacy grid seeds"
-                    )
-                k_max = int(k_max)
-                points_per_gaussian = int(points_per_gaussian)
-                if k_max <= 0:
-                    raise ValueError("p2g.grid_query.K_max must be positive")
-                if points_per_gaussian <= 0:
-                    raise ValueError(
-                        "p2g.grid_query.points_per_gaussian must be positive"
-                    )
-                exp = getattr(grid_query, "exp", None)
-                if exp is not None:
-                    exp = int(exp)
-                    if exp not in (1, 2):
-                        raise ValueError(
-                            "p2g.grid_query.exp must be null, 1, or 2"
-                        )
-                    if exp > k_max:
-                        raise ValueError(
-                            f"p2g.grid_query.exp={exp} requires K_max >= {exp}"
-                        )
-                self.grid_seed_config = (
-                    "legacy", points_per_gaussian, k_max, exp, None,
-                )
-            elif count_mode in ("learned_gumbel", "learned_gumbel_viewpt"):
-                learned_count = getattr(grid_query, "learned_count", None)
-                if learned_count is None:
-                    raise ValueError(
-                        "p2g.grid_query.learned_count is required for "
-                        f"count_mode={count_mode!r}"
-                    )
-                k_max = getattr(learned_count, "K_max", None)
-                if k_max is None or int(k_max) <= 0:
-                    raise ValueError(
-                        "p2g.grid_query.learned_count.K_max must be positive"
-                    )
-                seed_mode = str(
-                    getattr(learned_count, "seed_mode", "range_quantile")
-                ).lower()
-                if seed_mode != "range_quantile":
-                    raise ValueError(
-                        "p2g.grid_query.learned_count.seed_mode currently "
-                        "supports only 'range_quantile'"
-                    )
-                # Legacy points_per_gaussian/exp are deliberately not read in
-                # this branch: K is predicted after temporal feature fusion.
-                self.grid_seed_config = (
-                    count_mode, None, int(k_max), None, seed_mode,
-                )
-            else:
-                raise ValueError(
-                    "p2g.grid_query.count_mode must be 'legacy', "
-                    "'learned_gumbel', or 'learned_gumbel_viewpt'"
-                )
+        if self.anchor_mode == "grid":
+            self.grid_seed_config = resolve_grid_seed_config(
+                cfg, fixed_count=fixed_count_seeds
+            )
         lora_cfg = getattr(cfg, "utonia_lora", None)
         self.intensity_in_utonia = bool(
             getattr(lora_cfg, "enable", False)
@@ -192,14 +123,10 @@ class OccupiedGridTokenBuilder(nn.Module):
                 upos, ufeat, int5, occ, raw_count, membership = result
                 membership_list.append(membership)
             else:
-                (
-                    count_mode, points_per_gaussian, k_max, exp, seed_mode,
-                ) = self.grid_seed_config
                 result = aggregate_points_to_cells_with_seeds(
                     xyz, inten, grid_coord_list[i], feat_list[i],
                     coord_list[i], origins[i], mapper,
-                    points_per_gaussian, k_max, exp=exp,
-                    count_mode=count_mode, seed_mode=seed_mode,
+                    self.grid_seed_config,
                 )
                 upos, ufeat, int5, occ, raw_count, seed_data = result
                 seed_data_list.append(seed_data)

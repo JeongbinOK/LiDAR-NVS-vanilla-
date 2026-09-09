@@ -5,6 +5,7 @@ import unittest
 import torch
 
 from src.models_new.module.builders.common import (
+    GridSeedConfig,
     _aggregate_points_to_cells,
     aggregate_points_to_cells_with_membership,
     aggregate_points_to_cells_with_seeds,
@@ -76,6 +77,7 @@ def _aggregate_seed_cell(
     exp=None,
     count_mode="legacy",
     seed_mode=None,
+    fixed_count=False,
 ):
     intensity = torch.arange(1, points.shape[0] + 1, dtype=points.dtype)
     grid_coord = torch.tensor([[0, 0, 0]])
@@ -84,8 +86,15 @@ def _aggregate_seed_cell(
         voxel_coord = torch.tensor([[0.5, 0.5, 0.5]])
     return aggregate_points_to_cells_with_seeds(
         points, intensity, grid_coord, voxel_feature, voxel_coord,
-        torch.zeros(3), _UnitMapper(), points_per_gaussian, k_max, exp=exp,
-        count_mode=count_mode, seed_mode=seed_mode,
+        torch.zeros(3), _UnitMapper(),
+        GridSeedConfig(
+            count_mode=count_mode,
+            k_max=k_max,
+            points_per_gaussian=points_per_gaussian,
+            exp=exp,
+            seed_mode=seed_mode,
+            fixed_count=fixed_count,
+        ),
     )
 
 
@@ -108,7 +117,7 @@ def test_lora_builder_bypasses_separate_intensity_encoder():
     cfg = _builder_cfg("grid")
     cfg.utonia_lora = SimpleNamespace(enable=True)
 
-    builder = OccupiedGridTokenBuilder(cfg, one_seed_per_token=True)
+    builder = OccupiedGridTokenBuilder(cfg, fixed_count_seeds=True)
 
     assert builder.intensity_mode == "utonia_xyzi"
     assert builder.intensity_encoder is None
@@ -376,9 +385,98 @@ def test_viewpoint_additional_quantiles_repeat_observed_points_when_sparse():
     )
 
 
+def test_fixed_count_gives_every_token_k_max_medoid_slots():
+    points = torch.tensor([[0.1, 0.1, 0.1], [0.9, 0.9, 0.9], [0.5, 0.5, 0.5]])
+    seed_data = _aggregate_seed_cell(
+        points, points_per_gaussian=None, k_max=3, exp=1, fixed_count=True
+    )[-1]
+    medoid = seed_data.seed_sensor[0, 0]
+    assert seed_data.anchor_k.tolist() == [3]
+    torch.testing.assert_close(
+        seed_data.seed_sensor[0], medoid.expand(3, -1)
+    )
+    # The delta is measured from the geometric cell center for every slot.
+    torch.testing.assert_close(
+        seed_data.delta_sensor[0],
+        (medoid - torch.tensor([0.5, 0.5, 0.5])).expand(3, -1),
+    )
+
+
+def test_fixed_count_gives_every_token_k_max_token_coordinate_slots():
+    points = torch.tensor([[0.1, 0.1, 0.1], [0.9, 0.9, 0.9]])
+    token_coord = torch.tensor([[0.3, 0.4, 0.6]])
+    seed_data = _aggregate_seed_cell(
+        points, points_per_gaussian=None, k_max=3, voxel_coord=token_coord,
+        exp=2, fixed_count=True,
+    )[-1]
+    assert seed_data.anchor_k.tolist() == [3]
+    torch.testing.assert_close(
+        seed_data.seed_sensor[0], token_coord.expand(3, -1)
+    )
+
+
+def test_fixed_count_range_quantiles_ignore_the_raw_point_total():
+    """A fixed K spreads K quantile seeds however many points a token holds."""
+    sparse = torch.tensor([[0.10, 0.1, 0.1], [0.20, 0.1, 0.1]])
+    dense = torch.tensor([
+        [0.10, 0.1, 0.1], [0.20, 0.1, 0.1], [0.30, 0.1, 0.1],
+        [0.40, 0.1, 0.1], [0.50, 0.1, 0.1], [0.60, 0.1, 0.1],
+    ])
+    for points in (sparse, dense):
+        seed_data = _aggregate_seed_cell(
+            points, points_per_gaussian=None, k_max=4, exp=None,
+            fixed_count=True,
+        )[-1]
+        assert seed_data.anchor_k.tolist() == [4]
+        assert seed_data.seed_sensor.shape == (1, 4, 3)
+    # The same token under the raw-count rule would get only ceil(2/4)=1 slot.
+    variable = _aggregate_seed_cell(
+        sparse, points_per_gaussian=4, k_max=4, exp=None
+    )[-1]
+    assert variable.anchor_k.tolist() == [1]
+
+
+def test_dynamic_default_is_one_medoid_gaussian_per_token():
+    """An absent grid_query block keeps the historical fixed-count contract."""
+    cfg = _builder_cfg("grid")
+    del cfg.grid_query
+    builder = OccupiedGridTokenBuilder(cfg, fixed_count_seeds=True)
+    assert builder.grid_seed_config == GridSeedConfig(
+        count_mode="legacy", k_max=1, points_per_gaussian=1, exp=1,
+        fixed_count=True,
+    )
+    assert builder.grid_seed_config.gaussians_per_token == 1
+
+
+def test_fixed_count_builder_reads_k_max_from_config():
+    builder = OccupiedGridTokenBuilder(
+        _builder_cfg("grid", K_max=3, exp=1, points_per_gaussian=None),
+        fixed_count_seeds=True,
+    )
+    assert builder.grid_seed_config.gaussians_per_token == 3
+
+
+def test_fixed_count_builder_rejects_a_router_it_cannot_honour():
+    cfg = _builder_cfg(
+        "grid",
+        count_mode="learned_gumbel",
+        learned_count=SimpleNamespace(
+            K_max=3, tau=1.0, seed_mode="range_quantile"
+        ),
+    )
+    try:
+        OccupiedGridTokenBuilder(cfg, fixed_count_seeds=True)
+    except ValueError as error:
+        assert "fixed-count" in str(error)
+    else:
+        raise AssertionError("a learned count router must not be silently used")
+
+
 def test_grid_builder_exp_switches_only_grid_seed_construction():
     grid_builder = OccupiedGridTokenBuilder(_builder_cfg("grid", exp=2))
-    assert grid_builder.grid_seed_config == ("legacy", 4, 3, 2, None)
+    assert grid_builder.grid_seed_config == GridSeedConfig(
+        count_mode="legacy", k_max=3, points_per_gaussian=4, exp=2,
+    )
     learned_builder = OccupiedGridTokenBuilder(_builder_cfg(
         "grid",
         count_mode="learned_gumbel",
@@ -390,8 +488,8 @@ def test_grid_builder_exp_switches_only_grid_seed_construction():
             K_max=4, tau=1.0, seed_mode="range_quantile",
         ),
     ))
-    assert learned_builder.grid_seed_config == (
-        "learned_gumbel", None, 4, None, "range_quantile",
+    assert learned_builder.grid_seed_config == GridSeedConfig(
+        count_mode="learned_gumbel", k_max=4, seed_mode="range_quantile",
     )
     spherical_builder = OccupiedGridTokenBuilder(_builder_cfg("spherical", exp=2))
     assert spherical_builder.grid_seed_config is None
@@ -434,7 +532,10 @@ def test_seed_rows_follow_occupied_token_order_across_cells():
     ])
     result = aggregate_points_to_cells_with_seeds(
         points, torch.ones(4), grid_coord, voxel_feature, voxel_coord,
-        torch.zeros(3), _UnitMapper(), points_per_gaussian=2, k_max=2,
+        torch.zeros(3), _UnitMapper(),
+        GridSeedConfig(
+            count_mode="legacy", k_max=2, points_per_gaussian=2,
+        ),
     )
     _, feature, _, occupied, raw_count, seed_data = result
     seeds = seed_data.seed_sensor
