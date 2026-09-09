@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 
+import numpy as np
 from nuscenes.nuscenes import NuScenes
 from nuscenes.utils.splits import create_splits_scenes
 
@@ -25,6 +26,7 @@ from .nuscene import (
     NuScenesNVSDataset,
     _cfg_get,
     _resolve_bbox_json_path,
+    _sensor_to_world,
     NUSCENES_SWEEP_US,
     MAX_WIN_US,
     MIN_GAP_US,
@@ -181,6 +183,38 @@ class LiDAR4DNuScenesTestDataset(NuScenesNVSDataset):
         # + the exact window midpoint, which is the novel target view at T.
         V = len(window)
         return [0, V // 2, V - 1]
+
+    def target_boxes_ref(self, window_index: int):
+        """GT boxes at the target-second frame, in the window reference frame.
+
+        The collated ``gt["bbox"]`` comes from ``_boxes_in_sensor_frame``, which
+        reads the raw *keyframe* ``sample['anns']`` — for a non-keyframe target
+        sweep (T rarely lands on a 2 Hz keyframe) a moving object's box is stale
+        by up to ~0.5 s (metres of drift). ``nusc.get_boxes`` instead linearly
+        interpolates each annotation to the sweep timestamp, so the boxes line
+        up with the target-time LiDAR. Returned as ``(M, 7)``
+        ``[x,y,z,w,l,h,yaw]`` in the ref frame = the (T-0.5)s endpoint sensor
+        frame (the same ref ``__getitem__`` builds its poses/points in).
+        """
+        scene_idx, anchor = self.index[window_index]
+        window = self._sample_frames(scene_idx, anchor)
+        used = [window[i] for i in self._select_gt_indices(window)]
+        ref_token = used[0][0]
+        target_token = used[self.target_cam_index][0]
+
+        world_to_ref = np.linalg.inv(
+            _sensor_to_world(self.nusc, ref_token).astype(np.float64)
+        )
+        rot, trans = world_to_ref[:3, :3], world_to_ref[:3, 3]
+        yaw_offset = float(np.arctan2(rot[1, 0], rot[0, 0]))
+
+        boxes = []
+        for box in self.nusc.get_boxes(target_token):   # global frame, interpolated
+            cx, cy, cz = (rot @ np.asarray(box.center, np.float64) + trans).tolist()
+            w, l, h = (float(v) for v in box.wlh)
+            yaw = float(box.orientation.yaw_pitch_roll[0]) + yaw_offset
+            boxes.append([cx, cy, cz, w, l, h, yaw])
+        return np.asarray(boxes, np.float32).reshape(-1, 7)
 
     # ── helpers ─────────────────────────────────────────────────────────────
     def _walk_chain(self, start_token: str, n: int):

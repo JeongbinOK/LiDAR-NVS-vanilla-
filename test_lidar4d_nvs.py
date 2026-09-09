@@ -436,12 +436,18 @@ def main(cfg, config_source="unspecified"):
                 "gt_points": gt_pts,
             }
         seq_gauss[seq_name].append(center_frame)
+        # GT boxes at the target-second frame, interpolated to the sweep time
+        # (not the stale parent-keyframe anns) and in the Gaussian ref frame, so
+        # the surfel HTML can highlight in-bbox Gaussians + draw the boxes.
+        gt_boxes_ref = dataset.target_boxes_ref(i)
         surf = surfels_from_output(
-            model.g2p_model, target_gaussians, render_t
+            model.g2p_model, target_gaussians, render_t,
+            gt_boxes_ref=gt_boxes_ref,
         )
         seq_surfel[seq_name].append({
             "label": f"T={target_s}s", "static": surf["static"],
-            "dynamic": surf["dynamic"], "boxes": surf["boxes"],
+            "dynamic": surf["dynamic"], "dynamic_in_box": surf["dynamic_in_box"],
+            "boxes": surf["boxes"], "gt_boxes": surf["gt_boxes"],
             "input_points": in_pts, "gt_points": gt_pts,
             "pred_points": pred_pts})
 

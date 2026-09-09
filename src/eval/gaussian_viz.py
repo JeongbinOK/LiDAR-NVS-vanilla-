@@ -16,6 +16,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from src.models_new.utils.boxes import point_in_box
+
 
 def extract_frame(means_np: np.ndarray, is_dyn_np: np.ndarray,
                   max_static=None, seed: int = 0):
@@ -152,7 +154,9 @@ refresh();
 # layer names shared by both viewers
 L_STATIC = "gaussians (static)"
 L_DYN = "gaussians (dynamic)"
+L_DYN_INBOX = "gaussians (dynamic, in GT bbox)"
 L_BOX = "bbox"
+L_GT_BOX = "GT bbox"
 L_INPUT = "input LiDAR (2 endpoints)"
 L_GT = "GT LiDAR @ target t"
 L_PRED = "predicted LiDAR (raydrop kept)"
@@ -440,14 +444,20 @@ def dyn_boxes_from_output(g2p_model, b_gs, t_target: float) -> np.ndarray:
 
 def surfels_from_output(g2p_model, b_gs, t_target: float,
                         max_static=None, k: int = 8, sigma: float = 1.0,
-                        seed: int = 0):
+                        seed: int = 0, gt_boxes_ref=None):
     """Build 1-sigma surfel meshes (static + dynamic) for one window.
 
     Uses the SAME means/rotations the renderer uses (`get_means3D` /
     `get_rotations` at the target time) and 2D scales = softplus(scaling[:, :2]).
     Scales are shown AS-IS (no clamp) and `max_static=None` keeps ALL Gaussians,
     so degenerate large-scale Gaussians are fully visible for diagnosis. Also
-    returns the dynamic bboxes at the target time for overlay."""
+    returns the dynamic bboxes at the target time for overlay.
+
+    ``gt_boxes_ref`` (optional ``[M, 7]`` ``[x,y,z,w,l,h,yaw]`` boxes already in
+    the Gaussian ref frame, at the target time) splits the dynamic surfels into
+    those whose center falls inside a GT box (``dynamic_in_box``) and the rest
+    (``dynamic``); the boxes themselves are returned as ``gt_boxes`` for overlay.
+    """
     means = g2p_model.get_means3D(b_gs, t_target).detach()
     rots = g2p_model.get_rotations(b_gs, t_target).detach()
     sca = b_gs["scaling"].detach()
@@ -465,10 +475,29 @@ def surfels_from_output(g2p_model, b_gs, t_target: float,
         s_idx = np.random.default_rng(seed).choice(s_idx, max_static, replace=False)
     d_idx = np.where(is_dyn)[0]
 
+    # Split the dynamic surfels by GT-bbox membership (center-in-box).
+    gt_boxes_np = np.zeros((0, 7), np.float32)
+    d_in_idx = np.zeros((0,), np.int64)
+    if gt_boxes_ref is not None:
+        gb = (gt_boxes_ref.detach().float().cpu() if torch.is_tensor(gt_boxes_ref)
+              else torch.as_tensor(np.asarray(gt_boxes_ref), dtype=torch.float32))
+        gb = gb.reshape(-1, 7)
+        gt_boxes_np = gb.numpy().astype(np.float32)
+        if gb.shape[0] and d_idx.shape[0]:
+            assign = point_in_box(torch.from_numpy(means[d_idx]).float(), gb)
+            in_box = assign.numpy() >= 0
+            d_in_idx = d_idx[in_box]
+            d_idx = d_idx[~in_box]
+
     static = _ellipse_mesh(means[s_idx], rots[s_idx], su[s_idx], sv[s_idx], k, sigma)
     dynamic = _ellipse_mesh(means[d_idx], rots[d_idx], su[d_idx], sv[d_idx], k, sigma)
+    dynamic_in_box = _ellipse_mesh(
+        means[d_in_idx], rots[d_in_idx], su[d_in_idx], sv[d_in_idx], k, sigma
+    )
     boxes = dyn_boxes_from_output(g2p_model, b_gs, t_target)
-    return {"static": static, "dynamic": dynamic, "boxes": boxes}
+    return {"static": static, "dynamic": dynamic,
+            "dynamic_in_box": dynamic_in_box, "boxes": boxes,
+            "gt_boxes": gt_boxes_np}
 
 
 def _box_lines(boxes: np.ndarray):
@@ -498,7 +527,8 @@ def _box_lines(boxes: np.ndarray):
     return xs, ys, zs
 
 
-def _mesh_trace(mesh, color_by_height, visible, name, opacity, red=False):
+def _mesh_trace(mesh, color_by_height, visible, name, opacity, red=False,
+                color=None):
     v, f = mesh
     v = np.round(v, 1)
     tr = {"type": "mesh3d",
@@ -506,7 +536,9 @@ def _mesh_trace(mesh, color_by_height, visible, name, opacity, red=False):
           "i": f[:, 0].tolist(), "j": f[:, 1].tolist(), "k": f[:, 2].tolist(),
           "opacity": opacity, "flatshading": True, "name": name,
           "visible": visible, "hoverinfo": "skip"}
-    if red:
+    if color is not None:
+        tr["color"] = color
+    elif red:
         tr["color"] = "#e63946"
     else:
         tr["intensity"] = v[:, 2].tolist()
@@ -515,28 +547,39 @@ def _mesh_trace(mesh, color_by_height, visible, name, opacity, red=False):
     return tr
 
 
-def _box_trace(boxes, visible, name):
+def _box_trace(boxes, visible, name, color="#ffd000"):
     xs, ys, zs = _box_lines(np.asarray(boxes, np.float32).reshape(-1, 7))
     return {"type": "scatter3d", "mode": "lines",
             "x": [None if np.isnan(v) else round(float(v), 2) for v in xs],
             "y": [None if np.isnan(v) else round(float(v), 2) for v in ys],
             "z": [None if np.isnan(v) else round(float(v), 2) for v in zs],
-            "line": {"color": "#ffd000", "width": 3},
+            "line": {"color": color, "width": 3},
             "name": name, "visible": visible, "hoverinfo": "skip"}
 
 
 def save_sequence_surfel_html(path, title: str, frames: list):
     """frames: list of {"label", "static": (V,F), "dynamic": (V,F), "boxes": [M,7],
-    optional "input_points" [P,3], "gt_points" [Q,3], and
-    "pred_points" [R,3]} (all point sets in the Gaussian ref frame)."""
+    optional "dynamic_in_box": (V,F), "gt_boxes": [M,7], "input_points" [P,3],
+    "gt_points" [Q,3], and "pred_points" [R,3]} (all in the Gaussian ref frame).
+
+    ``dynamic_in_box`` (dynamic surfels whose center falls inside a GT box) is
+    drawn lime; ``gt_boxes`` are drawn as cyan wireframes. Both start visible.
+    """
+    empty_mesh = (np.zeros((0, 3), np.float32), np.zeros((0, 3), np.int64))
     traces, tags = [], []
     for fi, fr in enumerate(frames):
         traces.append(_mesh_trace(fr["static"], True, False, L_STATIC, 0.65))
         tags.append([fi, L_STATIC])
         traces.append(_mesh_trace(fr["dynamic"], False, False, L_DYN, 0.9, red=True))
         tags.append([fi, L_DYN])
+        traces.append(_mesh_trace(fr.get("dynamic_in_box", empty_mesh), False,
+                                  False, L_DYN_INBOX, 0.95, color="#39ff14"))
+        tags.append([fi, L_DYN_INBOX])
         traces.append(_box_trace(fr.get("boxes", np.zeros((0, 7))), False, L_BOX))
         tags.append([fi, L_BOX])
+        traces.append(_box_trace(fr.get("gt_boxes", np.zeros((0, 7))), False,
+                                 L_GT_BOX, color="#00e5ff"))
+        tags.append([fi, L_GT_BOX])
         traces.append(_point_trace(fr.get("input_points", np.zeros((0, 3))),
                                    "#9aa0a6", 1.2, L_INPUT))
         tags.append([fi, L_INPUT])
@@ -549,4 +592,5 @@ def save_sequence_surfel_html(path, title: str, frames: list):
 
     return _render(path, str(title) + " — 1σ surfels",
                    [fr["label"] for fr in frames], traces, tags,
-                   [L_STATIC, L_DYN, L_BOX, L_INPUT, L_GT, L_PRED], off=[L_INPUT])
+                   [L_STATIC, L_DYN, L_DYN_INBOX, L_BOX, L_GT_BOX,
+                    L_INPUT, L_GT, L_PRED], off=[L_INPUT])
