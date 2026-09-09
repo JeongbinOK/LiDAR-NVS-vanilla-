@@ -1386,22 +1386,26 @@ class MaxSpeedBarrierLayerWeightedCrossAttention(
             weights.detach().expand(token_count, -1),
         )
 
-    def forward(
+    def _prepare_forward(
         self,
         feature,
         position_ref,
         token_offset,
         frame_batch_idx,
-        token_time_coordinate,
         token_duration_sec,
     ):
+        """Validate the batch and resolve the ragged layout and barrier radii.
+
+        Every barrier variant needs exactly this, and needs it before any
+        attention runs. Resolving the counts and the radius to Python scalars
+        once matters: re-reading CUDA counts inside the layer loop would cost
+        several synchronizing host round-trips per temporal layer.
+        """
         n_tokens = int(feature.shape[0])
         if feature.shape != (n_tokens, self.dim):
             raise ValueError(f"V11 feature must be (N,{self.dim})")
         if position_ref.shape != (n_tokens, 3):
             raise ValueError("position_ref must align with V11 token features")
-        if token_time_coordinate.shape != (n_tokens,):
-            raise ValueError("V11 token time must provide one scalar per token")
         if token_duration_sec.shape != (n_tokens,):
             raise ValueError("V11 duration must provide one scalar per token")
         if not bool(torch.all(
@@ -1417,19 +1421,6 @@ class MaxSpeedBarrierLayerWeightedCrossAttention(
         if bool(torch.any(q_counts <= 0)) or bool(torch.any(k_counts <= 0)):
             raise ValueError("V11 requires tokens in both endpoint frames")
 
-        x = feature + self.time_to_feature(
-            self.time_encoder(token_time_coordinate)
-        ).to(feature.dtype)
-
-        query_position = position_ref.float()
-        key_position = position_ref[memory_rows].float()
-        q_angles = self.rope.angles(query_position)
-        k_angles = self.rope.angles(key_position)
-        # Resolve the ragged layout and the barrier radius to Python scalars
-        # once. Re-reading CUDA counts inside the layer loop would otherwise
-        # cost several synchronizing host round-trips per temporal layer.
-        q_count_values = [int(value) for value in q_counts.tolist()]
-        k_count_values = [int(value) for value in k_counts.tolist()]
         frame_duration = self._frame_first(token_duration_sec, q_counts)
         if not torch.equal(
             torch.repeat_interleave(frame_duration, q_counts),
@@ -1439,18 +1430,23 @@ class MaxSpeedBarrierLayerWeightedCrossAttention(
                 "V11 requires one endpoint interval per frame; the barrier "
                 "radius is a per-sample physical duration"
             )
-        # What an object at the admissible top speed could cover over this
-        # sample's endpoint interval.
-        frame_radius_values = [
-            max(self.barrier_speed_mps * float(value), 1.0e-4)
-            for value in frame_duration.tolist()
-        ]
+        return {
+            "n_tokens": n_tokens,
+            "q_counts": q_counts,
+            "k_counts": k_counts,
+            "memory_rows": memory_rows,
+            "q_count_values": [int(value) for value in q_counts.tolist()],
+            "k_count_values": [int(value) for value in k_counts.tolist()],
+            # What an object at the admissible top speed could cover over this
+            # sample's endpoint interval.
+            "frame_radius_values": [
+                max(self.barrier_speed_mps * float(value), 1.0e-4)
+                for value in frame_duration.tolist()
+            ],
+        }
 
-        use_flash = (
-            x.is_cuda
-            and flash_attn is not None
-            and self.implementation in ("flash_varlen", "auto")
-        )
+    def _use_flash(self, x):
+        """Whether the varlen kernel is available for this batch."""
         if (
             x.is_cuda
             and self.implementation == "flash_varlen"
@@ -1460,6 +1456,45 @@ class MaxSpeedBarrierLayerWeightedCrossAttention(
                 "V11 temporal attention requested flash_varlen, but "
                 "flash_attn is unavailable"
             )
+        return (
+            x.is_cuda
+            and flash_attn is not None
+            and self.implementation in ("flash_varlen", "auto")
+        )
+
+    def forward(
+        self,
+        feature,
+        position_ref,
+        token_offset,
+        frame_batch_idx,
+        token_time_coordinate,
+        token_duration_sec,
+    ):
+        if token_time_coordinate.shape != (int(feature.shape[0]),):
+            raise ValueError("V11 token time must provide one scalar per token")
+        layout = self._prepare_forward(
+            feature, position_ref, token_offset, frame_batch_idx,
+            token_duration_sec,
+        )
+        n_tokens = layout["n_tokens"]
+        q_counts = layout["q_counts"]
+        k_counts = layout["k_counts"]
+        memory_rows = layout["memory_rows"]
+        q_count_values = layout["q_count_values"]
+        k_count_values = layout["k_count_values"]
+        frame_radius_values = layout["frame_radius_values"]
+
+        x = feature + self.time_to_feature(
+            self.time_encoder(token_time_coordinate)
+        ).to(feature.dtype)
+
+        query_position = position_ref.float()
+        key_position = position_ref[memory_rows].float()
+        q_angles = self.rope.angles(query_position)
+        k_angles = self.rope.angles(key_position)
+
+        use_flash = self._use_flash(x)
 
         layer_matched_positions = []
         for layer in range(self.n_layers):
@@ -1526,6 +1561,7 @@ class MaxSpeedBarrierLayerWeightedCrossAttention(
             "motion_layer_logits": token_logits,
             "motion_layer_weights": token_weights,
         }
+
 
 class GroupedHeadRMSNorm(nn.Module):
     """RMSNorm over the head dimension with one learned gain per head *group*.
