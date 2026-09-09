@@ -1,5 +1,12 @@
 # Experiment configuration
 
+The Python implementation is split by responsibility. `src/config_loader.py`
+keeps composition, checkpoint restore, and the historical import API.
+`src/experiment_config/definitions.py` owns variant constants and schema key
+sets, `helpers.py` owns shared OmegaConf operations, and `validation.py` owns
+static config validation. Dependencies flow from definitions through helpers to
+validation; none of those modules imports `config_loader`.
+
 Fresh runs are composed in this order:
 
 1. `nuscene_train.yaml` shared base
@@ -35,8 +42,10 @@ cross-attention and uses the latter only for feature refinement. Its overlay
 defaults to `device=[0]` and `data.bbox_json_path=null`; both remain ordinary
 CLI-overridable runtime settings.
 
-Dynamic V1-V9 emit one observed-medoid-seeded Gaussian per occupied endpoint
-token; V10 and V11 select one to three range-quantile-seeded Gaussians. V3
+Dynamic V1-V9 and V11.1 emit a fixed number of Gaussians per occupied endpoint
+token, one observed-medoid seed by default; V10 and V11 let a router select one
+to three range-quantile-seeded Gaussians instead. `p2g.grid_query` chooses
+between the two and sets the fixed count -- see "Gaussians per token" below. V3
 through V6, V7.2, V8, V9, V10, and V11 embed
 `time_coordinate = relative_seconds / time_reference_sec`, where
 `time_reference_sec=1.0` is fixed across samples. An irregular 0.8-second pair
@@ -379,16 +388,16 @@ The divergence widens every epoch rather than converging back.
 The second change is that the **adaptive-K Gaussian router is removed**. V10 and
 V11 route `LN(f')` through a hard Gumbel-Softmax over K={1,2,3} and run only the
 selected K-specific joint head, so one token can emit up to three Gaussians that
-all share its velocity. V11.1 emits exactly one Gaussian per occupied token, at
-that token's observed medoid, through the plain `GaussianAttributeHead` the
-fixed-count Dynamic variants (V3-V9) already use -- so its variant config carries
-**no `p2g.grid_query` block at all**, and one is rejected rather than silently
-ignored. There is no count predictor, no straight-through opacity gate, no per-K
-gradient balancing and no seed bank. Token count and Gaussian count become the
-same number, which also removes an index expansion that quietly weighted every
-per-token diagnostic and every per-token regularizer by that token's K:
-`velocity_l2` and the motion statistics are now plain token means. Measured peak
-memory is unchanged (31.1 GiB against V11's 31.4 at 12 layers, `batch_size=2`).
+all share its velocity. V11.1 instead uses the fixed-count contract described
+under "Gaussians per token" below, and its shipped overlay carries no
+`p2g.grid_query` block, which means one Gaussian per occupied token at that
+token's observed medoid. There is no count predictor, no straight-through
+opacity gate, no per-K gradient balancing and no seed bank. Token count and
+Gaussian count become the same number, which also removes an index expansion
+that quietly weighted every per-token diagnostic and every per-token regularizer
+by that token's K: `velocity_l2` and the motion statistics are now plain token
+means. Measured peak memory is unchanged (31.1 GiB against V11's 31.4 at 12
+layers, `batch_size=2`).
 
 An **earlier V11.1 also gated the readout** by how much attention mass sat within
 `support_rho_m` of it, through a saturating ramp `clip((W - lo)/width, 0, 1)` with
@@ -450,6 +459,66 @@ do not use that fallback automatically. After inspecting the artifact, opt in
 with `allow_legacy_wandb_fallback=true`. Ray geometry and temporal-window fields
 under `data` are protected as structural semantics; dataset paths, splits, and
 worker counts remain runtime-overridable.
+
+## Gaussians per token (`p2g.grid_query`)
+
+How many 2D Gaussians one occupied Utonia token becomes is a config decision,
+not a property of the variant name. `p2g.grid_query.count_mode` selects between
+two contracts, and both are available to any Dynamic variant whose backend can
+run them.
+
+**Fixed count (`count_mode: legacy`, the default).** Every occupied token emits
+exactly `K_max` Gaussians, which is required whenever the block is present.
+`exp` says where those seeds start:
+
+| `exp` | seed placement |
+| --- | --- |
+| `1` | the token's observed medoid -- the raw point nearest its own-frame Cartesian mean |
+| `2` | the token's Utonia cell coordinate |
+| `null` | `K_max` deterministic range quantiles over the token's own raw points |
+
+Seeds that coincide are not redundant: the Gaussian head owns one parameter
+block per slot, including the bounded position offset, so slots starting at the
+same coordinate learn independent geometry. Under `exp: null` a token holding
+fewer raw points than slots repeats observed points, the same way the
+learned-count candidate bank does.
+
+Omitting the whole `p2g.grid_query` block means `K_max: 1, exp: 1`: one Gaussian
+per token at its medoid. That is what every fixed-count Dynamic variant (V1,
+V3-V9, V11.1) has always done, so their existing configs and checkpoints are
+unaffected. V1 remains limited to `K_max: 1` because its seed-conditioned head
+refines features at token resolution; V3-V9 and V11.1 support larger fixed
+counts. `points_per_gaussian` is read only by the grid *anchor* head, where K
+varies per token as `ceil(raw_count / points_per_gaussian)`; a fixed count never
+consults it.
+
+Because the count is fixed and identical for every token, a mean over Gaussians
+is exactly a mean over tokens. `velocity_l2` and the motion diagnostics stay
+unweighted no matter what `K_max` is set to.
+
+```bash
+# Two Gaussians per token, both starting at the token's observed medoid.
+python main.py model.variant=dynamic_2dgs_attention_velocity_v11_1 \
+  p2g.grid_query.K_max=2 p2g.grid_query.exp=1
+
+# Three Gaussians per token, spread over that token's raw points by range.
+python main.py model.variant=dynamic_2dgs_attention_velocity_v11_1 \
+  p2g.grid_query.K_max=3 p2g.grid_query.exp=null
+```
+
+Peak memory and step time scale with the Gaussian count, not the token count.
+Measured on one A100 at `batch_size=2` with a single temporal layer, V11.1 emits
+29,343 Gaussians at `K_max=1` and 58,686 at `K_max=2` from the same tokens.
+
+**Learned count (`count_mode: learned_gumbel`).** The refined token routes
+through the grid `GridSlotHead` and a hard Gumbel-Softmax over K={1,2,3} picks
+one K-specific joint head per token. Only V10 and V11 have this head; asking any
+other variant for it is rejected at config time rather than silently ignored.
+The seed geometry it consumes is the K-specific candidate bank, not the padded
+fixed-count seed set, so the two contracts cannot be mixed.
+
+Both counts are structural: `p2g` is a checkpoint-protected root, so a resume or
+evaluation cannot change how many Gaussians a checkpoint's tokens produce.
 
 ## Compact validation (`data.compact_val`)
 

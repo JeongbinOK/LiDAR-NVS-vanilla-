@@ -69,9 +69,11 @@ p2g:
     num_heads: 12
     rope_base: 10.0
     rope_position_scale: 4.0
-  # No grid_query block: one Gaussian per occupied token is the fixed-count
-  # seed contract, and configuring a router here is rejected rather than
-  # silently ignored.
+  # No grid_query block: the fixed-count default is one Gaussian per occupied
+  # token, seeded at that token's observed medoid. Set p2g.grid_query.K_max to
+  # emit more per token (and p2g.grid_query.exp to choose where they start);
+  # see "Gaussians per token" in config/README.md. This variant has no count
+  # router, so count_mode=learned_gumbel is rejected rather than ignored.
 
 data:
   mode: bbox

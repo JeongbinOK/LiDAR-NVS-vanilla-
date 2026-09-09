@@ -9,7 +9,7 @@ import torch
 from omegaconf import OmegaConf
 
 from src.config_loader import (
-    ADAPTIVE_COUNT_DYNAMIC_VARIANTS,
+    ROUTER_CAPABLE_DYNAMIC_VARIANTS,
     DYNAMIC_VARIANT,
     DYNAMIC_VARIANT_V1,
     DYNAMIC_VARIANT_V3,
@@ -401,7 +401,12 @@ class ConfigLoaderTest(unittest.TestCase):
     def test_v10_requires_exact_k123_router_without_budget(self):
         invalid = (
             ("p2g.utonia_lora.enable=false", "utonia_lora.enable=true"),
-            ("p2g.grid_query.count_mode=legacy", "count_mode"),
+            # Switching V10 to a fixed count is allowed, but the router keys
+            # the overlay ships would then be read by nothing.
+            (
+                "p2g.grid_query.count_mode=legacy",
+                "grad_balance, learned_count",
+            ),
             ("p2g.grid_query.learned_count.K_max=4", "K_max=3"),
             ("p2g.grid_query.learned_count.tau=0", "tau"),
             (
@@ -432,14 +437,14 @@ class ConfigLoaderTest(unittest.TestCase):
         self.assertEqual(config.dynamic_2dgs.regularization.velocity_l2.mode,
                          "split_group_l2")
         self.assertTrue(config.p2g.utonia_lora.enable)
-        # One Gaussian per token: no router is configured, and V11.1 is not on
-        # the adaptive-count list that would demand one.
+        # One Gaussian per token: no grid_query block is configured, and
+        # V11.1's backend has no router it could be pointed at.
         self.assertIsNone(OmegaConf.select(config, "p2g.grid_query"))
-        self.assertNotIn(DYNAMIC_VARIANT_V11_1, ADAPTIVE_COUNT_DYNAMIC_VARIANTS)
-        self.assertIn(DYNAMIC_VARIANT_V11, ADAPTIVE_COUNT_DYNAMIC_VARIANTS)
+        self.assertNotIn(DYNAMIC_VARIANT_V11_1, ROUTER_CAPABLE_DYNAMIC_VARIANTS)
+        self.assertIn(DYNAMIC_VARIANT_V11, ROUTER_CAPABLE_DYNAMIC_VARIANTS)
 
-    def test_v11_1_rejects_a_stale_router_block(self):
-        """A grid_query block would be read by nothing, so it is an error."""
+    def test_v11_1_rejects_a_router_its_backend_cannot_run(self):
+        """V11.1 has no count router, so asking for one is an error."""
         with self.assertRaises(ValueError) as raised:
             compose_fresh_config(OmegaConf.from_dotlist([
                 f"model.variant={DYNAMIC_VARIANT_V11_1}",
@@ -447,6 +452,48 @@ class ConfigLoaderTest(unittest.TestCase):
             ]))
         self.assertIn("grid_query", str(raised.exception))
         self.assertIn("V11.1", str(raised.exception))
+
+    def test_grid_query_sets_the_per_token_gaussian_count(self):
+        """K_max is how many Gaussians each token becomes; exp seeds them."""
+        for variant in (DYNAMIC_VARIANT, DYNAMIC_VARIANT_V11_1):
+            for k_max, exp in ((1, 1), (2, 1), (2, 2), (4, None)):
+                with self.subTest(variant=variant, K_max=k_max, exp=exp):
+                    config, _source = compose_fresh_config(
+                        OmegaConf.from_dotlist([
+                            f"model.variant={variant}",
+                            f"p2g.grid_query.K_max={k_max}",
+                            f"p2g.grid_query.exp={'null' if exp is None else exp}",
+                        ])
+                    )
+                    self.assertEqual(config.p2g.grid_query.K_max, k_max)
+                    self.assertEqual(config.p2g.grid_query.exp, exp)
+
+    def test_absent_grid_query_is_one_gaussian_per_token(self):
+        config, _source = compose_fresh_config(OmegaConf.from_dotlist([
+            f"model.variant={DYNAMIC_VARIANT_V11_1}",
+        ]))
+        self.assertIsNone(OmegaConf.select(config, "p2g.grid_query"))
+
+    def test_fixed_gaussian_count_rejects_impossible_settings(self):
+        invalid = (
+            ("p2g.grid_query.K_max=0", "positive"),
+            ("p2g.grid_query.K_max=1 p2g.grid_query.exp=2", "K_max >= 2"),
+            ("p2g.grid_query.K_max=2 p2g.grid_query.exp=3", "null, 1, or 2"),
+            (
+                "p2g.grid_query.K_max=2 p2g.grid_query.points_per_gaussian=0",
+                "points_per_gaussian",
+            ),
+            ("p2g.grid_query.K_max=2 p2g.grid_query.grad_balance=sqrt_k",
+             "Unsupported keys"),
+        )
+        for override, message in invalid:
+            with self.subTest(override=override), self.assertRaisesRegex(
+                ValueError, message
+            ):
+                compose_fresh_config(OmegaConf.from_dotlist([
+                    f"model.variant={DYNAMIC_VARIANT_V11_1}",
+                    *override.split(),
+                ]))
 
     def test_neither_barrier_variant_accepts_the_removed_gate_keys(self):
         """The gate is gone from V11.1 as well, not just absent from V11."""
