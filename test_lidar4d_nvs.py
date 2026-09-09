@@ -9,7 +9,7 @@ Protocol (1-second temporal novel-view synthesis):
 Metrics follow the official GS-LiDAR code (utils/metrics_utils.py):
   depth / intensity : RMSE, MedAE, LPIPS(alex), SSIM, PSNR  (raydrop-masked, full map)
   raydrop           : RMSE, Acc, F1
-  points            : Chamfer distance, F-score@0.05
+  points            : Chamfer distance, F-score@0.05 (+ precision, recall)
 Our depth is already in meters (g2p.scale_factor == 1.0), so GS-LiDAR's
 `scale_factor` rescale is NOT applied (scale=1.0).
 
@@ -158,7 +158,7 @@ def summarize(window_metrics):
     for key, subs in (("depth", ["rmse", "medae", "lpips", "ssim", "psnr"]),
                       ("intensity", ["rmse", "medae", "lpips", "ssim", "psnr"]),
                       ("raydrop", ["rmse", "acc", "f1"]),
-                      ("points", ["cd", "fscore"])):
+                      ("points", ["cd", "fscore", "precision", "recall"])):
         out[key] = {s: _agg(window_metrics, key, s) for s in subs}
     return out
 
@@ -461,7 +461,8 @@ def main(cfg, config_source="unspecified"):
         print(f"[{i+1:02d}/{len(dataset)}] {seq_name} T={target_s}s | "
               f"depth RMSE={wm['depth']['rmse']:.3f} PSNR={wm['depth']['psnr']:.2f} | "
               f"int RMSE={wm['intensity']['rmse']:.3f} | "
-              f"CD={wm['points']['cd']:.4f} F={wm['points']['fscore']:.3f}")
+              f"CD={wm['points']['cd']:.4f} F={wm['points']['fscore']:.3f} "
+              f"P={wm['points']['precision']:.3f} R={wm['points']['recall']:.3f}")
 
     # ── per-sequence 3D Gaussian HTML (buttons 1..4 = target seconds) ───────
     for seq_name, frames in seq_gauss.items():
@@ -529,7 +530,8 @@ def main(cfg, config_source="unspecified"):
                 f"  inten : RMSE={it['rmse']:.3f} MedAE={it['medae']:.3f} "
                 f"LPIPS={it['lpips']:.3f} SSIM={it['ssim']:.3f} PSNR={it['psnr']:.2f}\n"
                 f"  raydp : RMSE={rd['rmse']:.3f} Acc={rd['acc']:.3f} F1={rd['f1']:.3f}\n"
-                f"  point : CD={pt['cd']:.4f} F-score@0.05={pt['fscore']:.3f}")
+                f"  point : CD={pt['cd']:.4f} F-score@0.05={pt['fscore']:.3f} "
+                f"P={pt['precision']:.3f} R={pt['recall']:.3f}")
 
     seq_split = {wm["seq_name"]: wm["nuscenes_split"] for wm in window_metrics}
     print("\n" + "=" * 70)

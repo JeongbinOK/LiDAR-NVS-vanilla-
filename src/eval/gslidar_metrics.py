@@ -154,11 +154,13 @@ def raydrop_errors(pred, gt, ratio: float = 0.5) -> dict:
 def _fscore(dist1, dist2, threshold: float = 0.05):
     # dist1/dist2 are SQUARED euclidean distances (chamfer_3DDist convention),
     # so the 0.05 threshold matches GS-LiDAR exactly.
-    p1 = torch.mean((dist1 < threshold).float(), dim=1)
-    p2 = torch.mean((dist2 < threshold).float(), dim=1)
-    f = 2 * p1 * p2 / (p1 + p2)
+    # dist1 is pred->gt (over predicted points) -> precision;
+    # dist2 is gt->pred (over GT points)        -> recall.
+    precision = torch.mean((dist1 < threshold).float(), dim=1)
+    recall = torch.mean((dist2 < threshold).float(), dim=1)
+    f = 2 * precision * recall / (precision + recall)
     f[torch.isnan(f)] = 0
-    return f, p1, p2
+    return f, precision, recall
 
 
 def _range_to_points(depth_1hw, row_to_theta, vfov, hfov, near, far):
@@ -193,11 +195,13 @@ def point_metrics(pred_depth, gt_depth, row_to_theta, backends: MetricBackends,
     gt_lidar = _range_to_points(gt_depth, row_to_theta, vfov, hfov, near, far)
     if pred_lidar.shape[0] == 0 or gt_lidar.shape[0] == 0:
         return {"cd": float("nan"), "fscore": float("nan"),
+                "precision": float("nan"), "recall": float("nan"),
                 "pred_points": int(pred_lidar.shape[0]), "gt_points": int(gt_lidar.shape[0])}
 
     dist1, dist2, _, _ = backends.chamfer(pred_lidar[None].contiguous(),
                                           gt_lidar[None].contiguous())
     cd = float((dist1.mean() + dist2.mean()).item())
-    f, _, _ = _fscore(dist1, dist2, fscore_threshold)
+    f, precision, recall = _fscore(dist1, dist2, fscore_threshold)
     return {"cd": cd, "fscore": float(f.cpu()[0]),
+            "precision": float(precision.cpu()[0]), "recall": float(recall.cpu()[0]),
             "pred_points": int(pred_lidar.shape[0]), "gt_points": int(gt_lidar.shape[0])}
