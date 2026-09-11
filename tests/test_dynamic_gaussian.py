@@ -3216,6 +3216,91 @@ class V11MaxSpeedBarrierAttentionTest(unittest.TestCase):
             halved, torch.tensor([[0.0, 4.0, 16.0, 36.0, 100.0]])
         )
 
+    def test_linear_hinge_penalizes_proportionally_to_the_excess(self):
+        """V11.4's `-relu(d/R-1)` against V11's `-4 relu(d/R-1)^2`."""
+        cfg = v11_temporal_cfg(layers=1)
+        cfg.barrier_weight = 1.0
+        cfg.barrier_exponent = 1
+        module = MaxSpeedBarrierLayerWeightedCrossAttention(cfg, dim=24)
+        self.assertEqual(module.barrier_exponent, 1)
+        query = torch.zeros(1, 3)
+        key = torch.tensor([
+            [15.0, 0.0, 0.0], [30.0, 0.0, 0.0], [45.0, 0.0, 0.0],
+            [60.0, 0.0, 0.0], [90.0, 0.0, 0.0],
+        ])
+        # Still exactly free inside R, then one logit per extra radius.
+        torch.testing.assert_close(
+            module._barrier_bias(query, key, 30.0),
+            torch.tensor([[0.0, 0.0, 0.5, 1.0, 2.0]]),
+        )
+        # The radius still tracks the physical interval rather than distance.
+        torch.testing.assert_close(
+            module._barrier_bias(query, key, 15.0),
+            torch.tensor([[0.0, 1.0, 2.0, 3.0, 5.0]]),
+        )
+
+    def test_linear_hinge_folds_into_the_score_gemm_too(self):
+        """`(a/R) relu(d-R)` must equal `a relu(d/R-1)`, as at p=2."""
+        torch.manual_seed(13)
+        cfg = v11_temporal_cfg(layers=1)
+        cfg.barrier_weight = 1.0
+        cfg.barrier_exponent = 1
+        module = MaxSpeedBarrierLayerWeightedCrossAttention(cfg, dim=24)
+        query = torch.randn(5, module.head_dim)
+        key = torch.randn(7, module.head_dim)
+        value = torch.randn(7, module.head_dim + 3)
+        query_position = torch.randn(5, 3) * 40.0
+        key_position = torch.randn(7, 3) * 40.0
+        radius = 21.0
+
+        feature, matched = module._barrier_chunk(
+            query, key, value, query_position, key_position, radius
+        )
+        reference_score = (query @ key.transpose(0, 1)) * module.scale
+        reference_score = reference_score - module._barrier_bias(
+            query_position, key_position, radius
+        )
+        expected = torch.softmax(reference_score, dim=-1) @ value
+        torch.testing.assert_close(
+            feature, expected[..., :module.head_dim], atol=1.0e-5, rtol=1.0e-5
+        )
+        torch.testing.assert_close(
+            matched, expected[..., module.head_dim:], atol=1.0e-5, rtol=1.0e-5
+        )
+
+    def test_hinge_exponent_changes_attention_beyond_the_radius(self):
+        """The two hinges must actually disagree once a key is out of reach."""
+        torch.manual_seed(5)
+        quadratic = MaxSpeedBarrierLayerWeightedCrossAttention(
+            v11_temporal_cfg(layers=1), dim=24
+        )
+        linear_cfg = v11_temporal_cfg(layers=1)
+        linear_cfg.barrier_weight = 1.0
+        linear_cfg.barrier_exponent = 1
+        linear = MaxSpeedBarrierLayerWeightedCrossAttention(linear_cfg, dim=24)
+
+        query = torch.randn(4, quadratic.head_dim)
+        key = torch.randn(6, quadratic.head_dim)
+        value = torch.randn(6, quadratic.head_dim + 3)
+        query_position = torch.zeros(4, 3)
+        # 0.5R and 2.5R at R = 20: half the keys are unreachable.
+        key_position = torch.zeros(6, 3)
+        key_position[3:, 0] = 50.0
+        key_position[:3, 0] = 10.0
+        radius = 20.0
+
+        args = (query, key, value, query_position, key_position, radius)
+        near_only = [m._barrier_chunk(*args)[0] for m in (quadratic, linear)]
+        self.assertFalse(torch.allclose(near_only[0], near_only[1]))
+        # The quadratic charges 9 logits at 2.5R against the linear's 1.5, so
+        # it must put strictly less mass on the unreachable half.
+        masses = []
+        for module in (quadratic, linear):
+            bias = module._barrier_bias(query_position, key_position, radius)
+            score = (query @ key.transpose(0, 1)) * module.scale - bias
+            masses.append(float(torch.softmax(score, dim=-1)[:, 3:].sum()))
+        self.assertLess(masses[0], masses[1])
+
     def test_fused_score_matches_the_reference_barrier_form(self):
         """`(a/R^2) relu(d-R)^2` in the GEMM must equal `a relu(d/R-1)^2`."""
         torch.manual_seed(13)

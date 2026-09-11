@@ -333,6 +333,7 @@ def validate_experiment_config(config) -> None:
                     "use_time_embedding", "time_frequencies",
                     "time_embedding_dim", "time_reference_sec",
                     "position_encoding", "barrier_speed_mps", "barrier_weight",
+                    "barrier_exponent",
                     "match_chunk_size", "rope_base", "rope_position_scale",
                     "qk_norm", "layer_scale_init",
                 }
@@ -491,6 +492,19 @@ def validate_experiment_config(config) -> None:
                 )) < 0.0:
                     raise ValueError(
                         f"{label} temporal.barrier_weight must be non-negative"
+                    )
+                # The hinge grows quadratically (V11's shipped 2) or linearly
+                # (V11.4's 1) past the radius. Nothing else folds into the
+                # score GEMM's beta accumulate, so nothing else is supported.
+                barrier_exponent = OmegaConf.select(
+                    config, f"{temporal_path}.barrier_exponent"
+                )
+                if (
+                    barrier_exponent is not None
+                    and int(barrier_exponent) not in (1, 2)
+                ):
+                    raise ValueError(
+                        f"{label} temporal.barrier_exponent must be 1 or 2"
                     )
                 _require_positive(
                     config, f"{temporal_path}.match_chunk_size", kind=int

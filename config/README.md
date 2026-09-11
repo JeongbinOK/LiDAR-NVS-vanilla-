@@ -33,11 +33,12 @@ python main.py model.variant=dynamic_2dgs_attention_velocity_v11
 python main.py model.variant=dynamic_2dgs_attention_velocity_v11_1
 python main.py model.variant=dynamic_2dgs_attention_velocity_v11_2
 python main.py model.variant=dynamic_2dgs_attention_velocity_v11_3
+python main.py model.variant=dynamic_2dgs_attention_velocity_v11_4
 ```
 
 This `/4d` worktree defaults to `dynamic_2dgs_attention_velocity_v7_2` for a
 fresh run. `bbox_rigid_v1` is the historical box-routed model. V1 through V7.1,
-V8, V9, V10, V11, V11.1, V11.2, and V11.3 remain available for exact
+V8, V9, V10, V11, V11.1, V11.2, V11.3, and V11.4 remain available for exact
 checkpoint reconstruction and controlled A/B runs.
 V4/V5 reuse temporal cross-attention heads for velocity initialization. V6 does
 not: it adds an independent, time-free Siamese motion proposal before temporal
@@ -47,7 +48,7 @@ CLI-overridable runtime settings.
 
 Dynamic V1-V9, V11.1 and V11.3 emit a fixed number of Gaussians per occupied
 endpoint token -- one observed-medoid seed by default, and two range quantiles
-in V11.3; V10, V11, and V11.2 let a router select one to three
+in V11.3; V10, V11, V11.2 and V11.4 let a router select one to three
 range-quantile-seeded Gaussians instead. `p2g.grid_query`
 chooses between the two and sets the fixed count -- see "Gaussians per token"
 below. V3 through V6, V7.2, V8, V9, V10, V11, V11.2 and V11.3 embed
@@ -538,7 +539,48 @@ Trainable parameters go 7.48M to 7.22M on the same measurement.
 higher density, which is what V11.1 did when it went the other way to a single
 Gaussian per token.
 
-`barrier_weight` stays at 4. Re-scoring V11's trained head-0 features at other
+**V11.4** is V11 with the correspondence barrier made linear. Every configured
+value is identical to V11 except `model.variant`, the derived `exp_name`, and the
+two temporal keys that shape the hinge:
+
+```
+V11     bias = -4 * relu(d / R - 1)^2       # barrier_weight 4, barrier_exponent 2
+V11.4   bias = -1 * relu(d / R - 1)         # barrier_weight 1, barrier_exponent 1
+```
+
+`R = barrier_speed_mps * |dt|` in both, so both are still exactly zero inside the
+radius a 30 m/s object could cover over the endpoint interval, and both still
+share V11's backend, router, offset head and loss weights. What changes is only
+how the penalty grows outside the radius:
+
+| distance | V11 penalty | V11.4 penalty |
+| --- | --- | --- |
+| `R` | 0 | 0 |
+| `1.5R` | 1.0 | 0.5 |
+| `2R` | 4.0 | 1.0 |
+| `3R` | 16.0 | 2.0 |
+
+The quadratic starts flat at the boundary and accelerates, so a key just past the
+radius is barely discouraged while a distant one is foreclosed outright. At init
+QK-Norm holds the content logit spread near +-1, which means V11's hinge is below
+the content signal near `R` and far above it past `2R`. The linear hinge has the
+same slope everywhere outside and stays inside that range across the distances a
+real mismatch occupies, so a match beyond the speed limit remains arguable on
+feature evidence rather than being decided by geometry alone.
+
+`barrier_exponent` is a temporal config key available to every barrier variant,
+defaulting to `2`. `relu` is positively homogeneous, so `a * relu(d/R - 1)^p`
+equals `(a/R^p) * relu(d - R)^p` at `p=1` exactly as at `p=2`; the hinge still
+folds into the score GEMM's `beta * C` accumulate and nothing about the chunked
+softmax or its backward recomputation changes.
+
+Because the barrier is a constant of the graph rather than a parameter, V11.4 has
+V11's parameter names and shapes exactly. The two are weight-compatible and
+behaviourally different; what keeps a checkpoint's identity is the config
+embedded in it.
+
+`barrier_weight` stays at 4 **in V11 itself**. Re-scoring V11's trained head-0
+features at other
 weights shows a=0 to a=4 is decisive (mass beyond the radius 11.2% -> 0.85%,
 `|dp|` 8.5 m -> 2.26 m) and a=4 to a=64 changes nothing past the fourth decimal:
 the residual mass sits just outside the radius, where the hinge is near zero by
@@ -640,7 +682,7 @@ V11.3 emits that same 58,686 from its shipped `K_max: 2`.
 
 **Learned count (`count_mode: learned_gumbel`).** The refined token routes
 through the grid `GridSlotHead` and a hard Gumbel-Softmax over K={1,2,3} picks
-one K-specific joint head per token. Only V10, V11, and V11.2 may use it;
+one K-specific joint head per token. Only V10, V11, V11.2 and V11.4 may use it;
 asking any other variant for it is rejected at config time rather than silently
 ignored. V11.3 is rejected too, even though it shares V11's backend class,
 because its identity is the fixed count.

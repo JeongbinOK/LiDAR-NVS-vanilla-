@@ -1,0 +1,169 @@
+# Bbox-free Dynamic 2DGS V11.4.
+#
+# V11 with the correspondence barrier made linear. Every configured value is
+# identical to V11 except model.variant (and the derived exp_name) and the two
+# temporal keys that shape the hinge:
+#
+#     V11     -4 * relu(||dp|| / (v_max * |dt|) - 1)^2
+#     V11.4   -1 * relu(||dp|| / (v_max * |dt|) - 1)
+#
+# Both are exactly zero inside the radius a 30 m/s object could cover over the
+# endpoint interval, so what changes is only how the penalty grows outside it.
+# The quadratic starts flat at the boundary and accelerates: it charges 1 logit
+# at 1.5R, 4 at 2R and 16 at 3R, which means a key just past the radius is
+# barely discouraged while a distant one is ruled out outright. The linear hinge
+# charges 0.5, 1 and 2 at those distances, so its slope is the same everywhere
+# outside and the penalty stays inside the range QK-Norm holds the content logit
+# to. A match beyond the speed limit therefore remains arguable on feature
+# evidence rather than being foreclosed by geometry.
+#
+# 1. Position encoding is split across heads. Head 0 is the sole correspondence
+#    head and carries no RoPE; its logit is biased by the max-speed soft barrier
+#    above at v_max = 30 m/s. Heads 1-11 keep metric 3D RoPE at base=100 and
+#    1.2566 rad/m (2*pi/5 m).
+# 2. v_init averages the twelve head-0 attention maps under softmax over twelve
+#    plain learned scalars, so the mixture learns which depth resolves
+#    correspondence rather than being conditioned on any sample.
+# 3. LN(f') routes through the learned_gumbel K={1,2,3} grid head as in V10.
+# 4. One v_init + v_offset per token is shared by that token's K Gaussians.
+model:
+  variant: dynamic_2dgs_attention_velocity_v11_4
+
+device: [0]
+
+exp_name: ${model.variant}-bs-${train.batch_size}
+
+p2g:
+  anchor_mode: grid
+  freeze_utonia: true
+  utonia_feature_stage: 3
+  utonia_lora:
+    enable: true
+    input_mode: xyzi
+    rank: 16
+    alpha: 16
+    dropout: 0.0
+  # Inactive compatibility values; V11.4 validation requires LoRA above.
+  agg_mlp:
+    hidden_dim: 1024
+    hidden_layers: 2
+    out_dim: 576
+  joint_refiner:
+    num_heads: 12
+    rope_base: 10.0
+    rope_position_scale: 4.0
+  # V10's post-refinement K-adaptive grid head, unchanged. The router chooses
+  # exactly one of K={1,2,3} with hard Gumbel-Softmax STE; only the selected
+  # K-specific Gaussian head executes in the forward pass.
+  grid_query:
+    count_mode: learned_gumbel
+    grad_balance: sqrt_k
+    learned_count:
+      K_max: 3
+      tau: 1.0
+      seed_mode: range_quantile
+      grad_balance_scope: token
+      budget:
+        enable: false
+      logging:
+        enable: true
+        interval: 20
+        range_edges_m: [0, 10, 20, 30, 40, 60, 80, 110]
+
+data:
+  mode: bbox
+  bbox_json_path: null
+
+dynamic_2dgs:
+  temporal:
+    implementation: flash_varlen
+    layers: 12
+    num_heads: 12
+    mlp_ratio: 4
+
+    # V5 physical endpoint-time conditioning before layer one, as in V9/V10.
+    use_time_embedding: true
+    time_embedding_dim: 64
+    time_frequencies: 8
+    time_reference_sec: 1.0
+
+    position_encoding: barrier_rope_split
+
+    # Head 0's barrier. The hinge is not a bilinear form, so unlike V10's
+    # -(d/R)^2 it cannot be folded into extra Q/K channels; head 0 therefore
+    # runs an explicit chunked softmax while heads 1-11 stay on FlashAttention.
+    # R = 30 m at the nominal 1.0 s endpoint interval.
+    #
+    # exponent 1 with weight 1 is this variant's whole difference from V11.
+    # At init QK-Norm holds the content logit spread near +-1, so the linear
+    # hinge is comparable to the content signal across the whole range a real
+    # mismatch occupies (0.5 logits at 1.5R, 1 at 2R, 2 at 3R) instead of
+    # being negligible just outside R and overwhelming further out. relu is
+    # positively homogeneous, so a/R^p still folds into the score GEMM's beta
+    # accumulate at p=1 exactly as it did at p=2; nothing about the chunked
+    # softmax or its backward recomputation changes.
+    barrier_speed_mps: 30.0
+    barrier_weight: 1.0
+    barrier_exponent: 1
+    # Query rows per explicit head-0 softmax chunk. Each chunk is recomputed in
+    # backward, so this trades peak N_q x N_k score memory against kernel-launch
+    # and chunk-boundary overhead; it never changes the result. At the ~7.5k
+    # tokens/frame a nuScenes sweep produces this is two chunks per frame and
+    # ~120 MB per transient score block. Raise it when memory allows: an
+    # unchunked frame measured ~8% faster.
+    match_chunk_size: 4096
+
+    # Heads 1-11 only. 2*pi/scale = 5 m for the highest-frequency 3D RoPE band.
+    rope_base: 100.0
+    rope_position_scale: 1.2566370614359172
+
+    qk_norm: true
+    layer_scale_init: 0.1
+
+  gaussian_head:
+    # These priors initialize every slot of each K-specific joint head.
+    initial_opacity: 0.2
+    initial_scale_m: 0.3
+
+  motion:
+    # The offset head is conditioned on the initializer it corrects:
+    #   e_v = Linear(3,32) -> SiLU -> Linear(32,32)
+    #   v_offset = Linear(96,3)(SiLU(Linear(432+32,96)([LN(f'), e_v])))
+    # head 0's attended feature channels carry no metric coordinate, so without
+    # this embedding the head cannot see what it is correcting. The zero output
+    # initialization still starts a fresh run at v_total = v_init.
+    zero_init: true
+    residual_hidden_dim: 96
+    velocity_embedding_dim: 32
+    # The conditioning copy is detached, so v_init + v_offset stays the only
+    # route from the offset loss back into correspondence. Every init-conditioned
+    # head in this repo does the same; flip it here to open the second path.
+    detach_init_condition: true
+
+  regularization:
+    small_motion:
+      enabled: false
+      weight: 0.005
+      epsilon_m: 0.001
+      warmup_steps: 300
+      ramp_steps: 1700
+
+    velocity_l2:
+      enabled: true
+      # w_i * mean(||v_init||_2^2) + w_o * mean(||v_offset||_2^2), charged
+      # independently. Penalizing the sum instead would pay the offset to point
+      # backwards through the cross term -- V5's residual collapsed to a pure
+      # shrink operator at cos(init, offset) = -0.997 under exactly that form.
+      # Regularizing only the offset (V6/V7) removes the shrink incentive but
+      # leaves v_init unbounded, and V6's background |v_init| then grew to
+      # 5.8 m/s, past the vehicles it was meant to track.
+      mode: split_group_l2
+      init_weight: 0.01
+      offset_weight: 0.01
+      warmup_steps: 0
+      ramp_steps: 0
+
+# Keep the requested reconstruction/scale objective explicit in this variant.
+loss:
+  w_chamfer: 0.02
+  w_scale: 0.0

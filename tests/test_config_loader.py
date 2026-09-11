@@ -29,6 +29,7 @@ from src.config_loader import (
     DYNAMIC_VARIANT_V11_1,
     DYNAMIC_VARIANT_V11_2,
     DYNAMIC_VARIANT_V11_3,
+    DYNAMIC_VARIANT_V11_4,
     LEGACY_VARIANT,
     PHYSICAL_VELOCITY_VARIANTS,
     assert_model_variant_implemented,
@@ -513,6 +514,45 @@ class ConfigLoaderTest(unittest.TestCase):
         ):
             self.assertIn(DYNAMIC_VARIANT_V11_3, group)
         self.assertNotIn(DYNAMIC_VARIANT_V11_3, ROUTER_CAPABLE_DYNAMIC_VARIANTS)
+
+    def test_v11_4_is_v11_with_a_linear_hinge(self):
+        """Only the barrier's shape and weight separate it from V11."""
+        v11, _source = compose_fresh_config(OmegaConf.from_dotlist([
+            f"model.variant={DYNAMIC_VARIANT_V11}",
+        ]))
+        v11_4, source = compose_fresh_config(OmegaConf.from_dotlist([
+            f"model.variant={DYNAMIC_VARIANT_V11_4}",
+        ]))
+        self.assertIn(f"{DYNAMIC_VARIANT_V11_4}.yaml", source)
+
+        left = OmegaConf.to_container(v11, resolve=False)
+        right = OmegaConf.to_container(v11_4, resolve=False)
+        left["model"]["variant"] = right["model"]["variant"]
+        left_temporal = left["dynamic_2dgs"]["temporal"]
+        right_temporal = right["dynamic_2dgs"]["temporal"]
+        self.assertEqual(left_temporal.pop("barrier_weight"), 4.0)
+        self.assertEqual(right_temporal.pop("barrier_weight"), 1.0)
+        self.assertNotIn("barrier_exponent", left_temporal)
+        self.assertEqual(right_temporal.pop("barrier_exponent"), 1)
+        self.assertEqual(left, right)
+
+        # V11.4 keeps V11's router and barrier-match membership.
+        for group in (
+            ATTENTION_VELOCITY_VARIANTS,
+            BARRIER_MATCH_DYNAMIC_VARIANTS,
+            PHYSICAL_VELOCITY_VARIANTS,
+            ROUTER_CAPABLE_DYNAMIC_VARIANTS,
+        ):
+            self.assertIn(DYNAMIC_VARIANT_V11_4, group)
+        self.assertEqual(v11_4.p2g.grid_query.count_mode, "learned_gumbel")
+
+    def test_barrier_exponent_only_accepts_one_or_two(self):
+        for value in (0, 3):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                compose_fresh_config(OmegaConf.from_dotlist([
+                    f"model.variant={DYNAMIC_VARIANT_V11_4}",
+                    f"dynamic_2dgs.temporal.barrier_exponent={value}",
+                ]))
 
     def test_v11_3_head_is_seed_conditioned_at_three_channels_per_slot(self):
         """The router trunk's geometry input survives as head input columns."""

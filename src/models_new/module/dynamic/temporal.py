@@ -1114,10 +1114,11 @@ class MaxSpeedBarrierLayerWeightedCrossAttention(
     probabilities ever touch coordinates.  It carries no 3D RoPE.  Its position
     encoding is instead one additive physical barrier on the logit,
 
-    ``bias_ij = -a * relu(||x_i - x_j|| / (v_max * |dt|) - 1)^2``,
+    ``bias_ij = -a * relu(||x_i - x_j|| / (v_max * |dt|) - 1)^p``,
 
     which is exactly zero inside the radius a ``v_max`` object could cover over
-    the endpoint interval and grows quadratically outside it.  Unlike V10's
+    the endpoint interval and grows outside it -- quadratically at ``p=2``
+    (V11's shipped form), linearly at ``p=1``.  Unlike V10's
     ``-(d/R)^2`` prior the hinge is not a bilinear form, so it cannot be folded
     into extra Q/K channels; this head therefore runs as an explicit softmax,
     chunked over queries and recomputed in backward.  Its V carries the ordinary
@@ -1161,6 +1162,9 @@ class MaxSpeedBarrierLayerWeightedCrossAttention(
         ).lower()
         self.barrier_speed_mps = float(_cfg_get(cfg, "barrier_speed_mps", 30.0))
         self.barrier_weight = float(_cfg_get(cfg, "barrier_weight", 4.0))
+        # p=2 is V11's quadratic hinge; p=1 makes the penalty grow linearly
+        # once past the radius, so its slope is the same everywhere outside.
+        self.barrier_exponent = int(_cfg_get(cfg, "barrier_exponent", 2))
         self.match_chunk_size = int(_cfg_get(cfg, "match_chunk_size", 1024))
 
         if self.dim <= 0 or self.num_heads <= 0:
@@ -1185,6 +1189,8 @@ class MaxSpeedBarrierLayerWeightedCrossAttention(
             raise ValueError("V11 barrier_speed_mps must be positive")
         if self.barrier_weight < 0.0:
             raise ValueError("V11 barrier_weight must be non-negative")
+        if self.barrier_exponent not in (1, 2):
+            raise ValueError("barrier_exponent must be 1 or 2")
         if self.match_chunk_size <= 0:
             raise ValueError("V11 match_chunk_size must be positive")
 
@@ -1237,6 +1243,7 @@ class MaxSpeedBarrierLayerWeightedCrossAttention(
             "qk_motion_head_count": 1.0,
             "barrier_speed_mps": self.barrier_speed_mps,
             "barrier_weight": self.barrier_weight,
+            "barrier_exponent": float(self.barrier_exponent),
         }
         bound = 0.0
         for layer in range(self.n_layers):
@@ -1251,17 +1258,19 @@ class MaxSpeedBarrierLayerWeightedCrossAttention(
         return stats
 
     def _barrier_bias(self, query_position, key_position, radius):
-        """Reference form ``a * relu(d/R - 1)^2`` for one chunk of queries.
+        """Reference form ``a * relu(d/R - 1)^p`` for one chunk of queries.
 
         This is what the barrier *means*; :meth:`_barrier_chunk` evaluates the
-        algebraically identical ``(a/R^2) * relu(d - R)^2`` because that folds
+        algebraically identical ``(a/R^p) * relu(d - R)^p`` because that folds
         into the score GEMM. Positions are input geometry rather than
         parameters, so the barrier is a constant of the graph either way.
         """
         with torch.no_grad():
             excess = torch.cdist(query_position, key_position)
             excess = excess.div_(float(radius)).sub_(1.0).clamp_min_(0.0)
-            return excess.square_().mul_(self.barrier_weight)
+            if self.barrier_exponent == 2:
+                excess = excess.square_()
+            return excess.mul_(self.barrier_weight)
 
     def _barrier_chunk(
         self, query, key, value, query_position, key_position, radius
@@ -1271,20 +1280,24 @@ class MaxSpeedBarrierLayerWeightedCrossAttention(
         ``radius`` is one Python scalar: a chunk never spans an endpoint pair,
         and the barrier radius is that sample's physical interval. At these
         sizes the ``N_q x N_k`` block is bandwidth-bound rather than
-        FLOP-bound, so the hinge is written as ``relu(d - R)^2`` and folded
+        FLOP-bound, so the hinge is written as ``relu(d - R)^p`` and folded
         into the score GEMM's ``beta * C`` accumulate. That leaves three
-        elementwise passes over the block instead of nine.
+        elementwise passes over the block instead of nine. Scaling by ``R``
+        moves outside the hinge either way, since ``relu`` is positively
+        homogeneous: ``a * relu(d/R - 1)^p == (a/R^p) * relu(d - R)^p``.
         """
         radius = float(radius)
         with torch.no_grad():
             excess = torch.cdist(
                 query_position, key_position
-            ).sub_(radius).relu_().square_()
+            ).sub_(radius).relu_()
+            if self.barrier_exponent == 2:
+                excess = excess.square_()
         score = torch.addmm(
             excess,
             query,
             key.transpose(0, 1),
-            beta=-self.barrier_weight / (radius * radius),
+            beta=-self.barrier_weight / (radius ** self.barrier_exponent),
             alpha=self.scale,
         )
         probability = torch.softmax(score, dim=-1)
@@ -1830,6 +1843,7 @@ class GroupedGainBarrierCrossAttention(
             "qk_motion_head_count": 1.0,
             "barrier_speed_mps": self.barrier_speed_mps,
             "barrier_weight": self.barrier_weight,
+            "barrier_exponent": float(self.barrier_exponent),
         }
         names = {0: "match", 1: "rope"}
         bounds = {}

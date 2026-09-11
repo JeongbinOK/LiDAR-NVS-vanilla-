@@ -67,6 +67,9 @@ _BACKEND_CLASS = {
     "dynamic_2dgs_attention_velocity_v11_3": (
         "SeedConditionedBarrierVelocityGaussianBackend"
     ),
+    "dynamic_2dgs_attention_velocity_v11_4": (
+        "MaxSpeedBarrierVelocityGaussianBackend"
+    ),
 }
 
 _PROPOSAL_VARIANTS = {
@@ -132,6 +135,13 @@ _PRE_REFACTOR_MANIFEST = {
     # wide. That trunk is what separates it from V11.1's parameter names.
     "dynamic_2dgs_attention_velocity_v11_3": (
         "27b61a7e5c78bec30446", "274e243c1107ab2fa1b0"
+    ),
+    # V11.4 changes only the hinge's shape, and the barrier is a constant
+    # of the graph rather than a parameter, so its digests are V11's. The
+    # two are weight-compatible and behaviourally different; what keeps
+    # them apart is the config embedded in the checkpoint.
+    "dynamic_2dgs_attention_velocity_v11_4": (
+        "a7f420bb2b15d7023d1f", "b72527798ae7652e170c"
     ),
 }
 

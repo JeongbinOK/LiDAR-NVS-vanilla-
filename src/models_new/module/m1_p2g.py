@@ -204,6 +204,7 @@ class Point2Gaus(nn.Module):
                 DYNAMIC_VARIANT_V11_1,
                 DYNAMIC_VARIANT_V11_2,
                 DYNAMIC_VARIANT_V11_3,
+                DYNAMIC_VARIANT_V11_4,
             )
             from .dynamic_gaussian import (
                 AttentionInitializedVelocityGaussianBackend,
@@ -240,7 +241,9 @@ class Point2Gaus(nn.Module):
             # complete final feature under V11's barrier. V11.3 keeps V11's
             # stack and correspondence but replaces the router with a fixed
             # count, and rebuilds the seed conditioning the router's trunk
-            # used to supply on the plain Gaussian head.
+            # used to supply on the plain Gaussian head. V11.4 is V11 with
+            # only the hinge shape changed, so it shares V11's class and
+            # differs by dynamic_2dgs.temporal config alone.
             backend_cls = {
                 DYNAMIC_VARIANT_V1: DynamicGaussianBackend,
                 DYNAMIC_VARIANT_V3: PhysicalVelocityGaussianBackend,
@@ -270,6 +273,7 @@ class Point2Gaus(nn.Module):
                 DYNAMIC_VARIANT_V11_3: (
                     SeedConditionedBarrierVelocityGaussianBackend
                 ),
+                DYNAMIC_VARIANT_V11_4: MaxSpeedBarrierVelocityGaussianBackend,
             }.get(self.dynamic_variant)
             if backend_cls is None:
                 raise ValueError(

@@ -23,6 +23,7 @@ DYNAMIC_VARIANT_V11 = "dynamic_2dgs_attention_velocity_v11"
 DYNAMIC_VARIANT_V11_1 = "dynamic_2dgs_attention_velocity_v11_1"
 DYNAMIC_VARIANT_V11_2 = "dynamic_2dgs_attention_velocity_v11_2"
 DYNAMIC_VARIANT_V11_3 = "dynamic_2dgs_attention_velocity_v11_3"
+DYNAMIC_VARIANT_V11_4 = "dynamic_2dgs_attention_velocity_v11_4"
 # The unsuffixed constant always names the current fresh-run baseline. Keep an
 # explicit constant for each predecessor so checkpoint semantics stay exact.
 DYNAMIC_VARIANT = DYNAMIC_VARIANT_V7_2
@@ -44,6 +45,7 @@ ATTENTION_VELOCITY_VARIANTS = (
     DYNAMIC_VARIANT_V11_1,
     DYNAMIC_VARIANT_V11_2,
     DYNAMIC_VARIANT_V11_3,
+    DYNAMIC_VARIANT_V11_4,
 )
 # Variants whose backend owns the learned_gumbel K={1,2,3} grid Gaussian head,
 # and can therefore let a router decide how many Gaussians each token becomes.
@@ -56,6 +58,7 @@ ROUTER_CAPABLE_DYNAMIC_VARIANTS = (
     DYNAMIC_VARIANT_V10,
     DYNAMIC_VARIANT_V11,
     DYNAMIC_VARIANT_V11_2,
+    DYNAMIC_VARIANT_V11_4,
 )
 # Historical public name retained for scripts and configs that imported it.
 # The tuple describes backend capability; the selected count mode still comes
@@ -65,6 +68,7 @@ ADAPTIVE_COUNT_DYNAMIC_VARIANTS = ROUTER_CAPABLE_DYNAMIC_VARIANTS
 # V11.1 head 0 carries it at every layer while every other head keeps 3D RoPE,
 # and V11.1 additionally splits the QK-Norm gain along that head boundary.
 # V11.3 is V11's correspondence exactly, differing only in Gaussian count.
+# V11.4 is V11 with the hinge made linear: barrier_exponent=1 at weight 1.
 # V11.2 gives head 0 RoPE too and moves the barrier to a single post-refinement
 # readout head with its own gain, which is what lets its layer stack run
 # entirely on FlashAttention.
@@ -73,6 +77,7 @@ BARRIER_MATCH_DYNAMIC_VARIANTS = (
     DYNAMIC_VARIANT_V11_1,
     DYNAMIC_VARIANT_V11_2,
     DYNAMIC_VARIANT_V11_3,
+    DYNAMIC_VARIANT_V11_4,
 )
 DYNAMIC_VARIANTS = (
     DYNAMIC_VARIANT_V1,
@@ -91,6 +96,7 @@ DYNAMIC_VARIANTS = (
     DYNAMIC_VARIANT_V11_1,
     DYNAMIC_VARIANT_V11_2,
     DYNAMIC_VARIANT_V11_3,
+    DYNAMIC_VARIANT_V11_4,
 )
 
 # V3 and later share the physical-time contract. V4/V5 add attention-derived
@@ -111,6 +117,7 @@ PHYSICAL_VELOCITY_VARIANTS = (
     DYNAMIC_VARIANT_V11_1,
     DYNAMIC_VARIANT_V11_2,
     DYNAMIC_VARIANT_V11_3,
+    DYNAMIC_VARIANT_V11_4,
 )
 
 WARPED_PROPOSAL_VELOCITY_VARIANTS = (
@@ -183,6 +190,9 @@ VARIANT_CONFIG_PATHS = {
     ),
     DYNAMIC_VARIANT_V11_3: (
         REPO_ROOT / "config" / "variants" / f"{DYNAMIC_VARIANT_V11_3}.yaml"
+    ),
+    DYNAMIC_VARIANT_V11_4: (
+        REPO_ROOT / "config" / "variants" / f"{DYNAMIC_VARIANT_V11_4}.yaml"
     ),
 }
 

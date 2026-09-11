@@ -39,6 +39,7 @@ BACKENDS = {
     cl.DYNAMIC_VARIANT_V11_1: dg.SingleGaussianBarrierVelocityGaussianBackend,
     cl.DYNAMIC_VARIANT_V11_2: dg.FinalFeatureBarrierVelocityGaussianBackend,
     cl.DYNAMIC_VARIANT_V11_3: dg.SeedConditionedBarrierVelocityGaussianBackend,
+    cl.DYNAMIC_VARIANT_V11_4: dg.MaxSpeedBarrierVelocityGaussianBackend,
 }
 PROPOSAL_VARIANTS = set(cl.PROPOSAL_VELOCITY_VARIANTS)
 
