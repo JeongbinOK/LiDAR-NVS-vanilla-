@@ -38,6 +38,7 @@ BACKENDS = {
     cl.DYNAMIC_VARIANT_V11: dg.MaxSpeedBarrierVelocityGaussianBackend,
     cl.DYNAMIC_VARIANT_V11_1: dg.SingleGaussianBarrierVelocityGaussianBackend,
     cl.DYNAMIC_VARIANT_V11_2: dg.FinalFeatureBarrierVelocityGaussianBackend,
+    cl.DYNAMIC_VARIANT_V11_3: dg.SeedConditionedBarrierVelocityGaussianBackend,
 }
 PROPOSAL_VARIANTS = set(cl.PROPOSAL_VELOCITY_VARIANTS)
 
@@ -87,8 +88,15 @@ def _inputs(variant, backend, generator):
         seed = torch.randn(total, k_max, k_max, 3, generator=generator)
         delta = torch.randn(total, k_max, k_max, 3, generator=generator) * 0.1
     else:
-        seed = token_position.clone().unsqueeze(1)
-        delta = None
+        # A fixed count fills exactly that many slots. Repeated coordinates
+        # are the real contract for exp=1/2, and the per-slot parameter
+        # blocks are what separate them.
+        slots = backend.gaussians_per_token
+        seed = token_position.clone().unsqueeze(1).repeat(1, slots, 1)
+        delta = (
+            torch.randn(total, slots, 3, generator=generator) * 0.1
+            if getattr(backend, "seed_conditioned_head", False) else None
+        )
     token_offset = torch.tensor([n, total], dtype=torch.long)
     frame_batch_idx = torch.zeros(n_frames, dtype=torch.long)
     pose = [[torch.eye(4), torch.eye(4)]]
@@ -115,8 +123,16 @@ def main():
         kwargs = {}
         if variant in PROPOSAL_VARIANTS:
             kwargs["proposal_dim"] = DIM
-        if variant in cl.ROUTER_CAPABLE_DYNAMIC_VARIANTS:
-            kwargs["gaussian_count_cfg"] = overlay.p2g.grid_query
+        count = OmegaConf.select(overlay, "p2g.grid_query")
+        count_mode = str(
+            OmegaConf.select(overlay, "p2g.grid_query.count_mode") or "legacy"
+        ).lower()
+        if count is not None and count_mode == "learned_gumbel":
+            kwargs["gaussian_count_cfg"] = count
+        elif count is not None:
+            kwargs["gaussians_per_token"] = int(
+                OmegaConf.select(overlay, "p2g.grid_query.K_max") or 1
+            )
         torch.manual_seed(0)
         backend = backend_cls(cfg, gs_params, dim=DIM, offset_bound=0.8, **kwargs)
         backend.eval()

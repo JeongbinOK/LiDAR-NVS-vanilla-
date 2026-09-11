@@ -64,6 +64,9 @@ _BACKEND_CLASS = {
     "dynamic_2dgs_attention_velocity_v11_2": (
         "FinalFeatureBarrierVelocityGaussianBackend"
     ),
+    "dynamic_2dgs_attention_velocity_v11_3": (
+        "SeedConditionedBarrierVelocityGaussianBackend"
+    ),
 }
 
 _PROPOSAL_VARIANTS = {
@@ -122,6 +125,13 @@ _PRE_REFACTOR_MANIFEST = {
     # correspondence readout head.
     "dynamic_2dgs_attention_velocity_v11_2": (
         "4c40f14d3df7daad233b", "00d8592912ab2b795fa1"
+    ),
+    # V11.3 keeps V11's stack but drops the router, so its Gaussian head
+    # rebuilds what the router's decoder did around it: a trunk taking the
+    # two slots' 6 seed-delta columns, then attribute projections twice as
+    # wide. That trunk is what separates it from V11.1's parameter names.
+    "dynamic_2dgs_attention_velocity_v11_3": (
+        "27b61a7e5c78bec30446", "274e243c1107ab2fa1b0"
     ),
 }
 

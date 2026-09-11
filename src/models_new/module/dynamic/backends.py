@@ -395,12 +395,17 @@ class PhysicalVelocityGaussianBackend(DynamicGaussianBackend):
         timestamps_sec,
         window_duration_sec,
         motion_proposal_feature=None,
+        seed_delta_sensor=None,
     ):
         if fused_feature.ndim != 2 or fused_feature.shape[1] != self.dim:
             raise ValueError(f"dynamic fused_feature must be (N,{self.dim})")
         seed_sensor = self._check_fixed_count_seeds(
             seed_sensor, token_position_sensor
         )
+        if seed_delta_sensor is not None:
+            seed_delta_sensor = self._check_fixed_count_seeds(
+                seed_delta_sensor, token_position_sensor
+            )
 
         geometry = self._reference_geometry_and_time(
             token_position_sensor,
@@ -411,6 +416,7 @@ class PhysicalVelocityGaussianBackend(DynamicGaussianBackend):
             timestamps_normalized,
             timestamps_sec,
             window_duration_sec,
+            seed_delta_sensor=seed_delta_sensor,
         )
         refined, temporal_fields = self._temporal_refine(
             fused_feature,
@@ -758,8 +764,13 @@ class LayerWeightedAttentionVelocityGaussianBackend(
         if not self.adaptive_count:
             # Without a router this backend is an ordinary fixed-count variant
             # whose temporal stack happens to mix layers; the shared forward
-            # already implements that.
-            if seed_delta_sensor is not None:
+            # already implements that. Deltas are then the per-slot
+            # ``(N, G, 3)`` set a seed-conditioned head reads, never the
+            # K-specific ``(N, K, K, 3)`` bank, and the shared forward
+            # validates that shape.
+            if seed_delta_sensor is not None and not getattr(
+                self, "seed_conditioned_head", False
+            ):
                 raise ValueError(
                     "a fixed Gaussian count needs no K-specific seed-delta bank"
                 )
@@ -774,6 +785,7 @@ class LayerWeightedAttentionVelocityGaussianBackend(
                 timestamps_sec,
                 window_duration_sec,
                 motion_proposal_feature=motion_proposal_feature,
+                seed_delta_sensor=seed_delta_sensor,
             )
         del motion_proposal_feature
         if fused_feature.ndim != 2 or fused_feature.shape[1] != self.dim:
@@ -918,6 +930,57 @@ class FinalFeatureBarrierVelocityGaussianBackend(
 
     def _build_temporal(self, cfg):
         return FinalFeatureBarrierCrossAttention(cfg.temporal, self.dim)
+
+
+class SeedConditionedBarrierVelocityGaussianBackend(
+    MaxSpeedBarrierVelocityGaussianBackend
+):
+    """V11.3: V11's temporal stack and correspondence with a fixed count.
+
+    The adaptive-K router is gone, so ``p2g.grid_query`` fixes how many
+    Gaussians every token emits. What the router's decoder did beyond routing
+    is rebuilt here, so only the count differs from V11:
+
+    * Its trunk was the only place V11 fed seed geometry into the decoder,
+      concatenating the selected candidate row's ``3 * K_max`` deltas to the
+      normalized token feature. The head is therefore built seed-conditioned,
+      at ``3 * gaussians_per_token`` channels, one row per slot it owns.
+      Without them a token's slots would receive identical input and could
+      only diverge through their own parameter rows.
+    * That trunk was also the decoder's only nonlinearity. The head therefore
+      keeps it: ``Linear(dim + 3 * G, dim) -> SiLU`` before the attribute
+      projections, which is V11's shape with ``G`` slots in place of ``K_max``
+      candidates.
+    """
+
+    #: ``Point2Gaus`` reads this to decide whether to send the seed deltas.
+    seed_conditioned_head = True
+
+    def _build_gaussian_head(self, cfg, gs_params, offset_bound,
+                             gaussian_count_cfg):
+        if gaussian_count_cfg is not None:
+            raise ValueError(
+                "V11.3 emits a fixed number of Gaussians per token and cannot "
+                "use p2g.grid_query.count_mode=learned_gumbel"
+            )
+        return GaussianAttributeHead(
+            _cfg_get(cfg, "gaussian_head", None),
+            gs_params,
+            self.dim,
+            offset_bound,
+            gaussians_per_token=self.gaussians_per_token,
+            seed_conditioned=True,
+            trunk=True,
+        )
+
+    def _predict_gaussian(self, refined, geometry):
+        seed_delta_ref = geometry.get("seed_delta_ref")
+        if seed_delta_ref is None:
+            raise ValueError(
+                "V11.3 requires the transformed per-slot seed deltas; "
+                "Point2Gaus must pass seed_delta_sensor"
+            )
+        return self.gaussian_head(refined, seed_delta_ref)
 
 
 class SingleGaussianBarrierVelocityGaussianBackend(

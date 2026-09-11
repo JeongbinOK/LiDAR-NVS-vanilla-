@@ -22,15 +22,16 @@ DYNAMIC_VARIANT_V10 = "dynamic_2dgs_attention_velocity_v10"
 DYNAMIC_VARIANT_V11 = "dynamic_2dgs_attention_velocity_v11"
 DYNAMIC_VARIANT_V11_1 = "dynamic_2dgs_attention_velocity_v11_1"
 DYNAMIC_VARIANT_V11_2 = "dynamic_2dgs_attention_velocity_v11_2"
+DYNAMIC_VARIANT_V11_3 = "dynamic_2dgs_attention_velocity_v11_3"
 # The unsuffixed constant always names the current fresh-run baseline. Keep an
 # explicit constant for each predecessor so checkpoint semantics stay exact.
 DYNAMIC_VARIANT = DYNAMIC_VARIANT_V7_2
 # V4/V5 use a dense coordinate expectation from selected attention heads. V8
 # reuses selected final-layer heads with a consensus readout; V10 reads every
 # head at every layer and therefore has no `motion_head_count` config key. V11
-# reads head 0 at every layer; V11.2 gives every layer head RoPE and reads one
-# dedicated head after refinement. In both cases the match head is fixed rather
-# than configured.
+# reads head 0 at every layer, as does V11.3; V11.2 gives every layer head RoPE
+# and reads one dedicated head after refinement. In every case the match head is
+# fixed rather than configured.
 _SELECTED_HEAD_ATTENTION_VELOCITY_VARIANTS = (
     DYNAMIC_VARIANT_V4,
     DYNAMIC_VARIANT_V5,
@@ -42,12 +43,15 @@ ATTENTION_VELOCITY_VARIANTS = (
     DYNAMIC_VARIANT_V11,
     DYNAMIC_VARIANT_V11_1,
     DYNAMIC_VARIANT_V11_2,
+    DYNAMIC_VARIANT_V11_3,
 )
 # Variants whose backend owns the learned_gumbel K={1,2,3} grid Gaussian head,
 # and can therefore let a router decide how many Gaussians each token becomes.
 # Every other dynamic variant emits a fixed count per token. Which of the two a
-# run uses is still a config decision (p2g.grid_query.count_mode); this list
-# only says which backends are able to honour the router at all.
+# run uses is still a config decision (p2g.grid_query.count_mode) for the
+# variants listed here. V11.3 shares V11's backend class but is deliberately
+# absent: its identity is the fixed two Gaussians per token, so asking it for
+# the router is rejected rather than quietly turning it back into V11.
 ROUTER_CAPABLE_DYNAMIC_VARIANTS = (
     DYNAMIC_VARIANT_V10,
     DYNAMIC_VARIANT_V11,
@@ -60,6 +64,7 @@ ADAPTIVE_COUNT_DYNAMIC_VARIANTS = ROUTER_CAPABLE_DYNAMIC_VARIANTS
 # Variants whose correspondence runs under the max-speed barrier. In V11 and
 # V11.1 head 0 carries it at every layer while every other head keeps 3D RoPE,
 # and V11.1 additionally splits the QK-Norm gain along that head boundary.
+# V11.3 is V11's correspondence exactly, differing only in Gaussian count.
 # V11.2 gives head 0 RoPE too and moves the barrier to a single post-refinement
 # readout head with its own gain, which is what lets its layer stack run
 # entirely on FlashAttention.
@@ -67,6 +72,7 @@ BARRIER_MATCH_DYNAMIC_VARIANTS = (
     DYNAMIC_VARIANT_V11,
     DYNAMIC_VARIANT_V11_1,
     DYNAMIC_VARIANT_V11_2,
+    DYNAMIC_VARIANT_V11_3,
 )
 DYNAMIC_VARIANTS = (
     DYNAMIC_VARIANT_V1,
@@ -84,6 +90,7 @@ DYNAMIC_VARIANTS = (
     DYNAMIC_VARIANT_V11,
     DYNAMIC_VARIANT_V11_1,
     DYNAMIC_VARIANT_V11_2,
+    DYNAMIC_VARIANT_V11_3,
 )
 
 # V3 and later share the physical-time contract. V4/V5 add attention-derived
@@ -103,6 +110,7 @@ PHYSICAL_VELOCITY_VARIANTS = (
     DYNAMIC_VARIANT_V11,
     DYNAMIC_VARIANT_V11_1,
     DYNAMIC_VARIANT_V11_2,
+    DYNAMIC_VARIANT_V11_3,
 )
 
 WARPED_PROPOSAL_VELOCITY_VARIANTS = (
@@ -172,6 +180,9 @@ VARIANT_CONFIG_PATHS = {
     ),
     DYNAMIC_VARIANT_V11_2: (
         REPO_ROOT / "config" / "variants" / f"{DYNAMIC_VARIANT_V11_2}.yaml"
+    ),
+    DYNAMIC_VARIANT_V11_3: (
+        REPO_ROOT / "config" / "variants" / f"{DYNAMIC_VARIANT_V11_3}.yaml"
     ),
 }
 

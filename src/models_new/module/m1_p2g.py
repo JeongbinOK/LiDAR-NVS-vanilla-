@@ -203,6 +203,7 @@ class Point2Gaus(nn.Module):
                 DYNAMIC_VARIANT_V11,
                 DYNAMIC_VARIANT_V11_1,
                 DYNAMIC_VARIANT_V11_2,
+                DYNAMIC_VARIANT_V11_3,
             )
             from .dynamic_gaussian import (
                 AttentionInitializedVelocityGaussianBackend,
@@ -215,6 +216,7 @@ class Point2Gaus(nn.Module):
                 PhysicalVelocityGaussianBackend,
                 PostAttentionProposalVelocityGaussianBackend,
                 ProposalInitializedVelocityGaussianBackend,
+                SeedConditionedBarrierVelocityGaussianBackend,
                 StraightThroughProposalVelocityGaussianBackend,
                 WarpedProposalVelocityGaussianBackend,
             )
@@ -235,7 +237,10 @@ class Point2Gaus(nn.Module):
             # V11.2 moves correspondence out of the stack entirely: every
             # layer head gets RoPE so the loop is one FlashAttention call, and
             # one dedicated readout head builds the initializer from the
-            # complete final feature under V11's barrier.
+            # complete final feature under V11's barrier. V11.3 keeps V11's
+            # stack and correspondence but replaces the router with a fixed
+            # count, and rebuilds the seed conditioning the router's trunk
+            # used to supply on the plain Gaussian head.
             backend_cls = {
                 DYNAMIC_VARIANT_V1: DynamicGaussianBackend,
                 DYNAMIC_VARIANT_V3: PhysicalVelocityGaussianBackend,
@@ -261,6 +266,9 @@ class Point2Gaus(nn.Module):
                 ),
                 DYNAMIC_VARIANT_V11_2: (
                     FinalFeatureBarrierVelocityGaussianBackend
+                ),
+                DYNAMIC_VARIANT_V11_3: (
+                    SeedConditionedBarrierVelocityGaussianBackend
                 ),
             }.get(self.dynamic_variant)
             if backend_cls is None:
@@ -594,7 +602,12 @@ class Point2Gaus(nn.Module):
                 # Utonia token as temporal attention. Variant-specific matching
                 # then decides whether to project it or L2-normalize it directly.
                 dynamic_kwargs["motion_proposal_feature"] = all_ufeat
-            if self.dynamic_adaptive_count:
+            # The router selects a candidate row from the seed bank, and a
+            # seed-conditioned fixed-count head reads its slots directly.
+            # Either way the decoder needs the own-frame seed deltas.
+            if self.dynamic_adaptive_count or getattr(
+                self.dynamic_backend, "seed_conditioned_head", False
+            ):
                 dynamic_kwargs["seed_delta_sensor"] = all_delta_sensor
             dynamic_out = self.dynamic_backend(
                 agg_feat_i,

@@ -28,6 +28,7 @@ from src.config_loader import (
     DYNAMIC_VARIANT_V11,
     DYNAMIC_VARIANT_V11_1,
     DYNAMIC_VARIANT_V11_2,
+    DYNAMIC_VARIANT_V11_3,
     LEGACY_VARIANT,
     PHYSICAL_VELOCITY_VARIANTS,
     assert_model_variant_implemented,
@@ -481,6 +482,101 @@ class ConfigLoaderTest(unittest.TestCase):
                 "p2g.grid_query.learned_count.K_max=4",
             ]))
 
+    def test_v11_3_is_v11_with_a_fixed_count_of_two_gaussians(self):
+        """Only model.variant and the Gaussian count separate it from V11."""
+        v11, _source = compose_fresh_config(OmegaConf.from_dotlist([
+            f"model.variant={DYNAMIC_VARIANT_V11}",
+        ]))
+        v11_3, source = compose_fresh_config(OmegaConf.from_dotlist([
+            f"model.variant={DYNAMIC_VARIANT_V11_3}",
+        ]))
+        self.assertIn(f"{DYNAMIC_VARIANT_V11_3}.yaml", source)
+        self.assertNotEqual(v11.exp_name, v11_3.exp_name)
+
+        left = OmegaConf.to_container(v11, resolve=False)
+        right = OmegaConf.to_container(v11_3, resolve=False)
+        left["model"]["variant"] = right["model"]["variant"]
+        self.assertNotEqual(
+            left["p2g"].pop("grid_query"), right["p2g"].pop("grid_query")
+        )
+        self.assertEqual(left, right)
+
+        count = v11_3.p2g.grid_query
+        self.assertEqual(count.count_mode, "legacy")
+        self.assertEqual(count.K_max, 2)
+        self.assertIsNone(count.exp)
+
+        for group in (
+            ATTENTION_VELOCITY_VARIANTS,
+            BARRIER_MATCH_DYNAMIC_VARIANTS,
+            PHYSICAL_VELOCITY_VARIANTS,
+        ):
+            self.assertIn(DYNAMIC_VARIANT_V11_3, group)
+        self.assertNotIn(DYNAMIC_VARIANT_V11_3, ROUTER_CAPABLE_DYNAMIC_VARIANTS)
+
+    def test_v11_3_head_is_seed_conditioned_at_three_channels_per_slot(self):
+        """The router trunk's geometry input survives as head input columns."""
+        from src.models_new.module.dynamic.heads import GaussianAttributeHead
+
+        gs_params = OmegaConf.create(
+            {"shs": 32, "opacity": 1, "scaling": 2, "rotation": 4, "offset": 3}
+        )
+        head = GaussianAttributeHead(
+            None, gs_params, dim=64, offset_bound=0.8,
+            gaussians_per_token=2, seed_conditioned=True, trunk=True,
+        )
+        self.assertEqual(head.seed_dim, 6)
+        # Two layers with the one nonlinearity, matching the router's decoder:
+        # the seed deltas enter the trunk, the attributes read its output.
+        self.assertEqual(head.trunk[0].in_features, 64 + 6)
+        self.assertEqual(head.trunk[0].out_features, 64)
+        self.assertIsInstance(head.trunk[1], torch.nn.SiLU)
+        for name, width in head.sizes.items():
+            self.assertEqual(head.heads[name].in_features, 64)
+            self.assertEqual(head.heads[name].out_features, width * 2)
+
+        feature = torch.randn(5, 64)
+        seed_delta = torch.randn(5, 2, 3)
+        raw, offset, decoded = head(feature, seed_delta)
+        self.assertEqual(decoded.shape, (5, 64))
+        self.assertEqual(offset.shape, (10, 3))
+        # Zero-initialized offset rows keep a fresh run on its own seeds.
+        self.assertTrue(torch.equal(offset, torch.zeros_like(offset)))
+        # The deltas reach the attributes, so the two slots are not twins.
+        other, _offset, _decoded = head(feature, seed_delta + 1.0)
+        self.assertFalse(torch.allclose(raw["shs"], other["shs"]))
+
+        with self.assertRaisesRegex(ValueError, "requires seed deltas"):
+            head(feature, None)
+        with self.assertRaisesRegex(ValueError, "seed deltas must have shape"):
+            head(feature, torch.randn(5, 3, 3))
+
+    def test_default_gaussian_head_keeps_its_feature_only_input(self):
+        """Widening V11.3's head must not touch the shared V3-V11.1 shapes."""
+        from src.models_new.module.dynamic.heads import GaussianAttributeHead
+
+        gs_params = OmegaConf.create(
+            {"shs": 32, "opacity": 1, "scaling": 2, "rotation": 4, "offset": 3}
+        )
+        head = GaussianAttributeHead(None, gs_params, dim=64, offset_bound=0.8)
+        self.assertFalse(head.seed_conditioned)
+        self.assertEqual(head.seed_dim, 0)
+        self.assertIsNone(head.trunk)
+        for name in head.sizes:
+            self.assertEqual(head.heads[name].in_features, 64)
+        raw, offset, _decoded = head(torch.randn(5, 64))
+        self.assertEqual(offset.shape, (5, 3))
+        self.assertEqual(raw["shs"].shape, (5, 32))
+
+    def test_v11_3_rejects_the_router_it_was_defined_to_drop(self):
+        with self.assertRaises(ValueError) as raised:
+            compose_fresh_config(OmegaConf.from_dotlist([
+                f"model.variant={DYNAMIC_VARIANT_V11_3}",
+                "p2g.grid_query.count_mode=learned_gumbel",
+            ]))
+        self.assertIn("V11.3", str(raised.exception))
+        self.assertIn("count router", str(raised.exception))
+
     def test_v11_1_rejects_a_router_its_backend_cannot_run(self):
         """V11.1 has no count router, so asking for one is an error."""
         with self.assertRaises(ValueError) as raised:
@@ -493,7 +589,9 @@ class ConfigLoaderTest(unittest.TestCase):
 
     def test_grid_query_sets_the_per_token_gaussian_count(self):
         """K_max is how many Gaussians each token becomes; exp seeds them."""
-        for variant in (DYNAMIC_VARIANT, DYNAMIC_VARIANT_V11_1):
+        for variant in (
+            DYNAMIC_VARIANT, DYNAMIC_VARIANT_V11_1, DYNAMIC_VARIANT_V11_3,
+        ):
             for k_max, exp in ((1, 1), (2, 1), (2, 2), (4, None)):
                 with self.subTest(variant=variant, K_max=k_max, exp=exp):
                     config, _source = compose_fresh_config(
@@ -533,13 +631,9 @@ class ConfigLoaderTest(unittest.TestCase):
                     *override.split(),
                 ]))
 
-    def test_neither_barrier_variant_accepts_the_removed_gate_keys(self):
-        """The gate is gone from V11.1 as well, not just absent from V11."""
-        for variant in (
-            DYNAMIC_VARIANT_V11,
-            DYNAMIC_VARIANT_V11_1,
-            DYNAMIC_VARIANT_V11_2,
-        ):
+    def test_no_barrier_variant_accepts_the_removed_gate_keys(self):
+        """The gate is gone from every barrier variant, not just V11."""
+        for variant in BARRIER_MATCH_DYNAMIC_VARIANTS:
             for key in (
                 "support_rho_m", "support_gate_lo", "support_gate_width",
             ):

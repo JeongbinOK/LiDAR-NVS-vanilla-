@@ -10,24 +10,50 @@ from ...utils.attention import FourierPositionEncoder3D
 from .common import _cfg_get
 
 class GaussianAttributeHead(nn.Module):
-    """Time-invariant 2DGS decoder driven only by the shared token feature.
+    """Time-invariant 2DGS decoder driven by the shared token feature.
 
     ``gaussians_per_token`` slots share the token's feature but nothing else:
     each owns its own rows of every attribute projection, including the bounded
     position offset, so slots seeded at the same coordinate still learn
     independent geometry. At the default of one slot this is exactly the V3
     head, down to the parameter shapes saved in a checkpoint.
+
+    ``seed_conditioned`` additionally concatenates every slot's seed delta to
+    the normalized feature, widening the head's input by
+    ``3 * gaussians_per_token``. This is what the adaptive-K router's trunk
+    does with its own ``3 * K_max`` channels, so a fixed-count head can carry
+    the same geometric conditioning without the router.
+
+    ``trunk`` puts one ``Linear(in, dim) -> SiLU`` in front of the attribute
+    projections, which is the other half of what the router's decoder does and
+    the only nonlinearity either version has. Without it the whole head is a
+    single affine map of the normalized feature.
+
+    Both default to off: every V1-V11.1 checkpoint was saved from the plain
+    affine form and must restore unchanged.
     """
 
     def __init__(self, cfg, gs_params, dim: int, offset_bound: float,
-                 gaussians_per_token: int = 1):
+                 gaussians_per_token: int = 1, seed_conditioned: bool = False,
+                 trunk: bool = False):
         super().__init__()
         self.dim = int(dim)
         self.offset_bound = float(offset_bound)
         self.gaussians_per_token = int(gaussians_per_token)
         if self.gaussians_per_token < 1:
             raise ValueError("gaussians_per_token must be at least one")
+        self.seed_conditioned = bool(seed_conditioned)
+        self.seed_dim = (
+            3 * self.gaussians_per_token if self.seed_conditioned else 0
+        )
         self.output_norm = nn.LayerNorm(self.dim)
+        # A trunk absorbs the conditioned input and hands every attribute the
+        # same dim-wide hidden activation, exactly as the router's does.
+        self.trunk = (
+            nn.Sequential(nn.Linear(self.dim + self.seed_dim, self.dim), nn.SiLU())
+            if bool(trunk) else None
+        )
+        head_in = self.dim if self.trunk is not None else self.dim + self.seed_dim
 
         self.sizes = {
             name: int(getattr(gs_params, name))
@@ -37,7 +63,7 @@ class GaussianAttributeHead(nn.Module):
         if self.sizes["offset"] != 3:
             raise ValueError("Dynamic 2DGS requires p2g.gs_params.offset=3")
         self.heads = nn.ModuleDict({
-            name: nn.Linear(self.dim, width * self.gaussians_per_token)
+            name: nn.Linear(head_in, width * self.gaussians_per_token)
             for name, width in self.sizes.items()
         })
         self._initialize_outputs(cfg)
@@ -71,17 +97,47 @@ class GaussianAttributeHead(nn.Module):
             return value
         return value.reshape(value.shape[0] * self.gaussians_per_token, width)
 
-    def _decode(self, feature):
+    def _head_input(self, decoded, seed_delta):
+        """Normalized feature, with every slot's raw metric seed delta appended.
+
+        The deltas stay in metres rather than being normalized, which is how
+        the router trunk consumes its own copy of the same quantity.
+        """
+        if not self.seed_conditioned:
+            return decoded
+        if seed_delta is None:
+            raise ValueError(
+                "a seed-conditioned Gaussian head requires seed deltas"
+            )
+        expected = (decoded.shape[0], self.gaussians_per_token, 3)
+        if tuple(seed_delta.shape) != expected:
+            raise ValueError(
+                f"seed deltas must have shape {expected}, got "
+                f"{tuple(seed_delta.shape)}"
+            )
+        return torch.cat([
+            decoded,
+            seed_delta.to(dtype=decoded.dtype).reshape(
+                decoded.shape[0], self.seed_dim
+            ),
+        ], dim=-1)
+
+    def _decode(self, feature, seed_delta=None):
         decoded = self.output_norm(feature)
+        head_input = self._head_input(decoded, seed_delta)
+        if self.trunk is not None:
+            head_input = self.trunk(head_input)
         raw = {
-            name: self._unpack(head(decoded), self.sizes[name])
+            name: self._unpack(head(head_input), self.sizes[name])
             for name, head in self.heads.items()
         }
         offset = self.offset_bound * torch.tanh(raw.pop("offset"))
+        # The third value stays the normalized feature, not the conditioned
+        # input, so downstream consumers keep reading a dim-wide token.
         return raw, offset, decoded
 
-    def forward(self, feature):
-        return self._decode(feature)
+    def forward(self, feature, seed_delta=None):
+        return self._decode(feature, seed_delta)
 
 class SeedConditionedGaussianAttributeHead(GaussianAttributeHead):
     """Legacy V1 decoder retained for its checkpoint contract."""
